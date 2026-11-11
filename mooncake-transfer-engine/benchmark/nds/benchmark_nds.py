@@ -9,13 +9,32 @@ import json
 import mmap
 import os
 from pathlib import Path
+import platform
 import stat
+import subprocess
+import sys
 import time
 
 import numpy as np
 import tent
 import torch
 import torch_npu  # noqa: F401
+
+
+def mooncake_git_sha():
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=Path(__file__).resolve().parents[3],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() or None
 
 
 def arguments():
@@ -182,7 +201,11 @@ def run_buffers(args, result, path):
         "key_bytes": args.bytes * args.fragments,
         "key_stride_bytes": args.key_stride,
         "calling_threads": 1,
-        "timing_scope": "TENT submit and overall completion; excludes request construction, allocation, validation and batch release",
+        "timing_scope": (
+            "TENT submit through overall completion, including request validation "
+            "and I/O planning; excludes request construction, allocation, data "
+            "verification and batch release"
+        ),
     }
     result["tent_module"] = tent.__file__
     result["torch_version"] = torch.__version__
@@ -308,6 +331,13 @@ def main():
     args = arguments()
     result = {
         "success": False,
+        "mooncake_git_sha": mooncake_git_sha(),
+        "environment": {
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+        },
         "arguments": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },

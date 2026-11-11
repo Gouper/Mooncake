@@ -8,6 +8,11 @@ on:
         type: boolean
         required: true
         default: false
+      min_read_gb_per_second:
+        description: 'Minimum verified single-card read bandwidth in GB/s'
+        type: number
+        required: true
+        default: 6.5
 
 permissions:
   contents: read
@@ -19,7 +24,6 @@ concurrency:
 jobs:
   file:
     if: >-
-      github.repository == 'zhangjiale-zjl/Mooncake' &&
       vars.NDS_HARDWARE_ENABLED == 'true' && inputs.confirm_file_write
     runs-on: [self-hosted, linux, ARM64, nds-file]
     timeout-minutes: 30
@@ -30,12 +34,21 @@ jobs:
           NDS_TEST_DIRECTORY: ${{ vars.NDS_TEST_DIRECTORY }}
           NDS_DEVICE: ${{ vars.NDS_DEVICE }}
           NDS_PYTHON: ${{ vars.NDS_PYTHON }}
+          NDS_MIN_READ_GB_PER_SECOND: ${{ inputs.min_read_gb_per_second }}
         run: |
           test -n "$NDS_PYTHON" && test -x "$NDS_PYTHON"
           test -d "$NDS_TEST_DIRECTORY" && test -w "$NDS_TEST_DIRECTORY"
           [[ "$NDS_DEVICE" =~ ^[0-9]+$ ]]
           test -e "/dev/davinci$NDS_DEVICE"
           test -e /dev/p2p_device
+          "$NDS_PYTHON" - "$NDS_MIN_READ_GB_PER_SECOND" <<'PY'
+          import math
+          import sys
+
+          threshold = float(sys.argv[1])
+          if not math.isfinite(threshold) or threshold <= 0:
+              raise ValueError("Minimum read bandwidth must be finite and positive")
+          PY
       - name: Build the checked-out revision against the real NDS SDK
         env:
           NDS_ROOT: ${{ vars.NDS_ROOT }}
@@ -54,6 +67,7 @@ jobs:
           NDS_DEVICE: ${{ vars.NDS_DEVICE }}
           NDS_PYTHON: ${{ vars.NDS_PYTHON }}
           NDS_ROOT: ${{ vars.NDS_ROOT }}
+          NDS_MIN_READ_GB_PER_SECOND: ${{ inputs.min_read_gb_per_second }}
         run: |
           export PYTHONPATH="$PWD/build-nds/mooncake-transfer-engine/tent/src/python:$PYTHONPATH"
           export LD_LIBRARY_PATH="$PWD/build-nds/mooncake-common/src:$PWD/build-nds/mooncake-common:$PWD/build-nds/mooncake-transfer-engine/tent/src/metrics:$NDS_ROOT/lib:$LD_LIBRARY_PATH"
@@ -63,7 +77,23 @@ jobs:
           "$NDS_PYTHON" mooncake-transfer-engine/benchmark/nds/benchmark_nds.py \
             --file "$test_dir/payload.bin" --device "$NDS_DEVICE" \
             --bytes 32768 --fragments 124 --batch 950 --key-stride 4194304 \
-            --io-depth 512 --warmup 2 --iterations 30 --json nds-hardware.json
+            --io-depth 512 --mode read --warmup 2 --iterations 30 \
+            --json nds-hardware.json
+          "$NDS_PYTHON" - "$NDS_MIN_READ_GB_PER_SECOND" <<'PY'
+          import json
+          import math
+          from pathlib import Path
+          import sys
+
+          threshold = float(sys.argv[1])
+          result = json.loads(Path("nds-hardware.json").read_text(encoding="utf-8"))
+          if not result.get("success"):
+              raise SystemExit("Benchmark data verification did not pass")
+          bandwidth = result["measurements"]["read"]["gb_per_second"]
+          print(f"Verified read bandwidth: {bandwidth:.3f} GB/s; minimum: {threshold:.3f} GB/s")
+          if not math.isfinite(bandwidth) or bandwidth < threshold:
+              raise SystemExit("Read bandwidth is below the required threshold")
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
