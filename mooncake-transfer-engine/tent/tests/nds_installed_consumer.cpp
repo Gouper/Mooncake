@@ -40,11 +40,11 @@ int main(int argc, char** argv) {
         // Explicit NDS registration fails if the mock driver did not
         // initialize.
         if (rc) return 5;
-        if (tent_unregister_memory(engine.get(), buffer.get())) return 6;
+        if (tent_unregister_memory(engine.get(), buffer.get(), kSize)) return 6;
     } else if (!rc) {
         // Keep cleanup best-effort before reporting that disabled NDS accepted
         // memory.
-        (void)tent_unregister_memory(engine.get(), buffer.get());
+        (void)tent_unregister_memory(engine.get(), buffer.get(), kSize);
         return 7;
     }
     std::cout << "installed C++/C API consumer (NDS " << argv[1] << "): PASS\n";
