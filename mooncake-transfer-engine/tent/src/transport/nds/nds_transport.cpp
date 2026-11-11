@@ -214,8 +214,10 @@ struct NdsTransport::Impl {
         }
         auto cached = validated.find(request.target_id);
         if (cached != validated.end()) {
-            if (!contains(0, cached->second.length, request.target_offset, request.length)) {
-                return Status::InvalidArgument("NDS request exceeds File Segment");
+            if (!contains(0, cached->second.length, request.target_offset,
+                          request.length)) {
+                return Status::InvalidArgument(
+                    "NDS request exceeds File Segment");
             }
             path = cached->second.path;
             return Status::OK();
@@ -237,7 +239,8 @@ struct NdsTransport::Impl {
                     return Status::InvalidArgument(
                         "NDS request exceeds File Segment");
                 path = entries[0].path;
-                validated.emplace(request.target_id, ValidatedSegment{path, entries[0].length});
+                validated.emplace(request.target_id,
+                                  ValidatedSegment{path, entries[0].length});
                 return Status::OK();
             });
     }
@@ -467,7 +470,8 @@ Status NdsTransport::submitTransferTasks(SubBatchRef batch,
         Task task;
         task.request = request;
         std::string path;
-        auto status = impl_->validate(request, task.buffer_base, path, validated);
+        auto status =
+            impl_->validate(request, task.buffer_base, path, validated);
         std::shared_ptr<File> file;
         if (status.ok()) {
             int access = request.opcode == Request::READ ? O_RDONLY : O_RDWR;
