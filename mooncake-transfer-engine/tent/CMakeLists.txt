@@ -61,3 +61,17 @@ if(BUILD_UNIT_TESTS)
   add_subdirectory(tests)
   include(${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_plugin_context_tests.cmake)
 endif()
+
+# The public TENT headers live in ../include/tent. Install them with the TENT
+# subtree so installing only this directory yields a usable prefix; the classic
+# Transfer Engine install writes the same files when it is built as well.
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include/tent/transfer_engine_c.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include/tent/transfer_engine.h
+  DESTINATION include/tent
+)
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include/tent/common/status.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include/tent/common/types.h
+  DESTINATION include/tent/common
+)
