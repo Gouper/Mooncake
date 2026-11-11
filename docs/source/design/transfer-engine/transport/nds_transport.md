@@ -1,7 +1,5 @@
 # NDS Transport
 
-[中文文档](../../../zh_archive/nds_transport.md)
-
 ## Background
 
 Applications that offload KV caches to local storage need to transfer data
