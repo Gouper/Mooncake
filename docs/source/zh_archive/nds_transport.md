@@ -21,7 +21,7 @@ NDS Transport 的代码位于 `mooncake-transfer-engine/tent/src/transport/nds`�
 - 每个请求描述一个连续缓冲区，一个 batch 可提交多个 HBM 分片。
 - 使用 TENT 的内存注册、File Segment、批量提交和状态查询接口。
 - 需要同时启用 `USE_NDS` 编译选项和 `transports/nds/enable` 运行时配置。
-- 提供独立 benchmark 和实验性单机 vLLM KV 适配器。
+- 提供带数据校验的独立 benchmark。
 
 NDS 负责本机存储读写，Ascend Direct 负责内存传输。
 
@@ -36,7 +36,7 @@ NDS 负责本机存储读写，Ascend Direct 负责内存传输。
 | NDS SDK | UBSIO `feat/nds-adapter-v2` 分支，提供 `ascend_nds.h` 和 `libascend_nds.so` |
 | XDS | `mycastiel/xds` 的 `loop_topo` 分支，用户态库与内核模块配套 |
 | Mooncake 构建依赖 | 按[编译指南](../getting_started/build.md)准备，并安装所选 Ascend 平台的构建依赖 |
-| Python 工具环境 | benchmark 需要配套的 `torch`、`torch_npu`、`numpy`；KV 适配器另需 vLLM-Ascend |
+| Python 工具环境 | benchmark 需要配套的 `torch`、`torch_npu`、`numpy` |
 
 NDS SDK、XDS 用户态 ABI 和驱动须保持兼容。CPU/mock 测试使用独立测试 SDK，
 不需要 NPU 硬件。
@@ -97,10 +97,9 @@ cmake --install build-nds/mooncake-transfer-engine/tent
 | 变量 | 使用条件 | 说明 |
 | --- | --- | --- |
 | `LD_LIBRARY_PATH` | 库不在动态加载器默认搜索路径时 | TENT、NDS SDK、XDS、CANN 的库目录 |
-| `PYTHONPATH` | 使用 Python 工具时 | 构建生成的 `tent` 模块目录；vLLM 另需适配器目录 |
+| `PYTHONPATH` | 使用 Python 工具时 | 构建生成的 `tent` 模块目录，供 benchmark 使用 |
 | `MC_TENT_CONF` | 配置 TENT 应用时 | TENT JSON 文件路径或内联 JSON |
 | `MC_USE_TENT` | 使用经典 TE 兼容入口时 | 设置为 `1`；直接调用 `tent.TransferEngine()` 不需要 |
-| `MOONCAKE_TENT_NDS_CONFIG` | 使用 vLLM 适配器时 | 存储范围及元数据配置文件路径 |
 
 ```bash
 export LD_LIBRARY_PATH="$NDS_INSTALL_PREFIX/lib:$NDS_ROOT/lib:/path/to/xds/file_p2p:${LD_LIBRARY_PATH:-}"
@@ -165,56 +164,6 @@ export MC_TENT_CONF=/absolute/path/nds-tent.json
 使用 `policy_name="nds_storage"` 选择仅允许 NDS 的策略；
 `transport_hint=NDS` 表达允许范围内的传输优先选择。独立 benchmark 包含可执行的完整调用示例。
 
-### vLLM 适配器
-
-`mooncake-integration/vllm/tent_nds_connector.py` 为 vLLM-Ascend 的
-`AscendStoreConnector` 提供 `tent_nds` 后端。将适配器目录加入 `PYTHONPATH`：
-
-```bash
-export PYTHONPATH="$PWD/mooncake-integration/vllm:$PYTHONPATH"
-export MOONCAKE_TENT_NDS_CONFIG=/absolute/path/nds-kv.json
-```
-
-准备独立文件，实际写入整个数据区域并落盘。例如，以下命令创建 64 GiB 文件，
-`oflag=excl` 确保已有文件不会被覆盖：
-
-```bash
-dd if=/dev/zero of=/absolute/path/nds-kv.bin bs=4M count=16384 oflag=excl conv=fsync
-```
-
-每轮验证使用新的元数据路径。以下是 `nds-kv.json` 示例：
-
-```json
-{
-  "storage_path": "/absolute/path/nds-kv.bin",
-  "storage_offset": 0,
-  "storage_capacity": 68719476736,
-  "allocation_alignment": 4194304,
-  "namespace": "minimax-tp8-functional-run",
-  "metadata_path": "/absolute/path/run/metadata.sqlite",
-  "tent_config_path": "/absolute/path/nds-tent.json",
-  "log_dir": "/absolute/path/run/events",
-  "io_timeout_seconds": 120
-}
-```
-
-容量按所有 rank 的 KV 分配总量估算。示例预留 64 GiB，文件需覆盖该容量与起始
-偏移；简短的后端 smoke 可以使用更小的独立范围。
-
-vLLM 的 connector 配置为：
-
-```json
-{
-  "kv_connector": "AscendStoreConnector",
-  "kv_connector_module_path": "tent_nds_connector",
-  "kv_role": "kv_both",
-  "kv_connector_extra_config": {"backend": "tent_nds", "use_layerwise": false}
-}
-```
-
-该适配器支持单机 whole-key 传输，在完整写入后发布 key；不提供淘汰、崩溃恢复
-或分布式元数据，也不作为 Mooncake Store 的 SSD 分层。
-
 ## 功能与性能验证
 
 ### 安装检查
@@ -230,15 +179,14 @@ python3 -c 'import tent, torch, torch_npu; print(tent.__file__); print(torch.npu
 
 ### CPU 测试
 
-`chore/tent-nds-validation` 在特性分支 `feat/tent-nds` 上以独立提交保存测试、
-benchmark、CI 和文档。无 NPU 环境时，在验证分支的仓库根目录执行：
+无 NPU 环境时，在仓库根目录执行：
 
 ```bash
 python3 scripts/ci/run_tent_nds_cpu.py --mode on --build-root /var/tmp/tent-nds-on
 python3 scripts/ci/run_tent_nds_cpu.py --mode off --build-root /var/tmp/tent-nds-off
 ```
 
-脚本构建并测试 TENT，检查安装、SDK 缺失行为及元数据并发。构建根目录下的
+脚本构建并测试 TENT，检查安装后消费和 SDK 缺失行为。构建根目录下的
 `result.json`、`ctest.xml`、`missing-sdk.log` 保存结果。mock SDK 仅存在于测试
 目录，CPU 检查不代表真实 DMA 功能或硬件带宽。
 
@@ -290,19 +238,6 @@ TENT 计时范围从提交到完成，包含请求校验和 IO 规划；张量�
 
 NDS 使用该独立入口；当前 tebench 的协议路径也未完整接入 Ascend 和 MemFabric。
 
-### vLLM 后端 smoke
-
-安装 vLLM-Ascend 并配置 `nds-kv.json` 后，可以不加载模型先验证适配器：
-
-```bash
-python3 mooncake-integration/vllm/smoke_tent_nds.py --device 0
-```
-
-预期输出包含 `success: true`、`fragments: 124`、`missing_key: -2` 和
-`failed_write_published: false`。随后验证 MiniMax TP8 生成和重复前缀对应的外部
-KV 复用，关闭本地 prefix caching，并检查 `log_dir` 中各 rank 的成功读写事件。
-后端 smoke 不代表模型端到端功能已通过。端到端仅验功能，性能通过独立 benchmark 测量。
-
 ## 注意事项
 
 1. **对齐与边界：** 地址、长度和文件偏移按 512 B 对齐。每个分片均需位于已注册
@@ -332,7 +267,6 @@ KV 复用，关闭本地 prefix caching，并检查 `log_dir` 中各 rank 的成
 | `ndsFileDriverOpen` 失败 | 检查真实适配库与 XDS 的加载路径、驱动版本及设备权限 |
 | NDS 不可用，或注册/选路失败 | 检查两个启用开关、Ascend 平台构建、当前 NPU、内存位置、对齐和策略 |
 | 请求失败或完成字节数不足 | 查看 JSON 的 `error`、存储容量、提交范围和驱动日志；排空前保留缓冲区 |
-| 元数据身份不匹配 | 使用新的元数据路径及匹配文件范围、模型和 KV 布局的 namespace |
 | 小粒度带宽偏低 | 先确认数据校验通过，再对照相同的分片、batch、深度、计时范围和设备负载 |
 
 ## 相关文档

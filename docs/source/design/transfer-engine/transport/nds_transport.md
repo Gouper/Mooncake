@@ -19,7 +19,7 @@ uses the existing public API without changing the third-party header or ABI.
 - Each request describes a contiguous buffer; a batch can contain multiple HBM fragments.
 - Uses TENT memory registration, File Segments, batch submission and status queries.
 - Requires both the `USE_NDS` build option and the `transports/nds/enable` runtime setting.
-- Provides a standalone benchmark and an experimental single-host vLLM KV adapter.
+- Provides a standalone benchmark with data verification.
 
 NDS handles local storage transfers. Ascend Direct handles memory transfers.
 
@@ -34,7 +34,7 @@ NDS handles local storage transfers. Ascend Direct handles memory transfers.
 | NDS SDK | UBSIO `feat/nds-adapter-v2`, providing `ascend_nds.h` and `libascend_nds.so` |
 | XDS | `mycastiel/xds`, branch `loop_topo`, with matching userspace library and kernel module |
 | Mooncake dependencies | Follow the [build guide](../../../getting_started/build.md), including the dependencies for the selected Ascend platform |
-| Python tools | A compatible `torch`, `torch_npu` and `numpy` environment for the benchmark; vLLM-Ascend for the KV adapter |
+| Python tools | A compatible `torch`, `torch_npu` and `numpy` environment for the benchmark |
 
 Keep the NDS SDK, XDS userspace ABI and kernel driver compatible. CPU/mock tests
 run without NPU hardware and use a separate test SDK.
@@ -97,10 +97,9 @@ The benchmark uses the existing binding built under
 | Variable | Required | Description |
 | --- | --- | --- |
 | `LD_LIBRARY_PATH` | For libraries outside the loader search path | TENT, NDS SDK, XDS and CANN library directories |
-| `PYTHONPATH` | For Python tools | Built `tent` module; also the adapter directory when using vLLM |
+| `PYTHONPATH` | For Python tools | Built `tent` module for the benchmark |
 | `MC_TENT_CONF` | For application configuration | TENT JSON file path or inline JSON |
 | `MC_USE_TENT` | For the classic TE compatibility entry | Set to `1`; direct `tent.TransferEngine()` calls do not need it |
-| `MOONCAKE_TENT_NDS_CONFIG` | For the vLLM adapter | Path to its storage-range and metadata configuration |
 
 ```bash
 export LD_LIBRARY_PATH="$NDS_INSTALL_PREFIX/lib:$NDS_ROOT/lib:/path/to/xds/file_p2p:${LD_LIBRARY_PATH:-}"
@@ -168,58 +167,6 @@ Submit these requests together in one batch. Set `policy_name="nds_storage"`
 to use the policy permitting only NDS. `transport_hint=NDS` expresses a preference
 within the allowed transports. The benchmark provides an executable example.
 
-### vLLM adapter
-
-`mooncake-integration/vllm/tent_nds_connector.py` provides the `tent_nds` backend
-for vLLM-Ascend's `AscendStoreConnector`. Add its directory to `PYTHONPATH`:
-
-```bash
-export PYTHONPATH="$PWD/mooncake-integration/vllm:$PYTHONPATH"
-export MOONCAKE_TENT_NDS_CONFIG=/absolute/path/nds-kv.json
-```
-
-Prepare a dedicated file by writing every data block and flushing it. For example,
-the following creates a new 64 GiB file; `oflag=excl` protects existing files:
-
-```bash
-dd if=/dev/zero of=/absolute/path/nds-kv.bin bs=4M count=16384 oflag=excl conv=fsync
-```
-
-Use a fresh metadata path for each validation run. Example `nds-kv.json`:
-
-```json
-{
-  "storage_path": "/absolute/path/nds-kv.bin",
-  "storage_offset": 0,
-  "storage_capacity": 68719476736,
-  "allocation_alignment": 4194304,
-  "namespace": "minimax-tp8-functional-run",
-  "metadata_path": "/absolute/path/run/metadata.sqlite",
-  "tent_config_path": "/absolute/path/nds-tent.json",
-  "log_dir": "/absolute/path/run/events",
-  "io_timeout_seconds": 120
-}
-```
-
-Size the range for the combined KV allocation of all ranks. The example reserves
-64 GiB, so the file must cover that capacity plus the starting offset; a short
-backend smoke test can use a smaller dedicated range.
-
-The vLLM connector configuration is:
-
-```json
-{
-  "kv_connector": "AscendStoreConnector",
-  "kv_connector_module_path": "tent_nds_connector",
-  "kv_role": "kv_both",
-  "kv_connector_extra_config": {"backend": "tent_nds", "use_layerwise": false}
-}
-```
-
-This adapter supports single-host whole-key transfers and publishes keys only
-after complete writes. It does not provide eviction, crash recovery or distributed
-metadata. It is not a Mooncake Store SSD tier.
-
 ## Verification
 
 ### Installation check
@@ -235,17 +182,15 @@ engine as a whole; verify NDS initialization and data transfer with the I/O test
 
 ### CPU tests
 
-The `chore/tent-nds-validation` branch contains tests, benchmark tools, CI and
-documentation as separate commits on top of `feat/tent-nds`. Run the CPU checks
-from that branch without NPU hardware:
+Run the CPU checks from the repository root without NPU hardware:
 
 ```bash
 python3 scripts/ci/run_tent_nds_cpu.py --mode on --build-root /var/tmp/tent-nds-on
 python3 scripts/ci/run_tent_nds_cpu.py --mode off --build-root /var/tmp/tent-nds-off
 ```
 
-The script builds and tests TENT, checks installation and missing-SDK behavior,
-and runs metadata concurrency checks. Reports are `result.json`, `ctest.xml` and
+The script builds and tests TENT, checks installed consumers and missing-SDK
+behavior. Reports are `result.json`, `ctest.xml` and
 `missing-sdk.log` under the build root. The mock SDK stays in the test directory;
 these checks do not validate DMA or hardware bandwidth.
 
@@ -304,22 +249,6 @@ acceptance target is at least 6.5 GB/s after data verification passes.
 NDS uses this standalone entry. The current tebench protocol path does not fully
 integrate Ascend or MemFabric either.
 
-### vLLM backend smoke test
-
-With vLLM-Ascend installed and `nds-kv.json` configured, test the adapter without
-loading a model:
-
-```bash
-python3 mooncake-integration/vllm/smoke_tent_nds.py --device 0
-```
-
-Expected output includes `success: true`, `fragments: 124`, `missing_key: -2`
-and `failed_write_published: false`. Then validate MiniMax TP8 generation and
-external KV reuse with repeated prefixes, local prefix caching disabled, and
-successful per-rank write/read events in `log_dir`. Backend smoke alone does not
-establish model-level functionality. End-to-end acceptance is functional;
-performance uses the standalone benchmark.
-
 ## Important Notes
 
 1. **Alignment and bounds:** Addresses, sizes and file offsets must be 512-byte
@@ -355,7 +284,6 @@ performance uses the standalone benchmark.
 | `ndsFileDriverOpen` fails | Check real facade/XDS library resolution, driver version and device permissions |
 | NDS is unavailable or registration/selection fails | Check both enable switches, the Ascend platform build, selected NPU, memory location, alignment and policy |
 | Transfer fails or completes fewer bytes | Inspect the JSON `error`, storage capacity, submitted range and driver I/O logs; retain buffers until drained |
-| Metadata identity mismatch | Use a fresh metadata path and a namespace matching the file range, model and KV layout |
 | Small-I/O bandwidth is low | Confirm data checks pass; compare the same fragment layout, batch size, depth, timing scope and device load |
 
 ## See Also
