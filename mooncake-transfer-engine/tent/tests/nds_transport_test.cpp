@@ -22,6 +22,17 @@ namespace {
 using nds_test::state;
 constexpr size_t kSize = 48 * 1024 * 1024;
 
+void expectFileRange(const std::string& file, size_t offset, size_t length,
+                     unsigned char expected) {
+    int fd = open(file.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    std::vector<unsigned char> actual(length);
+    ssize_t bytes = pread(fd, actual.data(), length, offset);
+    EXPECT_EQ(close(fd), 0);
+    ASSERT_EQ(bytes, static_cast<ssize_t>(length));
+    EXPECT_EQ(actual, std::vector<unsigned char>(length, expected));
+}
+
 class NdsTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -203,6 +214,70 @@ TEST_F(NdsTest, SeparateRequestsValidateEachBufferRange) {
     EXPECT_EQ(poll(batch, 2).s, FAILED);
     EXPECT_EQ(poll(batch, 3).s, FAILED);
     EXPECT_EQ(state.submitted_ios, 2);
+}
+
+TEST_F(NdsTest, RepeatedTargetRequestsUseSegmentLengthAndIndependentBounds) {
+    auto first = request(Request::WRITE, 4096);
+    auto second = request(Request::WRITE, 8192, 16384);
+    auto tail = request(Request::WRITE, 4096, kSize - 4096);
+    auto outside = request(Request::WRITE, 4096, 32768);
+    outside.target_offset = kSize;
+    memset(first.source, 0x11, first.length);
+    memset(second.source, 0x22, second.length);
+    memset(tail.source, 0x33, tail.length);
+
+    auto batch = engine->allocateBatch(4);
+    ASSERT_TRUE(
+        engine->submitTransfer(batch, {first, second, tail, outside}).ok());
+    EXPECT_EQ(poll(batch, 0).s, COMPLETED);
+    EXPECT_EQ(poll(batch, 0).transferred_bytes, 4096);
+    EXPECT_EQ(poll(batch, 1).s, COMPLETED);
+    EXPECT_EQ(poll(batch, 1).transferred_bytes, 8192);
+    EXPECT_EQ(poll(batch, 2).s, COMPLETED);
+    EXPECT_EQ(poll(batch, 2).transferred_bytes, 4096);
+    EXPECT_EQ(poll(batch, 3).s, FAILED);
+    EXPECT_EQ(state.submitted_ios, 3);
+    ASSERT_TRUE(engine->freeBatch(batch).ok());
+    expectFileRange(path, 0, 4096, 0x11);
+    expectFileRange(path, 16384, 8192, 0x22);
+    expectFileRange(path, kSize - 4096, 4096, 0x33);
+}
+
+TEST_F(NdsTest, MixedTargetsDoNotShareValidatedPathOrLength) {
+    constexpr size_t other_size = 16 * 1024;
+    auto other_name =
+        (std::filesystem::temp_directory_path() / "tent-nds-test-XXXXXX")
+            .string();
+    int other_fd = mkstemp(other_name.data());
+    ASSERT_GE(other_fd, 0);
+    ASSERT_EQ(ftruncate(other_fd, other_size), 0);
+    ASSERT_EQ(close(other_fd), 0);
+    SegmentID other_segment = 0;
+    ASSERT_TRUE(
+        engine->openSegment(other_segment, "file://" + other_name).ok());
+
+    auto first = request(Request::WRITE, 4096);
+    auto second = request(Request::WRITE, 4096, 4096);
+    second.target_id = other_segment;
+    second.target_offset = other_size - second.length;
+    auto outside = request(Request::WRITE, 4096, 8192);
+    outside.target_id = other_segment;
+    outside.target_offset = other_size;
+    memset(first.source, 0x44, first.length);
+    memset(second.source, 0x55, second.length);
+
+    auto batch = engine->allocateBatch(3);
+    ASSERT_TRUE(engine->submitTransfer(batch, {first, second, outside}).ok());
+    EXPECT_EQ(poll(batch, 0).s, COMPLETED);
+    EXPECT_EQ(poll(batch, 1).s, COMPLETED);
+    EXPECT_EQ(poll(batch, 2).s, FAILED);
+    EXPECT_EQ(state.submitted_ios, 2);
+    ASSERT_TRUE(engine->freeBatch(batch).ok());
+
+    expectFileRange(path, 0, 4096, 0x44);
+    expectFileRange(other_name, other_size - 4096, 4096, 0x55);
+    expectFileRange(path, other_size - 4096, 4096, 0);
+    EXPECT_EQ(unlink(other_name.c_str()), 0);
 }
 
 TEST_F(NdsTest, SeparateRequestsCrossRegistrationsAndReuseContext) {
