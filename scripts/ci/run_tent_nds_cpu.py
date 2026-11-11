@@ -33,6 +33,29 @@ def run(args, **kwargs):
     subprocess.run(list(map(str, args)), check=True, **kwargs)
 
 
+def check_default_config():
+    """Keep the shipped configuration capable of selecting NDS."""
+    config_path = (
+        ROOT / "mooncake-transfer-engine/tent/config/transfer-engine.json"
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    expected = {"enable": False}
+    if config.get("transports", {}).get("nds") != expected:
+        raise RuntimeError(
+            "Default NDS transport configuration is missing or stale"
+        )
+    file_policy = next(
+        (
+            policy
+            for policy in config.get("policy", [])
+            if policy.get("name") == "file_storage"
+        ),
+        None,
+    )
+    if file_policy is None or "nds" not in file_policy.get("transports", []):
+        raise RuntimeError("The default file_storage policy must authorize NDS")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("on", "off"), required=True)
@@ -40,6 +63,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--cmake-arg", action="append", default=[])
     args = parser.parse_args()
+    check_default_config()
     work = args.build_root.resolve()
     work.mkdir(parents=True, exist_ok=True)
     build, prefix = work / "build", work / "install"
