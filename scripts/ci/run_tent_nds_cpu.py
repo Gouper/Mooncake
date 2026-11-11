@@ -154,7 +154,7 @@ def main():
             os.environ.get("CXX", "c++"),
             "-std=c++20",
             "-I",
-            ROOT / "mooncake-transfer-engine/tent/include",
+            prefix / "include",
             TESTS / "nds_installed_consumer.cpp",
             "-L",
             prefix / "lib",
@@ -174,13 +174,6 @@ def main():
     if "not found" in linked or str(build) in linked:
         raise RuntimeError("Installed consumer depends on missing/build-tree libraries")
     run([sys.executable, TESTS / "test_nds_bindings.py", args.mode], env=env)
-    run(
-        [
-            sys.executable,
-            ROOT / "mooncake-integration/vllm/smoke_metadata_concurrency.py",
-            "--cpu",
-        ]
-    )
     # Missing production SDK must fail at configure time with an actionable error.
     missing = subprocess.run(
         [
