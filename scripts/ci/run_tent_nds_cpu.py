@@ -149,12 +149,14 @@ def main():
         env["LD_LIBRARY_PATH"] += ":" + str(sdk / "lib")
     env["PYTHONPATH"] = str(build / "mooncake-transfer-engine/tent/src/python")
     # An installed consumer must resolve every symbol without build-tree libs.
+    # Per the documented usage, C/C++ consumers take the public headers from
+    # the source tree and link against the installed libraries.
     run(
         [
             os.environ.get("CXX", "c++"),
             "-std=c++20",
             "-I",
-            prefix / "include",
+            ROOT / "mooncake-transfer-engine/tent/include",
             TESTS / "nds_installed_consumer.cpp",
             "-L",
             prefix / "lib",

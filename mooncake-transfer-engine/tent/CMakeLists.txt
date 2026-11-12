@@ -61,8 +61,3 @@ if(BUILD_UNIT_TESTS)
   add_subdirectory(tests)
   include(${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_plugin_context_tests.cmake)
 endif()
-
-# Wire the public TENT headers into this subtree so installing only
-# mooncake-transfer-engine/tent yields a usable prefix with tent/*.h present;
-# the include/tent install rules were previously never reached.
-add_subdirectory(include/tent)
