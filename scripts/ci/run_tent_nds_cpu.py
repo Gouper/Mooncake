@@ -35,15 +35,11 @@ def run(args, **kwargs):
 
 def check_default_config():
     """Keep the shipped configuration capable of selecting NDS."""
-    config_path = (
-        ROOT / "mooncake-transfer-engine/tent/config/transfer-engine.json"
-    )
+    config_path = ROOT / "mooncake-transfer-engine/tent/config/transfer-engine.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     expected = {"enable": False}
     if config.get("transports", {}).get("nds") != expected:
-        raise RuntimeError(
-            "Default NDS transport configuration is missing or stale"
-        )
+        raise RuntimeError("Default NDS transport configuration is missing or stale")
     file_policy = next(
         (
             policy
@@ -122,7 +118,7 @@ def main():
     targets = TARGETS + (["tent_nds_transport_test"] if args.mode == "on" else [])
     run(["cmake", "--build", build, "--parallel", args.jobs, "--target", *targets])
     names = [t for t in targets if t.endswith("_test")]
-    names += ["tent_python_guards_test", "tent_cli_test"]
+    names += ["tent_python_guards_test", "tent_cli_test", "tent_nds_benchmark_test"]
     run(
         [
             "ctest",

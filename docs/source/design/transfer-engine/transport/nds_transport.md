@@ -267,10 +267,14 @@ integrate Ascend or MemFabric either.
 5. **Observability:** Enable `metrics/enabled` in a metrics-enabled build to inspect
    `transport="nds"` request, byte, failure and attempt counters. Use TENT's
    `log_level` for diagnostics.
-6. **Automation:** CPU CI uses the same script above. Hardware validation runs the
-   benchmark and roundtrip scripts directly on a host with the production NDS SDK
-   (`NDS_ROOT`, `NDS_PYTHON`, `NDS_TEST_DIRECTORY`, an idle `NDS_DEVICE`); record the
-   reported SHA and environment with the results.
+6. **Automation:** CPU CI uses the same script above. For hardware validation,
+   run `benchmark_nds.py` using the Basic file I/O and MiniMax-shaped commands
+   above with the production NDS SDK and an idle NPU. Select the device with
+   `--device` and the output file with `--json`. Preserve the JSON results,
+   including the reported SHA and environment, and record the NDS SDK, XDS and
+   CANN versions separately. `success: true` means data verification passed and
+   the run, including cleanup, returned without an exception. The tool reports
+   bandwidth but does not enforce the 6.5 GB/s target.
 
 ## Troubleshooting
 

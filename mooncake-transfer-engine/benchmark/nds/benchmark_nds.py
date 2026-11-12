@@ -315,7 +315,6 @@ def run_buffers(args, result, path):
             torch.equal(buffer.cpu(), data) for buffer, data in zip(buffers, expected)
         ):
             raise RuntimeError("Post-benchmark data verification failed")
-        result["success"] = True
     finally:
         # Unregistration fences any unfinished DMA before releasing the tensor.
         for buffer in registered:
@@ -344,7 +343,9 @@ def main():
     }
     try:
         run(args, result)
+        result["success"] = True
     except Exception as exc:
+        result["success"] = False
         result["error"] = f"{type(exc).__name__}: {exc}"
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(result, indent=2) + "\n")

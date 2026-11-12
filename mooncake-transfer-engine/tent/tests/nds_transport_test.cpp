@@ -367,6 +367,43 @@ TEST_F(NdsTest, SharedDriverAndRegistrationSurviveOtherEngineShutdown) {
     EXPECT_EQ(poll(batch).s, COMPLETED);
 }
 
+TEST_F(NdsTest, SharedPinSurvivesOneShotPendingIoAndCanBeReused) {
+    cfg->set("transports/nds/register_memory", false);
+    auto other = std::make_unique<TransferEngine>(cfg);
+    ASSERT_TRUE(other->available());
+    MemoryOptions options;
+    options.type = NDS;
+    options.location = "npu:0";
+    ASSERT_TRUE(other->registerLocalMemory(buffer, kSize, options).ok());
+    SegmentID other_segment = 0;
+    ASSERT_TRUE(other->openSegment(other_segment, "file://" + path).ok());
+    auto batch = other->allocateBatch(1);
+    state.pause = true;
+    ASSERT_TRUE(other
+                    ->submitTransfer(batch, {{Request::WRITE, buffer,
+                                              other_segment, 0, 4096}})
+                    .ok());
+    ASSERT_TRUE(engine->unregisterLocalMemory(buffer, kSize).ok());
+    EXPECT_EQ(state.unpins, 0);
+    // Rejoining with pinning must reuse the still-live SDK registration.
+    ASSERT_TRUE(engine->registerLocalMemory(buffer, kSize, options).ok());
+    EXPECT_EQ(state.pins, 1);
+    ASSERT_TRUE(engine->unregisterLocalMemory(buffer, kSize).ok());
+    EXPECT_EQ(state.unpins, 0);
+    // Last-user unregister fences the pending write before unpinning. A failed
+    // unpin must preserve ownership so the caller can retry safely.
+    state.unpin_error = true;
+    EXPECT_FALSE(other->unregisterLocalMemory(buffer, kSize).ok());
+    EXPECT_GT(state.drains, 0);
+    EXPECT_EQ(state.unpins, 0);
+    state.unpin_error = false;
+    ASSERT_TRUE(other->unregisterLocalMemory(buffer, kSize).ok());
+    EXPECT_EQ(state.unpins, 1);
+    ASSERT_TRUE(other->freeBatch(batch).ok());
+    EXPECT_EQ(state.live_contexts, 0);
+    expectFileRange(path, 0, 4096, 0x5a);
+}
+
 TEST_F(NdsTest, RuntimeGateAndDriverFailureLeaveTransportUnavailable) {
     engine.reset();
     cfg->set("transports/nds/enable", false);
