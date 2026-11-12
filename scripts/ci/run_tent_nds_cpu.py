@@ -13,7 +13,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ROOT / "mooncake-transfer-engine/tent/tests"
-HEADER_SHA256 = "3f10e7de07d9379fddcd2e4f77f43b2b35dc5ab0d59bc5363d7592f8b1ac1557"
+HEADER_SHA256 = "8d88cfb991bb3a5dfe33d2f4194443bbe36b3aac04f0e589d1e9abef0986a232"
 TARGETS = [
     "tent_shared",
     "tentpy",
