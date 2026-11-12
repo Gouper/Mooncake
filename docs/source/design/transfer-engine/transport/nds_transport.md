@@ -267,11 +267,10 @@ integrate Ascend or MemFabric either.
 5. **Observability:** Enable `metrics/enabled` in a metrics-enabled build to inspect
    `transport="nds"` request, byte, failure and attempt counters. Use TENT's
    `log_level` for diagnostics.
-6. **Automation:** CPU CI uses the same script above. The manual
-   `.github/workflows/nds-hardware.yml` entry requires a prepared `nds-file` runner,
-   `NDS_ROOT`, `NDS_PYTHON`, `NDS_TEST_DIRECTORY`, an idle `NDS_DEVICE`,
-   `NDS_HARDWARE_ENABLED=true` and explicit file-write confirmation. Keep it disabled
-   without suitable hardware.
+6. **Automation:** CPU CI uses the same script above. Hardware validation runs the
+   benchmark and roundtrip scripts directly on a host with the production NDS SDK
+   (`NDS_ROOT`, `NDS_PYTHON`, `NDS_TEST_DIRECTORY`, an idle `NDS_DEVICE`); record the
+   reported SHA and environment with the results.
 
 ## Troubleshooting
 

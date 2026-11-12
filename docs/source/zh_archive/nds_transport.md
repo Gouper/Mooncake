@@ -253,10 +253,10 @@ NDS 使用该独立入口；当前 tebench 的协议路径也未完整接入 Asc
    NDS 的策略。
 5. **可观测性：** 使用启用了指标的构建，设置 `metrics/enabled` 后观察
    `transport="nds"` 的请求、字节、失败和物理尝试计数。日志级别使用 TENT 的 `log_level`。
-6. **自动化：** CPU CI 复用上述脚本。手动 `.github/workflows/nds-hardware.yml`
-   需要准备好的 `nds-file` runner、`NDS_ROOT`、`NDS_PYTHON`、`NDS_TEST_DIRECTORY`、
-   空闲的 `NDS_DEVICE`、`NDS_HARDWARE_ENABLED=true` 和明确的文件写入确认。
-   无真实环境时保持关闭。
+6. **自动化：** CPU CI 复用上述脚本。硬件验证在具备生产 NDS SDK 的主机上
+   直接运行 benchmark 与 roundtrip 脚本（`NDS_ROOT`、`NDS_PYTHON`、
+   `NDS_TEST_DIRECTORY`、空闲的 `NDS_DEVICE`）；结果中记录了提交 SHA
+   与环境信息，可随验收材料一并留存。
 
 ## 故障排查
 
