@@ -67,7 +67,8 @@ def main():
     flags = []
     if args.mode == "on":
         header = TESTS / "thirdparty/nds/ascend_nds.h"
-        if hashlib.sha256(header.read_bytes()).hexdigest() != HEADER_SHA256:
+        header_bytes = header.read_bytes().replace(b"\r\n", b"\n")
+        if hashlib.sha256(header_bytes).hexdigest() != HEADER_SHA256:
             raise RuntimeError("The third-party NDS header fixture changed")
         (sdk / "include").mkdir(parents=True, exist_ok=True)
         (sdk / "lib").mkdir(exist_ok=True)
@@ -118,7 +119,7 @@ def main():
     targets = TARGETS + (["tent_nds_transport_test"] if args.mode == "on" else [])
     run(["cmake", "--build", build, "--parallel", args.jobs, "--target", *targets])
     names = [t for t in targets if t.endswith("_test")]
-    names += ["tent_python_guards_test", "tent_cli_test", "tent_nds_benchmark_test"]
+    names += ["tent_python_guards_test", "tent_cli_test"]
     run(
         [
             "ctest",

@@ -17,7 +17,6 @@ uses the existing public API without changing the third-party header or ABI.
 - Each request describes a contiguous buffer; a batch can contain multiple HBM fragments.
 - Uses TENT memory registration, File Segments, batch submission and status queries.
 - Requires both the `USE_NDS` build option and the `transports/nds/enable` runtime setting.
-- Provides a standalone benchmark with data verification.
 
 NDS handles local storage transfers. Ascend Direct handles memory transfers.
 
@@ -32,7 +31,6 @@ NDS handles local storage transfers. Ascend Direct handles memory transfers.
 | NDS SDK | UBSIO `feat/nds-adapter-v2`, providing `ascend_nds.h` and `libascend_nds.so` |
 | XDS | `mycastiel/xds`, branch `loop_topo`, with matching userspace library and kernel module |
 | Mooncake dependencies | Follow the [build guide](../../../getting_started/build.md), including the dependencies for the selected Ascend platform |
-| Python tools | A compatible `torch`, `torch_npu` and `numpy` environment for the benchmark |
 
 Keep the NDS SDK, XDS userspace ABI and kernel driver compatible. CPU/mock tests
 run without NPU hardware and use a separate test SDK.
@@ -75,7 +73,7 @@ cmake --install build-nds/mooncake-transfer-engine/tent
 requires its CANN/ADXL/HIXL dependencies. `USE_NDS=ON` alone does not enable the
 Ascend memory probe. The `ascend_direct` transport can remain disabled at runtime.
 When selecting Python explicitly, set both `PYTHON_EXECUTABLE` and
-`Python3_EXECUTABLE` to the interpreter used by the benchmark.
+`Python3_EXECUTABLE` to the interpreter used by the application.
 
 | CMake option | Default | Purpose |
 | --- | --- | --- |
@@ -87,7 +85,7 @@ When selecting Python explicitly, set both `PYTHON_EXECUTABLE` and
 
 The native installation contains `libtent_shared.so` and the `tent` diagnostic
 command. C/C++ consumers use headers from `mooncake-transfer-engine/tent/include`.
-The benchmark uses the existing binding built under
+Python applications use the existing binding built under
 `build-nds/mooncake-transfer-engine/tent/src/python`; no NDS wheel is needed.
 
 ## Environment Variables
@@ -95,7 +93,7 @@ The benchmark uses the existing binding built under
 | Variable | Required | Description |
 | --- | --- | --- |
 | `LD_LIBRARY_PATH` | For libraries outside the loader search path | TENT, NDS SDK, XDS and CANN library directories |
-| `PYTHONPATH` | For Python tools | Built `tent` module for the benchmark |
+| `PYTHONPATH` | For Python tools | Built `tent` module for Python applications |
 | `MC_TENT_CONF` | For application configuration | TENT JSON file path or inline JSON |
 | `MC_USE_TENT` | For the classic TE compatibility entry | Set to `1`; direct `tent.TransferEngine()` calls do not need it |
 
@@ -142,9 +140,7 @@ Save the following as `nds-tent.json`. It selects NDS for local NPU file I/O:
 | `io_bytes` | `16777216` | Maximum bytes per entry; 512-byte aligned, from 512 B to 64 MiB |
 | `register_memory` | `false` | `false`: one-shot mappings; `true`: pin registered HBM through the facade |
 
-Recreate the engine after changing these settings. The standalone benchmark
-constructs its own TENT configuration from command-line arguments; use
-`--io-depth` and `--io-bytes` to configure it.
+Recreate the engine after changing these settings.
 
 ## Usage
 
@@ -163,7 +159,7 @@ segment, file_offset, length)` per registered HBM fragment. Advance the file
 offset by each fragment length so the key occupies a contiguous storage range.
 Submit these requests together in one batch. Set `policy_name="nds_storage"`
 to use the policy permitting only NDS. `transport_hint=NDS` expresses a preference
-within the allowed transports. The benchmark provides an executable example.
+within the allowed transports.
 
 ## Verification
 
@@ -192,60 +188,15 @@ behavior. Reports are `result.json`, `ctest.xml` and
 `missing-sdk.log` under the build root. The mock SDK stays in the test directory;
 these checks do not validate DMA or hardware bandwidth.
 
-### Basic file I/O
+### Hardware validation
 
-Choose a new test file on a supported local filesystem. The benchmark creates
-the file, initializes the requested data ranges and flushes them before NDS I/O.
-Existing files must cover the requested range. The test overwrites that range,
-including when `--mode read` is selected.
-
-```bash
-python3 mooncake-transfer-engine/benchmark/nds/benchmark_nds.py \
-  --file /absolute/path/nds-smoke.bin \
-  --device 0 --bytes 4096 --fragments 1 --batch 2 \
-  --mode roundtrip --warmup 0 --iterations 1 --json nds-smoke.json
-```
-
-Success requires exit code `0`, `success: true` and `verified_bytes: 8192`.
-The tool verifies CPU-written data through NDS, NDS-written data through POSIX
-`O_DIRECT`, and the NDS round trip before and after measurement. A failure returns `1` and
-records an `error` in the JSON result.
-
-### MiniMax-shaped benchmark
-
-The single-card MiniMax TP8 KV layout uses 124 fragments of 32 KiB per key with
-a 4 MiB storage stride. Run the same shape with 350 or 950 keys:
-
-```bash
-python3 mooncake-transfer-engine/benchmark/nds/benchmark_nds.py \
-  --file /absolute/path/nds-read-350.bin \
-  --device 0 --bytes 32768 --fragments 124 --batch 350 \
-  --key-stride 4194304 --io-depth 512 --mode read \
-  --warmup 2 --iterations 30 --json nds-read-350.json
-```
-
-Use `--file /absolute/path/nds-read-950.bin --batch 950 --json nds-read-950.json`
-for the larger case. Reserve sufficient
-HBM and storage: the range must cover
-`offset + batch * key_stride`.
-
-| Option or result | Meaning |
-| --- | --- |
-| `--bytes` / `--fragments` | Bytes per fragment and fragments per key |
-| `--batch` | Keys submitted in each batch, not calling threads |
-| `--io-depth` | Maximum outstanding facade entries; not the number of keys |
-| `--backend facade` | Reference measurement through the same UBSIO public API |
-| `measurements.read.gb_per_second` | Decimal read bandwidth in GB/s |
-| `mean_ms`, `p50_ms`, `p99_ms`, `samples` | Batch latency statistics and individual samples within each measurement |
-
-The TENT timing window covers submission through completion, including request
-validation and I/O planning. Tensor allocation, request construction, preparation
-writes, warmup, data verification and batch release are outside the measured read
-window. Compare facade and TENT results separately. The single-card pure-read
-acceptance target is at least 6.5 GB/s after data verification passes.
-
-NDS uses this standalone entry. The current tebench protocol path does not fully
-integrate Ascend or MemFabric either.
+With the production NDS SDK and an idle NPU, use the application calls above
+with a dedicated test file. Verify CPU-written data through NDS, NDS-written
+data through POSIX `O_DIRECT`, and an NDS write/read round trip. Check completed
+byte counts and compare the data before releasing buffers. Cover both one-shot
+and registered-memory modes, multiple fragments and batches larger than the
+configured I/O depth. Record the Mooncake commit, NDS SDK, XDS and CANN versions
+with the results.
 
 ## Important Notes
 
@@ -267,14 +218,9 @@ integrate Ascend or MemFabric either.
 5. **Observability:** Enable `metrics/enabled` in a metrics-enabled build to inspect
    `transport="nds"` request, byte, failure and attempt counters. Use TENT's
    `log_level` for diagnostics.
-6. **Automation:** CPU CI uses the same script above. For hardware validation,
-   run `benchmark_nds.py` using the Basic file I/O and MiniMax-shaped commands
-   above with the production NDS SDK and an idle NPU. Select the device with
-   `--device` and the output file with `--json`. Preserve the JSON results,
-   including the reported SHA and environment, and record the NDS SDK, XDS and
-   CANN versions separately. `success: true` means data verification passed and
-   the run, including cleanup, returned without an exception. The tool reports
-   bandwidth but does not enforce the 6.5 GB/s target.
+6. **Automation:** CPU CI uses the same script above. Hardware validation must
+   run separately with the production NDS SDK and an idle NPU; CPU/mock results
+   do not establish hardware correctness or performance.
 
 ## Troubleshooting
 
@@ -284,7 +230,7 @@ integrate Ascend or MemFabric either.
 | `import tent` fails or loads another build | Check the Python version, `PYTHONPATH`, `tent.__file__` and dependent libraries |
 | `ndsFileDriverOpen` fails | Check real facade/XDS library resolution, driver version and device permissions |
 | NDS is unavailable or registration/selection fails | Check both enable switches, the Ascend platform build, selected NPU, memory location, alignment and policy |
-| Transfer fails or completes fewer bytes | Inspect the JSON `error`, storage capacity, submitted range and driver I/O logs; retain buffers until drained |
+| Transfer fails or completes fewer bytes | Inspect the transfer status, storage capacity, submitted range and driver I/O logs; retain buffers until drained |
 | Small-I/O bandwidth is low | Confirm data checks pass; compare the same fragment layout, batch size, depth, timing scope and device load |
 
 ## See Also

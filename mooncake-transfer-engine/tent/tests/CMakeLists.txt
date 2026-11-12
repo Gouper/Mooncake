@@ -10,9 +10,6 @@ target_include_directories(tent_diagnostic_test
 add_test(NAME tent_diagnostic_test COMMAND tent_diagnostic_test)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_test(NAME tent_nds_benchmark_test
-         COMMAND ${Python3_EXECUTABLE}
-                 ${CMAKE_CURRENT_SOURCE_DIR}/test_nds_benchmark.py)
 add_test(NAME tent_cli_test
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py
                  $<TARGET_FILE:tent_cli>)

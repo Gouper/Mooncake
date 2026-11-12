@@ -21,7 +21,6 @@ NDS Transport 的代码位于 `mooncake-transfer-engine/tent/src/transport/nds`�
 - 每个请求描述一个连续缓冲区，一个 batch 可提交多个 HBM 分片。
 - 使用 TENT 的内存注册、File Segment、批量提交和状态查询接口。
 - 需要同时启用 `USE_NDS` 编译选项和 `transports/nds/enable` 运行时配置。
-- 提供带数据校验的独立 benchmark。
 
 NDS 负责本机存储读写，Ascend Direct 负责内存传输。
 
@@ -36,7 +35,6 @@ NDS 负责本机存储读写，Ascend Direct 负责内存传输。
 | NDS SDK | UBSIO `feat/nds-adapter-v2` 分支，提供 `ascend_nds.h` 和 `libascend_nds.so` |
 | XDS | `mycastiel/xds` 的 `loop_topo` 分支，用户态库与内核模块配套 |
 | Mooncake 构建依赖 | 按[编译指南](../getting_started/build.md)准备，并安装所选 Ascend 平台的构建依赖 |
-| Python 工具环境 | benchmark 需要配套的 `torch`、`torch_npu`、`numpy` |
 
 NDS SDK、XDS 用户态 ABI 和驱动须保持兼容。CPU/mock 测试使用独立测试 SDK，
 不需要 NPU 硬件。
@@ -78,7 +76,7 @@ cmake --install build-nds/mooncake-transfer-engine/tent
 示例通过 `USE_ASCEND_DIRECT=ON` 启用 Ascend 平台，需要对应的 CANN/ADXL/HIXL
 构建依赖。仅设置 `USE_NDS=ON` 不会启用 Ascend 内存探测。
 `ascend_direct` Transport 可以在运行时保持关闭。显式选择 Python 时，将
-`PYTHON_EXECUTABLE` 和 `Python3_EXECUTABLE` 都设置为 benchmark 使用的解释器。
+`PYTHON_EXECUTABLE` 和 `Python3_EXECUTABLE` 都设置为应用使用的解释器。
 
 | CMake 选项 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -89,7 +87,7 @@ cmake --install build-nds/mooncake-transfer-engine/tent
 | `TENT_METRICS_ENABLED` | `OFF` | 编译 TENT 指标支持 |
 
 原生安装包含 `libtent_shared.so` 和 `tent` 诊断命令。C/C++ 使用
-`mooncake-transfer-engine/tent/include` 中的头文件；benchmark 使用
+`mooncake-transfer-engine/tent/include` 中的头文件；Python 应用使用
 `build-nds/mooncake-transfer-engine/tent/src/python` 下构建的现有绑定，无需 NDS wheel。
 
 ## 环境变量配置
@@ -97,7 +95,7 @@ cmake --install build-nds/mooncake-transfer-engine/tent
 | 变量 | 使用条件 | 说明 |
 | --- | --- | --- |
 | `LD_LIBRARY_PATH` | 库不在动态加载器默认搜索路径时 | TENT、NDS SDK、XDS、CANN 的库目录 |
-| `PYTHONPATH` | 使用 Python 工具时 | 构建生成的 `tent` 模块目录，供 benchmark 使用 |
+| `PYTHONPATH` | 使用 Python 工具时 | 构建生成的 `tent` 模块目录，供 Python 应用使用 |
 | `MC_TENT_CONF` | 配置 TENT 应用时 | TENT JSON 文件路径或内联 JSON |
 | `MC_USE_TENT` | 使用经典 TE 兼容入口时 | 设置为 `1`；直接调用 `tent.TransferEngine()` 不需要 |
 
@@ -144,8 +142,7 @@ export MC_TENT_CONF=/absolute/path/nds-tent.json
 | `io_bytes` | `16777216` | 单个 IO 项的最大字节数，按 512 B 对齐，范围 512 B–64 MiB |
 | `register_memory` | `false` | `false` 使用一次性映射；`true` 通过适配库预注册 HBM |
 
-修改上述配置后重新创建 engine。独立 benchmark 按命令行参数生成自己的 TENT
-配置，使用 `--io-depth` 和 `--io-bytes` 设置其 IO 参数。
+修改上述配置后重新创建 engine。
 
 ## 使用方法
 
@@ -162,9 +159,9 @@ export MC_TENT_CONF=/absolute/path/nds-tent.json
 `tent.Request(opcode, address, segment, file_offset, length)`。按分片长度累加
 文件偏移，使整个 key 占据连续存储区间，再将这些请求作为一个 batch 提交。
 使用 `policy_name="nds_storage"` 选择仅允许 NDS 的策略；
-`transport_hint=NDS` 表达允许范围内的传输优先选择。独立 benchmark 包含可执行的完整调用示例。
+`transport_hint=NDS` 表达允许范围内的传输优先选择。
 
-## 功能与性能验证
+## 功能验证
 
 ### 安装检查
 
@@ -190,53 +187,13 @@ python3 scripts/ci/run_tent_nds_cpu.py --mode off --build-root /var/tmp/tent-nds
 `result.json`、`ctest.xml`、`missing-sdk.log` 保存结果。mock SDK 仅存在于测试
 目录，CPU 检查不代表真实 DMA 功能或硬件带宽。
 
-### 普通文件基础读写
+### 硬件验证
 
-在受支持的本机文件系统中选择新的测试文件。benchmark 创建文件，实际写入请求
-覆盖的数据区域并落盘，然后执行 NDS IO。已有文件需覆盖请求范围。测试会覆盖
-该范围，`--mode read` 也包含准备写入。
-
-```bash
-python3 mooncake-transfer-engine/benchmark/nds/benchmark_nds.py \
-  --file /absolute/path/nds-smoke.bin \
-  --device 0 --bytes 4096 --fragments 1 --batch 2 \
-  --mode roundtrip --warmup 0 --iterations 1 --json nds-smoke.json
-```
-
-成功条件为返回码 `0`、`success: true` 和 `verified_bytes: 8192`。工具校验 CPU
-写入后由 NDS 读取、NDS 写入后由 POSIX `O_DIRECT` 读取，以及测量前后的 NDS
-读写回环；失败时返回 `1`，JSON 中记录 `error`。
-
-### MiniMax 形状 benchmark
-
-MiniMax TP8 的单卡 KV 布局按每 key 124 个 32 KiB 分片、4 MiB 存储 stride
-构造。使用相同形状，分别下发 350 或 950 keys：
-
-```bash
-python3 mooncake-transfer-engine/benchmark/nds/benchmark_nds.py \
-  --file /absolute/path/nds-read-350.bin \
-  --device 0 --bytes 32768 --fragments 124 --batch 350 \
-  --key-stride 4194304 --io-depth 512 --mode read \
-  --warmup 2 --iterations 30 --json nds-read-350.json
-```
-
-较大压力使用 `--file /absolute/path/nds-read-950.bin --batch 950 --json nds-read-950.json`。
-预留足够的 HBM 和存储，文件容量须覆盖 `offset + batch * key_stride`。
-
-| 参数或结果 | 含义 |
-| --- | --- |
-| `--bytes` / `--fragments` | 每个分片的字节数、每个 key 的分片数 |
-| `--batch` | 每批提交的 key 数，不是调用线程数 |
-| `--io-depth` | 未完成的标准 IO 项上限，不是 key 数 |
-| `--backend facade` | 通过同一 UBSIO 公开接口进行对照测量 |
-| `measurements.read.gb_per_second` | 十进制读带宽，单位 GB/s |
-| `mean_ms`、`p50_ms`、`p99_ms`、`samples` | 各 measurement 中的批次延迟统计与原始样本 |
-
-TENT 计时范围从提交到完成，包含请求校验和 IO 规划；张量分配、请求对象构造、
-准备写入、预热、数据校验和 batch 释放不计入纯读测量。facade 与 TENT 结果分别
-比较。数据校验通过后，单卡纯读带宽验收目标为 6.5 GB/s 以上。
-
-NDS 使用该独立入口；当前 tebench 的协议路径也未完整接入 Ascend 和 MemFabric。
+在具备生产 NDS SDK 的主机上选择空闲 NPU 和专用测试文件，按上述应用调用流程
+验证 CPU 写入后由 NDS 读取、NDS 写入后由 POSIX `O_DIRECT` 读取，以及 NDS
+写入后读取的回环。检查完成字节数，并在释放缓冲区前比较数据内容。覆盖一次性映射、
+预注册内存、多分片，以及请求数超过 IO 深度的批次。保存结果时记录 Mooncake
+提交、NDS SDK、XDS 和 CANN 版本。
 
 ## 注意事项
 
@@ -253,10 +210,8 @@ NDS 使用该独立入口；当前 tebench 的协议路径也未完整接入 Asc
    NDS 的策略。
 5. **可观测性：** 使用启用了指标的构建，设置 `metrics/enabled` 后观察
    `transport="nds"` 的请求、字节、失败和物理尝试计数。日志级别使用 TENT 的 `log_level`。
-6. **自动化：** CPU CI 复用上述脚本。硬件验证在具备生产 NDS SDK 的主机上
-   直接运行 benchmark 与 roundtrip 脚本（`NDS_ROOT`、`NDS_PYTHON`、
-   `NDS_TEST_DIRECTORY`、空闲的 `NDS_DEVICE`）；结果中记录了提交 SHA
-   与环境信息，可随验收材料一并留存。
+6. **自动化：** CPU CI 复用上述脚本。硬件验证需在具备生产 NDS SDK 的主机上
+   使用空闲 NPU 单独执行；CPU/mock 结果不代表真实硬件的正确性或性能。
 
 ## 故障排查
 
@@ -266,7 +221,7 @@ NDS 使用该独立入口；当前 tebench 的协议路径也未完整接入 Asc
 | `import tent` 失败或加载了其他版本 | 检查 Python 版本、`PYTHONPATH`、`tent.__file__` 和动态库依赖 |
 | `ndsFileDriverOpen` 失败 | 检查真实适配库与 XDS 的加载路径、驱动版本及设备权限 |
 | NDS 不可用，或注册/选路失败 | 检查两个启用开关、Ascend 平台构建、当前 NPU、内存位置、对齐和策略 |
-| 请求失败或完成字节数不足 | 查看 JSON 的 `error`、存储容量、提交范围和驱动日志；排空前保留缓冲区 |
+| 请求失败或完成字节数不足 | 查看传输状态、存储容量、提交范围和驱动日志；排空前保留缓冲区 |
 | 小粒度带宽偏低 | 先确认数据校验通过，再对照相同的分片、batch、深度、计时范围和设备负载 |
 
 ## 相关文档
