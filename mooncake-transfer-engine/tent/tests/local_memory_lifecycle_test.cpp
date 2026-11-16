@@ -28,6 +28,11 @@
 #include "tent/runtime/transport.h"
 #include "tent/runtime/proxy_manager.h"
 
+#if defined(USE_MEMFABRIC) && defined(__linux__)
+#include <sys/mman.h>
+#include "tent/transport/memfabric/memfabric_transport.h"
+#endif
+
 #if defined(__linux__)
 namespace {
 std::atomic<bool> fail_next_segment_sync{false};
@@ -439,6 +444,289 @@ TEST(LocalMemoryLifecycle, StagePoolSelectsAllocatorFromLocalTransports) {
         EXPECT_EQ(mlu->remove_calls, with_mlu ? 1 : 0);
     }
 }
+
+#if defined(USE_MEMFABRIC) && defined(__linux__)
+// A logical GVA is not dereferenceable. PROT_NONE makes an accidental host
+// probe fail deterministically instead of quietly accepting a CPU-accessible
+// fake.
+class DeviceAddressMemFabricTransport : public MemFabricTransport {
+   public:
+    ~DeviceAddressMemFabricTransport() override {
+        if (pool) munmap(pool, pool_size);
+    }
+
+    Status allocateLocalMemory(void** address, size_t size,
+                               MemoryOptions&) override {
+        pool =
+            mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pool == MAP_FAILED) {
+            pool = nullptr;
+            return Status::InternalError("mmap failed");
+        }
+        pool_size = size;
+        *address = pool;
+        return Status::OK();
+    }
+
+    Status freeLocalMemory(void* address, size_t size) override {
+        ++free_calls;
+        if (address != pool || size != pool_size)
+            return Status::InvalidArgument("unknown allocation");
+        munmap(pool, pool_size);
+        pool = nullptr;
+        return Status::OK();
+    }
+
+    bool describeAllocation(void* address, size_t size,
+                            MemoryOptions& options) const override {
+        if (!pool || address != pool || size != pool_size) return false;
+        options.type = MEMFABRIC;
+        options.location = "npu:0";
+        options.global_address = reinterpret_cast<uint64_t>(pool);
+        return true;
+    }
+
+    bool overlapsAllocation(void* address, size_t size) const override {
+        const auto base = reinterpret_cast<uint64_t>(pool);
+        const auto start = reinterpret_cast<uint64_t>(address);
+        return pool && size &&
+               (start >= base ? start - base < pool_size : base - start < size);
+    }
+
+    bool supportsGlobalAddressing() const override { return true; }
+
+    bool warmupMemory(void*, size_t) override {
+        ++warmup_calls;
+        return false;
+    }
+
+    Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        desc.transports.push_back(MEMFABRIC);
+        return Status::OK();
+    }
+
+    Status addMemoryBuffer(std::vector<BufferDesc>& descs,
+                           const MemoryOptions& options) override {
+        if (fail_registration)
+            return Status::InternalError("injected GVA export failure");
+        for (auto& desc : descs) addMemoryBuffer(desc, options);
+        return Status::OK();
+    }
+
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        desc.transports.erase(std::remove(desc.transports.begin(),
+                                          desc.transports.end(), MEMFABRIC),
+                              desc.transports.end());
+        return Status::OK();
+    }
+
+    Status mapRemoteMemory(SegmentID, void*, size_t) override {
+        return Status::NotImplemented("Use the device-address output overload");
+    }
+
+    Status mapRemoteMemory(SegmentID, void* gva, size_t size,
+                           void** device_address) override {
+        ++map_calls;
+        return resolveGlobalAddress(gva, size, device_address);
+    }
+
+    Status resolveGlobalAddress(void* gva, size_t size,
+                                void** device_address) override {
+        if (!device_address)
+            return Status::InvalidArgument("Null device-address output");
+        *device_address = nullptr;
+        const auto address = reinterpret_cast<uint64_t>(gva);
+        const auto base = reinterpret_cast<uint64_t>(pool);
+        if (!pool || !size || address < base || address - base >= pool_size ||
+            size > pool_size - (address - base))
+            return Status::InvalidArgument("Unknown logical range");
+        *device_address = reinterpret_cast<void*>(address + (1ULL << 40));
+        return Status::OK();
+    }
+
+    Status unmapRemoteMemory(SegmentID, void*) override {
+        ++unmap_calls;
+        return Status::OK();
+    }
+
+    void* pool = nullptr;
+    size_t pool_size = 0;
+    int warmup_calls = 0, free_calls = 0, map_calls = 0, unmap_calls = 0;
+    bool fail_registration = false;
+};
+
+class RegistrationObserver : public FailOnceRemoveTransport {
+   public:
+    RegistrationObserver() : FailOnceRemoveTransport(TCP) {}
+    bool warmupMemory(void*, size_t) override {
+        ++warmup_calls;
+        return false;
+    }
+    Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& options) override {
+        registered.push_back(desc.addr);
+        return FailOnceRemoveTransport::addMemoryBuffer(desc, options);
+    }
+    int warmup_calls = 0;
+    std::vector<uint64_t> registered;
+};
+
+class MemFabricEngineRegistration : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        auto config = makeConfig();
+        config->set("transports/memfabric/enable", false);
+        engine = std::make_unique<TransferEngineImpl>(config);
+        ASSERT_TRUE(engine->available());
+        memfabric = std::make_shared<DeviceAddressMemFabricTransport>();
+        tcp = std::make_shared<RegistrationObserver>();
+        engine->swapTransportForTest(MEMFABRIC, memfabric);
+        engine->swapTransportForTest(TCP, tcp);
+        MemoryOptions options;
+        options.type = MEMFABRIC;
+        options.location = "cpu:0";
+        // A zero request still produces a managed GVA pool.
+        ASSERT_TRUE(engine->allocateLocalMemory(&pool, kSize, options).ok());
+        EXPECT_EQ(options.global_address, 0u);
+    }
+
+    static constexpr size_t kSize = 4096;
+    std::unique_ptr<TransferEngineImpl> engine;
+    std::shared_ptr<DeviceAddressMemFabricTransport> memfabric;
+    std::shared_ptr<RegistrationObserver> tcp;
+    void* pool = nullptr;
+};
+
+TEST_F(MemFabricEngineRegistration, KnownDeviceAddressBypassesCpuProbing) {
+    MemoryOptions options;
+    options.location = "cpu:0";
+    auto status = engine->registerLocalMemory({pool}, {kSize}, options);
+    ASSERT_TRUE(status.ok()) << status;
+    const auto buffers = TransferEngineImplTestPeer::localBuffers(*engine);
+    ASSERT_EQ(buffers.size(), 1u);
+    EXPECT_EQ(buffers[0].location, "npu:0");
+    EXPECT_EQ(buffers[0].transports, std::vector<TransportType>{MEMFABRIC});
+    EXPECT_EQ(memfabric->warmup_calls, 0);
+    EXPECT_EQ(tcp->warmup_calls, 0);
+    EXPECT_TRUE(tcp->registered.empty());
+}
+
+TEST_F(MemFabricEngineRegistration,
+       RejectsPartialOrCrossTransportRegistration) {
+    MemoryOptions options;
+    for (auto range : std::vector<std::pair<void*, size_t>>{
+             {pool, kSize - 1},
+             {reinterpret_cast<void*>(reinterpret_cast<uint64_t>(pool) + 1),
+              kSize - 1},
+             {pool, kSize + 1}}) {
+        EXPECT_TRUE(
+            engine->registerLocalMemory({range.first}, {range.second}, options)
+                .IsInvalidArgument());
+    }
+    options.type = TCP;
+    EXPECT_TRUE(engine->registerLocalMemory({pool}, {kSize}, options)
+                    .IsInvalidArgument());
+    EXPECT_EQ(tcp->warmup_calls, 0);
+    EXPECT_TRUE(tcp->registered.empty());
+}
+
+TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {
+    std::vector<char> ordinary(kSize);
+    MemoryOptions options;
+    options.location = "npu:0";
+    auto status =
+        engine->registerLocalMemory({ordinary.data()}, {kSize}, options);
+    ASSERT_TRUE(status.ok()) << status;
+    const auto buffers = TransferEngineImplTestPeer::localBuffers(*engine);
+    ASSERT_EQ(buffers.size(), 1u);
+    // NUMA probing may return the wildcard when move_pages is unavailable.
+    EXPECT_TRUE(buffers[0].location == kWildcardLocation ||
+                buffers[0].location.substr(0, 4) == "cpu:");
+    EXPECT_GT(tcp->warmup_calls, 0);
+    EXPECT_EQ(
+        tcp->registered,
+        std::vector<uint64_t>{reinterpret_cast<uint64_t>(ordinary.data())});
+    EXPECT_TRUE(engine->unregisterLocalMemory(ordinary.data()).ok());
+}
+
+TEST_F(MemFabricEngineRegistration, MixedBatchLimitsDevicePoolToMemFabric) {
+    std::vector<char> ordinary(kSize);
+    MemoryOptions options;
+    auto status = engine->registerLocalMemory({pool, ordinary.data()},
+                                              {kSize, kSize}, options);
+    ASSERT_TRUE(status.ok()) << status;
+    const auto buffers = TransferEngineImplTestPeer::localBuffers(*engine);
+    ASSERT_EQ(buffers.size(), 2u);
+    for (const auto& buffer : buffers) {
+        if (buffer.addr == reinterpret_cast<uint64_t>(pool)) {
+            EXPECT_EQ(buffer.transports, std::vector<TransportType>{MEMFABRIC});
+        }
+    }
+    EXPECT_EQ(
+        tcp->registered,
+        std::vector<uint64_t>{reinterpret_cast<uint64_t>(ordinary.data())});
+    EXPECT_TRUE(engine->unregisterLocalMemory(ordinary.data()).ok());
+}
+
+TEST_F(MemFabricEngineRegistration, ExportFailureCannotFallBackToCpuTransport) {
+    memfabric->fail_registration = true;
+    EXPECT_FALSE(engine->registerLocalMemory(pool, kSize).ok());
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());
+    EXPECT_TRUE(tcp->registered.empty());
+}
+
+TEST_F(MemFabricEngineRegistration, ZeroRequestCannotFreePublishedPool) {
+    ASSERT_TRUE(engine->registerLocalMemory(pool, kSize).ok());
+    EXPECT_TRUE(engine->freeLocalMemory(pool).IsInvalidArgument());
+    EXPECT_EQ(memfabric->free_calls, 0);
+    ASSERT_TRUE(engine->unregisterLocalMemory(pool).ok());
+    EXPECT_TRUE(engine->freeLocalMemory(pool).ok());
+    EXPECT_EQ(memfabric->free_calls, 1);
+}
+
+TEST_F(MemFabricEngineRegistration, ExplicitMappingDispatchesToMemFabric) {
+    void* device_address = nullptr;
+    EXPECT_TRUE(
+        engine->mapRemoteMemory(1, pool, kSize, &device_address, MEMFABRIC)
+            .ok());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(device_address),
+              reinterpret_cast<uint64_t>(pool) + (1ULL << 40));
+    EXPECT_TRUE(engine->unmapRemoteMemory(1, pool, MEMFABRIC).ok());
+    EXPECT_EQ(memfabric->map_calls, 1);
+    EXPECT_EQ(memfabric->unmap_calls, 1);
+}
+TEST_F(MemFabricEngineRegistration, StrictMappingRejectsLogicalAddressMode) {
+    EXPECT_TRUE(
+        engine->mapRemoteMemory(1, pool, kSize, MEMFABRIC).IsNotImplemented());
+    EXPECT_EQ(memfabric->map_calls, 0);
+}
+
+TEST_F(MemFabricEngineRegistration, ResolveDispatchesLogicalRangeToMemFabric) {
+    auto* offset =
+        reinterpret_cast<void*>(reinterpret_cast<uint64_t>(pool) + 32);
+    void* device_address = nullptr;
+    ASSERT_TRUE(
+        engine->resolveGlobalAddress(offset, 64, &device_address, MEMFABRIC)
+            .ok());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(device_address),
+              reinterpret_cast<uint64_t>(offset) + (1ULL << 40));
+    EXPECT_FALSE(
+        engine
+            ->resolveGlobalAddress(pool, kSize + 1, &device_address, MEMFABRIC)
+            .ok());
+    EXPECT_EQ(device_address, nullptr);
+    EXPECT_FALSE(
+        engine->resolveGlobalAddress(pool, kSize, nullptr, MEMFABRIC).ok());
+}
+
+TEST_F(MemFabricEngineRegistration, MappingRejectsMissingOutputBeforeDispatch) {
+    EXPECT_FALSE(engine
+                     ->mapRemoteMemory(1, pool, kSize,
+                                       static_cast<void**>(nullptr), MEMFABRIC)
+                     .ok());
+    EXPECT_EQ(memfabric->map_calls, 0);
+}
+#endif
 
 }  // namespace
 }  // namespace tent

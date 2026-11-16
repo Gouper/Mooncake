@@ -151,6 +151,26 @@ class Transport {
             "Global address mapping is unavailable" LOC_MARK);
     }
 
+    virtual Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                                   void** device_address) {
+        if (!device_address)
+            return Status::InvalidArgument(
+                "Null device address output" LOC_MARK);
+        *device_address = nullptr;
+        CHECK_STATUS(mapRemoteMemory(peer, gva, size));
+        *device_address = gva;
+        return Status::OK();
+    }
+
+    virtual Status resolveGlobalAddress(void*, size_t, void** device_address) {
+        if (!device_address)
+            return Status::InvalidArgument(
+                "Null device address output" LOC_MARK);
+        *device_address = nullptr;
+        return Status::NotImplemented(
+            "Global address resolution is unavailable" LOC_MARK);
+    }
+
     virtual Status unmapRemoteMemory(SegmentID, void*) {
         return Status::NotImplemented(
             "Global address mapping is unavailable" LOC_MARK);

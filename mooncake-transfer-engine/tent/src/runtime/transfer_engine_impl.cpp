@@ -46,6 +46,9 @@
 #ifdef USE_XPU
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
+#ifdef USE_MEMFABRIC
+#include "tent/transport/memfabric/memfabric_transport.h"
+#endif
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -915,14 +918,24 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
     for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
          ++it) {
         if (it->addr == addr) {
-            if (it->options.global_address) {
+            bool managed_gva = it->options.global_address != 0;
+#ifdef USE_MEMFABRIC
+            if (auto* memfabric =
+                    dynamic_cast<MemFabricTransport*>(it->transport)) {
+                MemoryOptions allocation;
+                managed_gva = managed_gva || memfabric->describeAllocation(
+                                                 addr, it->size, allocation);
+            }
+#endif
+            if (managed_gva) {
                 auto segment = metadata_->segmentManager().getLocal();
                 if (segment) {
                     const auto base = reinterpret_cast<uint64_t>(addr);
                     for (const auto& buffer :
                          std::get<MemorySegmentDesc>(segment->detail).buffers) {
-                        if (buffer.addr < base + it->size &&
-                            base < buffer.addr + buffer.length)
+                        if (buffer.addr >= base
+                                ? buffer.addr - base < it->size
+                                : base - buffer.addr < buffer.length)
                             return Status::InvalidArgument(
                                 "Unregister GVA memory before freeing "
                                 "it" LOC_MARK);
@@ -971,6 +984,61 @@ Status TransferEngineImpl::mapRemoteMemory(SegmentID peer, void* gva,
             return transport_list_[candidate]->mapRemoteMemory(peer, gva, size);
     }
     return Status::NotImplemented("No global-address transport" LOC_MARK);
+}
+
+Status TransferEngineImpl::mapRemoteMemory(SegmentID peer, void* gva,
+                                           size_t size, void** device_address,
+                                           TransportType type) {
+    if (!device_address)
+        return Status::InvalidArgument("Null device address output" LOC_MARK);
+    *device_address = nullptr;
+    const auto address = reinterpret_cast<uint64_t>(gva);
+    if (peer == LOCAL_SEGMENT_ID || !address || !size ||
+        size > UINT64_MAX - address || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid global mapping range or transport" LOC_MARK);
+    std::vector<TransportType> exported;
+    if (type == UNSPEC) {
+        SegmentDescRef pin;
+        CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+            peer, pin, [&](SegmentDesc* segment) -> Status {
+                auto* buffer = segment->findBuffer(address, size);
+                if (!buffer)
+                    return Status::NeedsRefreshCache(
+                        "Memory range is not registered" LOC_MARK);
+                exported = buffer->transports;
+                return Status::OK();
+            }));
+    }
+    for (auto candidate : getSupportedTransports(type)) {
+        if (transport_list_[candidate]->supportsGlobalAddressing() &&
+            (type != UNSPEC || std::find(exported.begin(), exported.end(),
+                                         candidate) != exported.end()))
+            return transport_list_[candidate]->mapRemoteMemory(peer, gva, size,
+                                                               device_address);
+    }
+    return Status::NotImplemented("No global-address transport" LOC_MARK);
+}
+
+Status TransferEngineImpl::resolveGlobalAddress(void* gva, size_t size,
+                                                void** device_address,
+                                                TransportType type) {
+    if (!device_address)
+        return Status::InvalidArgument("Null device address output" LOC_MARK);
+    *device_address = nullptr;
+    auto address = reinterpret_cast<uint64_t>(gva);
+    if (!address || !size || size > UINT64_MAX - address || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid GVA resolution arguments" LOC_MARK);
+    Status result = Status::NotImplemented("No address resolver" LOC_MARK);
+    for (auto candidate : getSupportedTransports(type)) {
+        result = transport_list_[candidate]->resolveGlobalAddress(
+            gva, size, device_address);
+        if (!result.IsNotImplemented()) return result;
+    }
+    return result;
 }
 
 Status TransferEngineImpl::unmapRemoteMemory(SegmentID peer, void* gva,
@@ -1058,52 +1126,84 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
     desc_list.reserve(addr_list.size());
+    std::unordered_set<uint64_t> memfabric_pools;
+#ifdef USE_MEMFABRIC
+    auto* memfabric =
+        dynamic_cast<MemFabricTransport*>(transport_list_[MEMFABRIC].get());
+#endif
     for (size_t i = 0; i < addr_list.size(); ++i) {
         BufferDesc desc;
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
+        if (!desc.addr || !desc.length || desc.length > UINT64_MAX - desc.addr)
+            return Status::InvalidArgument(
+                "Invalid memory registration range" LOC_MARK);
 
-        auto& platform = Platform::getLoader();
-#ifdef USE_CUDA
-        // Warm-up can register memory temporarily, so validate it first.
-        auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
-        CudaPointerInfo pointer_info;
-        if (cuda)
-            CHECK_STATUS(
-                cuda->validateMemoryRegistration(addr_list[i], pointer_info));
-#endif
-
-        // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
-        // subsequent RDMA registration and NUMA probing
-        bool pages_pinned = false;
-        for (auto type : transports) {
-            if (transport_list_[type]->warmupMemory(addr_list[i],
-                                                    size_list[i])) {
-                pages_pinned = true;
-                break;
+        bool known_memfabric_pool = false;
+#ifdef USE_MEMFABRIC
+        if (memfabric) {
+            MemoryOptions allocation;
+            known_memfabric_pool = memfabric->describeAllocation(
+                addr_list[i], size_list[i], allocation);
+            if (known_memfabric_pool) {
+                if (options.type != UNSPEC && options.type != MEMFABRIC)
+                    return Status::InvalidArgument(
+                        "MemFabric GVA pools require MEMFABRIC "
+                        "registration" LOC_MARK);
+                desc.location = allocation.location;
+                memfabric_pools.insert(desc.addr);
+            } else if (memfabric->overlapsAllocation(addr_list[i],
+                                                     size_list[i])) {
+                return Status::InvalidArgument(
+                    "Register the complete MemFabric GVA pool" LOC_MARK);
             }
         }
-
-        // NUMA probe: skip prefault if warm-up already pinned pages
-        std::vector<RangeLocation> entries;
-#ifdef USE_CUDA
-        if (cuda) {
-            entries = cuda->getLocation(addr_list[i], size_list[i],
-                                        pages_pinned, pointer_info);
-        } else
 #endif
-        {
-            entries =
-                platform.getLocation(addr_list[i], size_list[i], pages_pinned);
-        }
-        if (entries.empty())
-            return Status::InvalidArgument(
-                "Unable to locate registered memory range" LOC_MARK);
-        if (entries.size() == 1) {
-            desc.location = entries[0].location;
-        } else {
-            desc.location = entries[0].location;
-            desc.regions = coalesceRegions(entries);
+        // Both HBM and DRAM pools expose logical GVA tokens, which cannot be
+        // dereferenced. Only a trusted backend record can bypass probing.
+        if (!known_memfabric_pool) {
+            auto& platform = Platform::getLoader();
+#ifdef USE_CUDA
+            // Warm-up can register memory temporarily, so validate it first.
+            auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
+            CudaPointerInfo pointer_info;
+            if (cuda)
+                CHECK_STATUS(cuda->validateMemoryRegistration(addr_list[i],
+                                                              pointer_info));
+#endif
+
+            // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
+            // subsequent RDMA registration and NUMA probing
+            bool pages_pinned = false;
+            for (auto type : transports) {
+                if (transport_list_[type]->warmupMemory(addr_list[i],
+                                                        size_list[i])) {
+                    pages_pinned = true;
+                    break;
+                }
+            }
+
+            // NUMA probe: skip prefault if warm-up already pinned pages
+            std::vector<RangeLocation> entries;
+#ifdef USE_CUDA
+            if (cuda) {
+                entries = cuda->getLocation(addr_list[i], size_list[i],
+                                            pages_pinned, pointer_info);
+            } else
+#endif
+            {
+                entries = platform.getLocation(addr_list[i], size_list[i],
+                                               pages_pinned);
+            }
+            if (entries.empty())
+                return Status::InvalidArgument(
+                    "Unable to locate registered memory range" LOC_MARK);
+            if (entries.size() == 1) {
+                desc.location = entries[0].location;
+            } else {
+                desc.location = entries[0].location;
+                desc.regions = coalesceRegions(entries);
+            }
         }
         desc.ref_count = 1;
         // The probe is the source of truth for transport selection: it
@@ -1116,7 +1216,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         // make getTypeEnum() return MTYPE_UNKNOWN and break transport
         // selection. Validate before overriding: keep the probe when the
         // caller is a wildcard, unknown, or a different type.
-        if (options.location != kWildcardLocation &&
+        if (!known_memfabric_pool && options.location != kWildcardLocation &&
             !options.location.empty()) {
             auto probed_type =
                 getTypeEnum(LocationParser(desc.location).type());
@@ -1142,6 +1242,14 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
+    // Export managed pools before optional registrations, so an export
+    // failure cannot publish a device pointer through a CPU transport.
+    if (!memfabric_pools.empty()) {
+        const auto found =
+            std::find(transports.begin(), transports.end(), MEMFABRIC);
+        std::rotate(transports.begin(), found, found + 1);
+    }
+
     bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
         desc_list,
@@ -1153,13 +1261,26 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             std::vector<TransportType> registered_transports;
             Status first_error = Status::OK();
             for (auto type : transports) {
-                auto s = transport_list_[type]->addMemoryBuffer(descs, options);
+                std::vector<BufferDesc> filtered;
+                std::vector<size_t> indices;
+                auto* selected = &descs;
+                if (!memfabric_pools.empty() && type != MEMFABRIC) {
+                    for (size_t i = 0; i < descs.size(); ++i) {
+                        if (memfabric_pools.count(descs[i].addr)) continue;
+                        indices.push_back(i);
+                        filtered.push_back(descs[i]);
+                    }
+                    if (filtered.empty()) continue;
+                    selected = &filtered;
+                }
+                auto s =
+                    transport_list_[type]->addMemoryBuffer(*selected, options);
                 if (!s.ok()) {
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
                     // transport as defensive cleanup for a partially
                     // constructed backend.
-                    for (auto& desc : descs) {
+                    for (auto& desc : *selected) {
                         auto cleanup =
                             transport_list_[type]->removeMemoryBuffer(desc);
                         if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
@@ -1171,9 +1292,13 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     // the long-standing best-effort behavior across several
                     // installed transports, but may not publish a buffer for
                     // which every backend failed.
-                    if (options.type != UNSPEC) return s;
+                    if (options.type != UNSPEC ||
+                        (type == MEMFABRIC && !memfabric_pools.empty()))
+                        return s;
                     continue;
                 }
+                for (size_t i = 0; i < indices.size(); ++i)
+                    descs[indices[i]] = std::move(filtered[i]);
                 registered_transports.push_back(type);
             }
             if (registered_transports.empty() && !first_error.ok()) {

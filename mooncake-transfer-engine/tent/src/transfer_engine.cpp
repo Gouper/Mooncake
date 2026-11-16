@@ -103,6 +103,17 @@ Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
     return impl_->mapRemoteMemory(peer, gva, size, type);
 }
 
+Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                                       void** device_address,
+                                       TransportType type) {
+    return impl_->mapRemoteMemory(peer, gva, size, device_address, type);
+}
+Status TransferEngine::resolveGlobalAddress(void* gva, size_t size,
+                                            void** device_address,
+                                            TransportType type) {
+    return impl_->resolveGlobalAddress(gva, size, device_address, type);
+}
+
 Status TransferEngine::unmapRemoteMemory(SegmentID peer, void* gva,
                                          TransportType type) {
     return impl_->unmapRemoteMemory(peer, gva, type);

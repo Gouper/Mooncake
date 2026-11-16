@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "memfabric_types.h"
+#include "tent/transport/memfabric/memfabric_shared_memory.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/memfabric/memfabric_under_api.h"
@@ -75,6 +76,15 @@ class MemFabricTransport : public Transport {
                            const MemoryOptions& options) override;
     Status removeMemoryBuffer(BufferDesc& desc) override;
 
+    Status allocateLocalMemory(void**, size_t, MemoryOptions&) override;
+    Status freeLocalMemory(void*, size_t) override;
+    bool supportsGlobalAddressing() const override;
+    Status mapRemoteMemory(SegmentID, void*, size_t) override;
+    Status mapRemoteMemory(SegmentID, void*, size_t, void**) override;
+    Status resolveGlobalAddress(void*, size_t, void**) override;
+    Status unmapRemoteMemory(SegmentID, void*) override;
+    virtual bool describeAllocation(void*, size_t, MemoryOptions&) const;
+    virtual bool overlapsAllocation(void*, size_t) const;
     const char* getName() const override { return "memfabric"; }
     bool supportNotification() const override { return false; }
 
@@ -100,7 +110,10 @@ class MemFabricTransport : public Transport {
     std::string local_segment_name_;
     MemFabricConfig config_;
 
-    std::mutex inflight_mu_;
+    mutable std::mutex inflight_mu_;
+    std::shared_ptr<MemFabricSharedMemory> gva_;
+    MemFabricGvaConfig gva_config_;
+    std::map<std::pair<SegmentID, uint64_t>, std::string> gva_remote_;
     std::condition_variable inflight_cv_;
     // Non-owning batch index, protected together with submission and polling.
     std::unordered_set<MemFabricSubBatch*> batches_;

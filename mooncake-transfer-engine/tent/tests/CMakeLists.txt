@@ -901,6 +901,10 @@ target_include_directories(tent_segment_desc_retry_test
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 
 if(USE_MEMFABRIC)
+  add_executable(tent_memfabric_gva_test memfabric_gva_test.cpp)
+  target_link_libraries(tent_memfabric_gva_test PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_memfabric_gva_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_memfabric_gva_test COMMAND tent_memfabric_gva_test)
   add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
   target_link_libraries(tent_memfabric_transport_test PRIVATE gtest gtest_main
                                                               tent_link_group)
@@ -909,6 +913,33 @@ if(USE_MEMFABRIC)
                                           ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
   add_test(NAME tent_memfabric_transport_test
            COMMAND tent_memfabric_transport_test)
+endif()
+if(USE_MEMFABRIC)
+  target_sources(tent_local_memory_lifecycle_test PRIVATE memfabric_test_acl_stubs.cpp)
+  target_include_directories(tent_local_memory_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
+endif()
+option(BUILD_MEMFABRIC_GVA_NATIVE_SMOKE "Build opt-in two-NPU MemFabric GVA smoke executable" OFF)
+if(BUILD_MEMFABRIC_GVA_NATIVE_SMOKE)
+  if(NOT USE_MEMFABRIC OR NOT MEMFABRIC_HYBM_GVA_REGISTRY_HEADERS)
+    message(FATAL_ERROR "Native GVA smoke requires MemFabric and compatible official HYBM headers")
+  endif()
+  find_path(MEMFABRIC_ACL_INCLUDE_DIR acl/acl.h
+            HINTS ENV ASCEND_HOME_PATH PATH_SUFFIXES include)
+  find_library(MEMFABRIC_ACL_LIBRARY ascendcl
+               HINTS ENV ASCEND_HOME_PATH PATH_SUFFIXES lib64)
+  if(NOT MEMFABRIC_ACL_INCLUDE_DIR OR NOT MEMFABRIC_ACL_LIBRARY)
+    message(FATAL_ERROR "Native GVA smoke requires real ACL headers/library; set ASCEND_HOME_PATH")
+  endif()
+  add_executable(tent_memfabric_gva_native_smoke memfabric_gva_native_smoke.cpp
+                 ../src/transport/memfabric/memfabric_shared_memory.cpp
+                 ../src/transport/memfabric/memfabric_gva_api.cpp
+                 ../src/common/status.cpp)
+  target_include_directories(tent_memfabric_gva_native_smoke PRIVATE
+                             ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                             ${MEMFABRIC_HYBM_INCLUDE_DIR} ${MEMFABRIC_ACL_INCLUDE_DIR})
+  target_compile_definitions(tent_memfabric_gva_native_smoke PRIVATE TENT_WITH_HYBM_GVA=1)
+  target_link_libraries(tent_memfabric_gva_native_smoke PRIVATE glog::glog dl pthread ${MEMFABRIC_ACL_LIBRARY})
+  # Intentionally not registered with CTest: requires two idle real NPUs.
 endif()
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
