@@ -460,7 +460,7 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
     }
 
     Status allocateLocalMemory(void** address, size_t size,
-                               MemoryOptions&) override {
+                               MemoryOptions& options) override {
         pool =
             mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (pool == MAP_FAILED) {
@@ -469,6 +469,9 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
         }
         pool_size = size;
         *address = pool;
+        options.type = MEMFABRIC;
+        options.location = "npu:0";
+        options.global_address = reinterpret_cast<uint64_t>(pool);
         return Status::OK();
     }
 
@@ -481,22 +484,6 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
         return Status::OK();
     }
 
-    bool describeAllocation(void* address, size_t size,
-                            MemoryOptions& options) const override {
-        if (!pool || address != pool || size != pool_size) return false;
-        options.type = MEMFABRIC;
-        options.location = "npu:0";
-        options.global_address = reinterpret_cast<uint64_t>(pool);
-        return true;
-    }
-
-    bool overlapsAllocation(void* address, size_t size) const override {
-        const auto base = reinterpret_cast<uint64_t>(pool);
-        const auto start = reinterpret_cast<uint64_t>(address);
-        return pool && size &&
-               (start >= base ? start - base < pool_size : base - start < size);
-    }
-
     bool supportsGlobalAddressing() const override { return true; }
 
     bool warmupMemory(void*, size_t) override {
@@ -505,6 +492,13 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        const auto base = reinterpret_cast<uint64_t>(pool);
+        if (pool && (desc.addr >= base ? desc.addr - base < pool_size
+                                       : base - desc.addr < desc.length)) {
+            if (desc.addr != base || desc.length != pool_size)
+                return Status::InvalidArgument("Register complete GVA pool");
+            desc.location = "npu:0";
+        }
         desc.transports.push_back(MEMFABRIC);
         return Status::OK();
     }
@@ -513,7 +507,7 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
                            const MemoryOptions& options) override {
         if (fail_registration)
             return Status::InternalError("injected GVA export failure");
-        for (auto& desc : descs) addMemoryBuffer(desc, options);
+        for (auto& desc : descs) CHECK_STATUS(addMemoryBuffer(desc, options));
         return Status::OK();
     }
 
@@ -595,7 +589,7 @@ class MemFabricEngineRegistration : public ::testing::Test {
         options.location = "cpu:0";
         // A zero request still produces a managed GVA pool.
         ASSERT_TRUE(engine->allocateLocalMemory(&pool, kSize, options).ok());
-        EXPECT_EQ(options.global_address, 0u);
+        EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(pool));
     }
 
     static constexpr size_t kSize = 4096;
@@ -637,6 +631,55 @@ TEST_F(MemFabricEngineRegistration,
                     .IsInvalidArgument());
     EXPECT_EQ(tcp->warmup_calls, 0);
     EXPECT_TRUE(tcp->registered.empty());
+}
+
+TEST_F(MemFabricEngineRegistration, UnknownGlobalAddressCannotBypassProbing) {
+    std::vector<char> ordinary(kSize);
+    MemoryOptions options;
+    options.global_address = reinterpret_cast<uint64_t>(ordinary.data());
+    EXPECT_TRUE(engine->registerLocalMemory({ordinary.data()}, {kSize}, options)
+                    .IsInvalidArgument());
+    EXPECT_EQ(tcp->warmup_calls, 0);
+    EXPECT_TRUE(tcp->registered.empty());
+}
+
+TEST_F(MemFabricEngineRegistration, MissingGlobalOwnerCannotPublishPool) {
+    engine->swapTransportForTest(MEMFABRIC, nullptr);
+    EXPECT_TRUE(engine->registerLocalMemory(pool, kSize).IsInvalidArgument());
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());
+    EXPECT_EQ(tcp->warmup_calls, 0);
+    EXPECT_TRUE(tcp->registered.empty());
+    engine->swapTransportForTest(MEMFABRIC, memfabric);
+}
+
+TEST_F(MemFabricEngineRegistration,
+       DifferentGlobalOwnersRequireSeparateBatches) {
+    class OtherGlobalTransport : public DeviceAddressMemFabricTransport {
+       public:
+        Status allocateLocalMemory(void** address, size_t size,
+                                   MemoryOptions& options) override {
+            CHECK_STATUS(DeviceAddressMemFabricTransport::allocateLocalMemory(
+                address, size, options));
+            options.type = NVLINK;
+            return Status::OK();
+        }
+    };
+    auto other = std::make_shared<OtherGlobalTransport>();
+    other->fail_registration = true;
+    engine->swapTransportForTest(NVLINK, other);
+    MemoryOptions allocation;
+    allocation.type = NVLINK;
+    void* other_pool = nullptr;
+    ASSERT_TRUE(
+        engine->allocateLocalMemory(&other_pool, kSize, allocation).ok());
+    MemoryOptions registration;
+    EXPECT_TRUE(engine
+                    ->registerLocalMemory({pool, other_pool}, {kSize, kSize},
+                                          registration)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());
+    EXPECT_EQ(tcp->warmup_calls, 0);
+    EXPECT_TRUE(engine->freeLocalMemory(other_pool).ok());
 }
 
 TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {

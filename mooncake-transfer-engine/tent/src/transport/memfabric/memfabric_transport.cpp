@@ -81,15 +81,6 @@ bool MemFabricTransport::supportsGlobalAddressing() const {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     return gva_ && gva_->available();
 }
-bool MemFabricTransport::describeAllocation(void* addr, size_t size,
-                                            MemoryOptions& options) const {
-    std::lock_guard<std::mutex> lock(inflight_mu_);
-    return gva_ && gva_->describe(addr, size, options);
-}
-bool MemFabricTransport::overlapsAllocation(void* addr, size_t size) const {
-    std::lock_guard<std::mutex> lock(inflight_mu_);
-    return gva_ && gva_->overlaps(reinterpret_cast<uint64_t>(addr), size);
-}
 Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
@@ -106,7 +97,8 @@ Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
         return Status::InvalidArgument(
             "GVA location must be cpu or the configured npu device");
     CHECK_STATUS(gva_->allocate(addr, size, type, options.global_address));
-    options.type = MEMFABRIC;
+    if (!gva_->describe(*addr, size, options))
+        return Status::InternalError("Allocated GVA pool has no descriptor");
     return Status::OK();
 }
 Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
@@ -975,12 +967,13 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
             if (!all)
                 return Status::InvalidArgument(
                     "Register GVA pools separately from ordinary buffers");
-            for (const auto& desc : desc_list) {
+            for (auto& desc : desc_list) {
                 MemoryOptions trusted;
                 if (!gva_->describe(reinterpret_cast<void*>(desc.addr),
                                     desc.length, trusted))
                     return Status::InvalidArgument(
                         "Register the complete GVA pool");
+                desc.location = trusted.location;
             }
             for (auto& desc : desc_list) {
                 CHECK_STATUS(gva_->publish(reinterpret_cast<void*>(desc.addr),
@@ -993,6 +986,8 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
             return Status::OK();
         }
     }
+    if (options.global_address)
+        return Status::InvalidArgument("Unknown MemFabric GVA allocation");
     CHECK_STATUS(initializeLocked());
 
     const bool local_sdma = config_.data_op_type == SMEMB_DATA_OP_SDMA &&

@@ -46,9 +46,6 @@
 #ifdef USE_XPU
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
-#ifdef USE_MEMFABRIC
-#include "tent/transport/memfabric/memfabric_transport.h"
-#endif
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -919,14 +916,6 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
          ++it) {
         if (it->addr == addr) {
             bool managed_gva = it->options.global_address != 0;
-#ifdef USE_MEMFABRIC
-            if (auto* memfabric =
-                    dynamic_cast<MemFabricTransport*>(it->transport)) {
-                MemoryOptions allocation;
-                managed_gva = managed_gva || memfabric->describeAllocation(
-                                                 addr, it->size, allocation);
-            }
-#endif
             if (managed_gva) {
                 auto segment = metadata_->segmentManager().getLocal();
                 if (segment) {
@@ -1071,11 +1060,15 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
     desc_list.reserve(addr_list.size());
-    std::unordered_set<uint64_t> memfabric_pools;
-#ifdef USE_MEMFABRIC
-    auto* memfabric =
-        dynamic_cast<MemFabricTransport*>(transport_list_[MEMFABRIC].get());
-#endif
+    std::vector<AllocatedMemory> global_allocations;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& allocation : allocated_memory_)
+            if (allocation.options.global_address)
+                global_allocations.push_back(allocation);
+    }
+    std::map<uint64_t, TransportType> allocation_owners;
+    std::unordered_set<TransportType> required_transports;
     for (size_t i = 0; i < addr_list.size(); ++i) {
         BufferDesc desc;
         desc.addr = (uint64_t)addr_list[i];
@@ -1084,29 +1077,38 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             return Status::InvalidArgument(
                 "Invalid memory registration range" LOC_MARK);
 
-        bool known_memfabric_pool = false;
-#ifdef USE_MEMFABRIC
-        if (memfabric) {
-            MemoryOptions allocation;
-            known_memfabric_pool = memfabric->describeAllocation(
-                addr_list[i], size_list[i], allocation);
-            if (known_memfabric_pool) {
-                if (options.type != UNSPEC && options.type != MEMFABRIC)
-                    return Status::InvalidArgument(
-                        "MemFabric GVA pools require MEMFABRIC "
-                        "registration" LOC_MARK);
-                desc.location = allocation.location;
-                memfabric_pools.insert(desc.addr);
-            } else if (memfabric->overlapsAllocation(addr_list[i],
-                                                     size_list[i])) {
+        bool global_allocation = false;
+        for (const auto& allocation : global_allocations) {
+            const auto base = reinterpret_cast<uint64_t>(allocation.addr);
+            const bool overlaps = desc.addr >= base
+                                      ? desc.addr - base < allocation.size
+                                      : base - desc.addr < desc.length;
+            if (!overlaps) continue;
+            if (desc.addr < base || desc.addr - base >= allocation.size ||
+                desc.length > allocation.size - (desc.addr - base))
                 return Status::InvalidArgument(
-                    "Register the complete MemFabric GVA pool" LOC_MARK);
-            }
+                    "Registration exceeds global allocation" LOC_MARK);
+            const auto owner = allocation.options.type;
+            if (options.type != UNSPEC && options.type != owner)
+                return Status::InvalidArgument(
+                    "Global allocations require their owning "
+                    "transport" LOC_MARK);
+            if (std::find(transports.begin(), transports.end(), owner) ==
+                transports.end())
+                return Status::InvalidArgument(
+                    "Global allocation transport is unavailable" LOC_MARK);
+            desc.location = allocation.options.location;
+            allocation_owners.emplace(desc.addr, owner);
+            required_transports.insert(owner);
+            global_allocation = true;
+            break;
         }
-#endif
-        // Both HBM and DRAM pools expose logical GVA tokens, which cannot be
-        // dereferenced. Only a trusted backend record can bypass probing.
-        if (!known_memfabric_pool) {
+        if (!global_allocation && options.global_address)
+            return Status::InvalidArgument(
+                "Unknown global allocation" LOC_MARK);
+        // Only tracked global allocations bypass pointer probing. Their
+        // backend validates registration constraints before publication.
+        if (!global_allocation) {
             auto& platform = Platform::getLoader();
 #ifdef USE_CUDA
             // Warm-up can register memory temporarily, so validate it first.
@@ -1161,7 +1163,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         // make getTypeEnum() return MTYPE_UNKNOWN and break transport
         // selection. Validate before overriding: keep the probe when the
         // caller is a wildcard, unknown, or a different type.
-        if (!known_memfabric_pool && options.location != kWildcardLocation &&
+        if (!global_allocation && options.location != kWildcardLocation &&
             !options.location.empty()) {
             auto probed_type =
                 getTypeEnum(LocationParser(desc.location).type());
@@ -1187,13 +1189,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
-    // Export managed pools before optional registrations, so an export
-    // failure cannot publish a device pointer through a CPU transport.
-    if (!memfabric_pools.empty()) {
-        const auto found =
-            std::find(transports.begin(), transports.end(), MEMFABRIC);
-        std::rotate(transports.begin(), found, found + 1);
-    }
+    if (required_transports.size() > 1)
+        return Status::InvalidArgument(
+            "Register global allocations from different transports "
+            "separately" LOC_MARK);
+
+    // Register owning transports first; a global allocation cannot fall back
+    // to a backend that interprets its logical address as an ordinary pointer.
+    std::stable_partition(transports.begin(), transports.end(),
+                          [&](TransportType type) {
+                              return required_transports.count(type) != 0;
+                          });
 
     bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
@@ -1209,9 +1215,13 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 std::vector<BufferDesc> filtered;
                 std::vector<size_t> indices;
                 auto* selected = &descs;
-                if (!memfabric_pools.empty() && type != MEMFABRIC) {
+                if (!allocation_owners.empty()) {
                     for (size_t i = 0; i < descs.size(); ++i) {
-                        if (memfabric_pools.count(descs[i].addr)) continue;
+                        const auto owner =
+                            allocation_owners.find(descs[i].addr);
+                        if (owner != allocation_owners.end() &&
+                            owner->second != type)
+                            continue;
                         indices.push_back(i);
                         filtered.push_back(descs[i]);
                     }
@@ -1238,7 +1248,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     // installed transports, but may not publish a buffer for
                     // which every backend failed.
                     if (options.type != UNSPEC ||
-                        (type == MEMFABRIC && !memfabric_pools.empty()))
+                        required_transports.count(type))
                         return s;
                     continue;
                 }

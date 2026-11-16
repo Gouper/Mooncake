@@ -611,6 +611,20 @@ class MemFabricTransportTest : public ::testing::Test {
         return api;
     }
 
+    Status PrepareGvaAllocation() {
+        CHECK_STATUS(Install("device_sdma"));
+        MemFabricGvaConfig config;
+        config.enabled = true;
+        config.group = "allocation-options";
+        config.rank_count = 2;
+        config.hbm_size = config.dram_size = config.hbm_window =
+            config.dram_window = CopyTestHybm::kSize;
+        copy_api_ = std::make_shared<CopyTestHybm>();
+        transport_->gva_ =
+            std::make_shared<MemFabricSharedMemory>(config, name_, copy_api_);
+        return Status::OK();
+    }
+
     Status PrepareGvaCopy(size_t capacity = 256,
                           const char* protocol = "device_sdma") {
         CHECK_STATUS(Install("device_sdma"));
@@ -2114,6 +2128,41 @@ TEST_F(MemFabricTransportTest, TransBatchZeroCannotCompletePendingGvaCopy) {
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, 64u);
+}
+
+TEST_F(MemFabricTransportTest, GvaAllocationReturnsRegistrationOptions) {
+    ASSERT_TRUE(PrepareGvaAllocation().ok());
+    for (auto host : {false, true}) {
+        MemoryOptions options;
+        options.location = host ? "cpu:0" : "npu:0";
+        void** output = host ? &local_dram_ : &copy_hbm_;
+        ASSERT_TRUE(
+            transport_
+                ->allocateLocalMemory(output, CopyTestHybm::kSize, options)
+                .ok());
+        EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(*output));
+        EXPECT_EQ(options.type, MEMFABRIC);
+        EXPECT_EQ(options.location, "npu:0");
+        BufferDesc desc{};
+        desc.addr = options.global_address;
+        desc.length = CopyTestHybm::kSize;
+        desc.location = "cpu:7";
+        ASSERT_TRUE(transport_->addMemoryBuffer(desc, options).ok());
+        EXPECT_EQ(desc.location, "npu:0");
+        EXPECT_EQ(desc.transports, std::vector<TransportType>{MEMFABRIC});
+    }
+}
+
+TEST_F(MemFabricTransportTest, UnknownGvaCannotUseOrdinaryRegistration) {
+    ASSERT_TRUE(Install().ok());
+    MemoryOptions options;
+    options.global_address = 0x100000000000000ULL;
+    BufferDesc desc{};
+    desc.addr = options.global_address;
+    desc.length = CopyTestHybm::kSize;
+    EXPECT_TRUE(transport_->addMemoryBuffer(desc, options).IsInvalidArgument());
+    EXPECT_TRUE(desc.transports.empty());
+    EXPECT_EQ(state_->register_mem_calls, 0);
 }
 
 TEST_F(MemFabricTransportTest, SdmaMappingPreparesCopyThroughExistingEntry) {

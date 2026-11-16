@@ -89,8 +89,6 @@ class MemFabricTransport : public Transport {
     virtual Status mapRemoteMemory(SegmentID, void*, size_t, void**);
     virtual Status resolveGlobalAddress(void*, size_t, void**);
     Status unmapRemoteMemory(SegmentID, void*) override;
-    virtual bool describeAllocation(void*, size_t, MemoryOptions&) const;
-    virtual bool overlapsAllocation(void*, size_t) const;
     const char* getName() const override { return "memfabric"; }
     bool supportNotification() const override { return false; }
 
