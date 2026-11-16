@@ -8,7 +8,7 @@
 namespace mooncake {
 namespace tent {
 namespace {
-constexpr uint64_t kPage = 2ULL << 20;
+constexpr uint64_t kPageSize = 2ULL << 20;
 Status pending(const char* why) {
     return Status::TooManyRequests(
         std::string("MemFabric GVA cleanup pending: ") + why);
@@ -16,21 +16,28 @@ Status pending(const char* why) {
 Status nativeError(const char* op) {
     return Status::InternalError(std::string("HYBM GVA ") + op + " failed");
 }
-bool blobValid(const nlohmann::json& j) {
-    if (!j.is_array() || j.empty() || j.size() > (1U << 18)) return false;
-    for (const auto& b : j)
-        if (!b.is_number_unsigned() || b.get<uint64_t>() > 255) return false;
+bool blobValid(const nlohmann::json& descriptor) {
+    if (!descriptor.is_array() || descriptor.empty() ||
+        descriptor.size() > (1U << 18))
+        return false;
+    for (const auto& byte : descriptor)
+        if (!byte.is_number_unsigned() || byte.get<uint64_t>() > 255)
+            return false;
     return true;
 }
 }  // namespace
 MemFabricSharedMemory::MemFabricSharedMemory(
-    MemFabricGvaConfig c, std::string owner,
+    MemFabricGvaConfig config, std::string owner,
     std::shared_ptr<MemFabricGvaApi> api)
-    : config_(std::move(c)), owner_(std::move(owner)), api_(std::move(api)) {
+    : config_(std::move(config)),
+      owner_(std::move(owner)),
+      api_(std::move(api)) {
     std::random_device random;
-    std::ostringstream id;
-    for (int i = 0; i < 4; ++i) id << std::hex << random() << '-';
-    generation_ = id.str();
+    std::ostringstream generation;
+    for (int index = 0; index < 4; ++index)
+        generation << std::hex << random() << '-';
+    generation_ = generation.str();
+    config_status_ = validateConfig();
 }
 MemFabricSharedMemory::~MemFabricSharedMemory() {
     if (!close().ok()) {
@@ -43,7 +50,7 @@ MemFabricSharedMemory::~MemFabricSharedMemory() {
         retained->push_back(std::move(api_));
     }
 }
-Status MemFabricSharedMemory::ensureLocked() {
+Status MemFabricSharedMemory::validateConfig() const {
     if (!available())
         return Status::NotImplemented(
             "MemFabric GVA requires compatible HYBM headers and library "
@@ -62,14 +69,22 @@ Status MemFabricSharedMemory::ensureLocked() {
     for (auto pair : {std::make_pair(config_.hbm_size, config_.hbm_window),
                       std::make_pair(config_.dram_size, config_.dram_window)}) {
         if ((bool(pair.first) != bool(pair.second)) ||
-            pair.first > pair.second || pair.first % kPage ||
-            pair.second % kPage ||
+            pair.first > pair.second || pair.first % kPageSize ||
+            pair.second % kPageSize ||
             pair.second >
                 std::numeric_limits<uint64_t>::max() / config_.rank_count)
             return Status::InvalidArgument(
                 "GVA sizes must be aligned to 2 MiB and fit rank windows");
     }
+    return Status::OK();
+}
+Status MemFabricSharedMemory::bindDevice() {
     if (api_->bind(config_.device)) return nativeError("bind device");
+    return Status::OK();
+}
+Status MemFabricSharedMemory::initializeContext() {
+    CHECK_STATUS(config_status_);
+    CHECK_STATUS(bindDevice());
     if (entity_ && !entity_blob_.is_null()) return Status::OK();
     if (!initialized_) {
         if (api_->initialize(config_.device)) return nativeError("initialize");
@@ -90,7 +105,7 @@ Status MemFabricSharedMemory::ensureLocked() {
     entity_blob_ = blob;
     return Status::OK();
 }
-MemFabricSharedMemory::Json MemFabricSharedMemory::identityLocked() const {
+MemFabricSharedMemory::Json MemFabricSharedMemory::makeIdentity() const {
     return Json{{"version", 2u},
                 {"protocol", config_.protocol},
                 {"address_mode", "logical56"},
@@ -107,85 +122,87 @@ MemFabricSharedMemory::Json MemFabricSharedMemory::identityLocked() const {
                 {"dram_size", config_.dram_size},
                 {"entity_blob", entity_blob_}};
 }
-Status MemFabricSharedMemory::allocate(void** out, size_t n, uint32_t t,
+Status MemFabricSharedMemory::allocate(void** out, size_t size,
+                                       uint32_t memory_type,
                                        uint64_t requested) {
     if (!out) return Status::InvalidArgument("Null GVA output");
     *out = nullptr;
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
-    if (t != 1 && t != 2)
+    if (memory_type != 1 && memory_type != 2)
         return Status::InvalidArgument("Unknown GVA memory type");
-    if (n == 0 || n % kPage ||
-        n != (t == 1 ? config_.hbm_size : config_.dram_size))
+    if (size == 0 || size % kPageSize ||
+        size != (memory_type == 1 ? config_.hbm_size : config_.dram_size))
         return Status::InvalidArgument(
             "Allocate exactly the configured complete GVA pool");
-    auto& p = pools_[t - 1];
-    if (p.slice)
+    auto& pool = pools_[memory_type - 1];
+    if (pool.slice)
         return Status::InvalidArgument("One pool per memory type is supported");
     // HYBM uses a bump allocator and free does not restore its cursor. Do not
     // repeatedly allocate to hunt for the requested VA, or promise pool reuse.
-    if (consumed_[t - 1])
+    if (consumed_[memory_type - 1])
         return Status::InvalidArgument(
             "HYBM pool capacity already consumed; recreate the GVA context");
-    for (const auto& kv : peers_)
-        if (!kv.second.cleaned)
+    for (const auto& entry : peers_)
+        if (!entry.second.cleaned)
             return pending("allocate pools before peer preparation");
-    CHECK_STATUS(ensureLocked());
-    void* slice = api_->allocate(entity_, t, n);
+    CHECK_STATUS(initializeContext());
+    void* slice = api_->allocate(entity_, memory_type, size);
     if (!slice) return nativeError("allocate slice");
-    consumed_[t - 1] = n;
+    consumed_[memory_type - 1] = size;
     auto gva = api_->address(entity_, slice);
     uint64_t dva = 0, end = 0;
     auto mapped = api_->size(entity_, slice);
-    bool valid = gva && mapped == n &&
-                 n <= std::numeric_limits<uint64_t>::max() - gva &&
+    bool valid = gva && mapped == size &&
+                 size <= std::numeric_limits<uint64_t>::max() - gva &&
                  !api_->translate(gva, 1, dva) && dva && dva != gva &&
-                 n <= std::numeric_limits<uint64_t>::max() - dva &&
-                 !api_->translate(gva + n - 1, 1, end) && end == dva + n - 1 &&
-                 (!requested || requested == gva);
+                 size <= std::numeric_limits<uint64_t>::max() - dva &&
+                 !api_->translate(gva + size - 1, 1, end) &&
+                 end == dva + size - 1 && (!requested || requested == gva);
     if (!valid) {
         if (api_->free(entity_, slice)) rollback_.push_back(slice);
         return Status::InvalidArgument(
             "HYBM logical GVA must match the request and resolve to a distinct "
             "contiguous device VA; allocation retained for cleanup if needed");
     }
-    p.slice = slice;
-    p.address = gva;
-    p.device_address = dva;
-    p.length = n;
-    if (t == 2) (void)api_->translate(gva, 2, p.host_address);
-    p.descriptor = identityLocked();
-    p.descriptor["type"] = t;
-    p.descriptor["address"] = gva;
-    p.descriptor["size"] = n;
-    p.descriptor["mapped_size"] = mapped;
-    p.descriptor["pool_generation"] = ++pool_generation_;
+    pool.slice = slice;
+    pool.address = gva;
+    pool.device_address = dva;
+    pool.length = size;
+    if (memory_type == 2) (void)api_->translate(gva, 2, pool.host_address);
+    pool.descriptor = makeIdentity();
+    pool.descriptor["type"] = memory_type;
+    pool.descriptor["address"] = gva;
+    pool.descriptor["size"] = size;
+    pool.descriptor["mapped_size"] = mapped;
+    pool.descriptor["pool_generation"] = ++pool_generation_;
     *out = reinterpret_cast<void*>(gva);
     return Status::OK();
 }
-bool MemFabricSharedMemory::describe(void* ptr, size_t n,
-                                     MemoryOptions& o) const {
+bool MemFabricSharedMemory::describe(void* ptr, size_t size,
+                                     MemoryOptions& options) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& p : pools_)
-        if (p.slice && p.address == reinterpret_cast<uint64_t>(ptr) &&
-            p.length == n) {
-            o.location = "npu:" + std::to_string(config_.device);
-            o.type = MEMFABRIC;
-            o.global_address = p.address;
+    for (const auto& pool : pools_)
+        if (pool.slice && pool.address == reinterpret_cast<uint64_t>(ptr) &&
+            pool.length == size) {
+            options.location = "npu:" + std::to_string(config_.device);
+            options.type = MEMFABRIC;
+            options.global_address = pool.address;
             return true;
         }
     return false;
 }
-bool MemFabricSharedMemory::overlaps(uint64_t address, size_t n) const {
+bool MemFabricSharedMemory::overlaps(uint64_t address, size_t size) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto intersects = [address, n](uint64_t base, uint64_t length) {
-        if (!base || !length || !n) return false;
-        return address >= base ? address - base < length : n > base - address;
+    auto intersects = [address, size](uint64_t base, uint64_t length) {
+        if (!base || !length || !size) return false;
+        return address >= base ? address - base < length
+                               : size > base - address;
     };
-    for (const auto& p : pools_)
-        if (p.slice && (intersects(p.address, p.length) ||
-                        intersects(p.device_address, p.length)))
+    for (const auto& pool : pools_)
+        if (pool.slice && (intersects(pool.address, pool.length) ||
+                           intersects(pool.device_address, pool.length)))
             return true;
     // Physical companion mappings and partial maps also own device aliases.
     // They must not fall through to CPU probing, ACL free or trans
@@ -206,21 +223,22 @@ bool MemFabricSharedMemory::overlaps(uint64_t address, size_t n) const {
     }
     return false;
 }
-Status MemFabricSharedMemory::publish(void* ptr, size_t n, std::string& out) {
+Status MemFabricSharedMemory::publish(void* ptr, size_t size,
+                                      std::string& out) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& p : pools_)
-        if (p.slice && p.address == reinterpret_cast<uint64_t>(ptr) &&
-            p.length == n) {
-            if (!p.descriptor.contains("slice_blob")) {
-                CHECK_STATUS(ensureLocked());
+    for (auto& pool : pools_)
+        if (pool.slice && pool.address == reinterpret_cast<uint64_t>(ptr) &&
+            pool.length == size) {
+            if (!pool.descriptor.contains("slice_blob")) {
+                CHECK_STATUS(bindDevice());
                 std::vector<uint8_t> blob;
-                if (api_->exportBlob(entity_, p.slice, blob) ||
+                if (api_->exportBlob(entity_, pool.slice, blob) ||
                     !blobValid(Json(blob)))
                     return nativeError("export slice");
-                p.descriptor["slice_blob"] = blob;
+                pool.descriptor["slice_blob"] = blob;
             }
-            out = p.descriptor.dump();
-            p.published = true;
+            out = pool.descriptor.dump();
+            pool.published = true;
             return Status::OK();
         }
     return Status::InvalidArgument(
@@ -230,73 +248,80 @@ Status MemFabricSharedMemory::unpublish(void* ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
-    for (auto& p : pools_)
-        if (p.slice && p.address == reinterpret_cast<uint64_t>(ptr)) {
-            p.published = false;
+    for (auto& pool : pools_)
+        if (pool.slice && pool.address == reinterpret_cast<uint64_t>(ptr)) {
+            pool.published = false;
             return Status::OK();
         }
     return Status::InvalidArgument("Unknown GVA pool");
 }
-Status MemFabricSharedMemory::free(void* ptr, size_t n) {
+Status MemFabricSharedMemory::free(void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
-    for (auto& p : pools_)
-        if (p.slice && p.address == reinterpret_cast<uint64_t>(ptr) &&
-            p.length == n) {
-            if (p.published) return pending("pool is still registered");
-            for (const auto& kv : peers_)
-                if (!kv.second.cleaned)
+    for (auto& pool : pools_)
+        if (pool.slice && pool.address == reinterpret_cast<uint64_t>(ptr) &&
+            pool.length == size) {
+            if (pool.published) return pending("pool is still registered");
+            for (const auto& entry : peers_)
+                if (!entry.second.cleaned)
                     return pending("local context still holds peer imports");
-            CHECK_STATUS(ensureLocked());
-            if (api_->free(entity_, p.slice)) return nativeError("free slice");
-            p = Pool{};
+            CHECK_STATUS(bindDevice());
+            if (api_->free(entity_, pool.slice))
+                return nativeError("free slice");
+            pool = Pool{};
             return Status::OK();
         }
     return Status::InvalidArgument("Unknown GVA pool or size");
 }
-Status MemFabricSharedMemory::validateLocked(const Json& j,
-                                             const std::string& owner) const {
+Status MemFabricSharedMemory::validateDescriptor(
+    const Json& descriptor, const std::string& owner) const {
     try {
-        if (j.value("protocol", std::string("device_sdma")) != config_.protocol)
+        if (descriptor.value("protocol", std::string("device_sdma")) !=
+            config_.protocol)
             return Status::InvalidArgument("GVA peer protocol differs");
-        if (j.at("version").get<uint64_t>() != 2 ||
-            j.at("address_mode").get<std::string>() != "logical56" ||
-            j.at("owner").get<std::string>() != owner || owner.empty() ||
-            j.at("group").get<std::string>() != config_.group ||
-            j.at("generation").get<std::string>().empty() ||
-            j.at("generation").get<std::string>().size() > 128 ||
-            j.at("ranks").get<uint64_t>() != config_.rank_count ||
-            j.at("rank").get<uint64_t>() >= config_.rank_count ||
-            j.at("rank").get<uint64_t>() == config_.rank ||
-            j.at("entity").get<uint64_t>() != config_.entity ||
-            j.at("device").get<uint64_t>() > 65535 ||
-            j.at("hbm_window").get<uint64_t>() != config_.hbm_window ||
-            j.at("dram_window").get<uint64_t>() != config_.dram_window ||
-            j.at("hbm_size").get<uint64_t>() != config_.hbm_size ||
-            j.at("dram_size").get<uint64_t>() != config_.dram_size ||
-            !blobValid(j.at("entity_blob")))
+        if (descriptor.at("version").get<uint64_t>() != 2 ||
+            descriptor.at("address_mode").get<std::string>() != "logical56" ||
+            descriptor.at("owner").get<std::string>() != owner ||
+            owner.empty() ||
+            descriptor.at("group").get<std::string>() != config_.group ||
+            descriptor.at("generation").get<std::string>().empty() ||
+            descriptor.at("generation").get<std::string>().size() > 128 ||
+            descriptor.at("ranks").get<uint64_t>() != config_.rank_count ||
+            descriptor.at("rank").get<uint64_t>() >= config_.rank_count ||
+            descriptor.at("rank").get<uint64_t>() == config_.rank ||
+            descriptor.at("entity").get<uint64_t>() != config_.entity ||
+            descriptor.at("device").get<uint64_t>() > 65535 ||
+            descriptor.at("hbm_window").get<uint64_t>() != config_.hbm_window ||
+            descriptor.at("dram_window").get<uint64_t>() !=
+                config_.dram_window ||
+            descriptor.at("hbm_size").get<uint64_t>() != config_.hbm_size ||
+            descriptor.at("dram_size").get<uint64_t>() != config_.dram_size ||
+            !blobValid(descriptor.at("entity_blob")))
             return Status::InvalidArgument(
                 "Incompatible GVA peer identity/layout");
-        if (j.contains("type")) {
-            auto t = j.at("type").get<uint64_t>();
-            auto a = j.at("address").get<uint64_t>();
-            auto n = j.at("size").get<uint64_t>();
-            if ((t != 1 && t != 2) || !a || !n || a % kPage || n % kPage ||
-                n > std::numeric_limits<uint64_t>::max() - a ||
-                n != j.at("mapped_size").get<uint64_t>() ||
-                n != (t == 1 ? config_.hbm_size : config_.dram_size) ||
-                !j.at("pool_generation").get<uint64_t>() ||
-                !blobValid(j.at("slice_blob")))
+        if (descriptor.contains("type")) {
+            auto memory_type = descriptor.at("type").get<uint64_t>();
+            auto address = descriptor.at("address").get<uint64_t>();
+            auto size = descriptor.at("size").get<uint64_t>();
+            if ((memory_type != 1 && memory_type != 2) || !address || !size ||
+                address % kPageSize || size % kPageSize ||
+                size > std::numeric_limits<uint64_t>::max() - address ||
+                size != descriptor.at("mapped_size").get<uint64_t>() ||
+                size !=
+                    (memory_type == 1 ? config_.hbm_size : config_.dram_size) ||
+                !descriptor.at("pool_generation").get<uint64_t>() ||
+                !blobValid(descriptor.at("slice_blob")))
                 return Status::InvalidArgument("Invalid GVA pool descriptor");
-            auto rank = j.at("rank").get<uint64_t>();
-            auto window = t == 1 ? config_.hbm_window : config_.dram_window;
-            if (a < rank * window)
+            auto rank = descriptor.at("rank").get<uint64_t>();
+            auto window =
+                memory_type == 1 ? config_.hbm_window : config_.dram_window;
+            if (address < rank * window)
                 return Status::InvalidArgument("Invalid GVA window address");
-            const auto& local = pools_[t - 1];
-            if (local.slice &&
-                (local.address < config_.rank * window ||
-                 a - rank * window != local.address - config_.rank * window))
+            const auto& local = pools_[memory_type - 1];
+            if (local.slice && (local.address < config_.rank * window ||
+                                address - rank * window !=
+                                    local.address - config_.rank * window))
                 return Status::InvalidArgument(
                     "GVA window bases differ across ranks");
         }
@@ -305,61 +330,64 @@ Status MemFabricSharedMemory::validateLocked(const Json& j,
         return Status::InvalidArgument("Malformed GVA descriptor");
     }
 }
-Status MemFabricSharedMemory::recordLocked(const Json& j,
-                                           const std::string& owner) {
-    CHECK_STATUS(validateLocked(j, owner));
-    auto rank = j.at("rank").get<uint32_t>();
-    auto generation = j.at("generation").get<std::string>();
-    auto it = peers_.find(rank);
-    if (it != peers_.end() && !it->second.cleaned &&
-        (it->second.owner != owner || it->second.generation != generation))
+Status MemFabricSharedMemory::recordPeer(const Json& descriptor,
+                                         const std::string& owner) {
+    CHECK_STATUS(validateDescriptor(descriptor, owner));
+    auto rank = descriptor.at("rank").get<uint32_t>();
+    auto generation = descriptor.at("generation").get<std::string>();
+    auto iterator = peers_.find(rank);
+    if (iterator != peers_.end() && !iterator->second.cleaned &&
+        (iterator->second.owner != owner ||
+         iterator->second.generation != generation))
         return pending("old peer generation must exit first");
-    CHECK_STATUS(ensureLocked());
     auto& peer = peers_[rank];
     if (peer.cleaned) peer = Peer{};
     if (peer.owner.empty()) {
         peer.owner = owner;
         peer.generation = generation;
-        peer.entity_blob = j.at("entity_blob");
+        peer.entity_blob = descriptor.at("entity_blob");
     }
-    if (peer.entity_blob != j.at("entity_blob"))
+    if (peer.entity_blob != descriptor.at("entity_blob"))
         return Status::InvalidArgument(
             "Peer entity blob changed within its generation");
     // Retain the requested address before either native import: entity import
     // may fail after changing state, and unmap must still be able to find it.
-    if (j.contains("type")) {
-        const auto index = j.at("type").get<size_t>() - 1;
-        if (!peer.descriptors[index].is_null() && peer.descriptors[index] != j)
+    if (descriptor.contains("type")) {
+        const auto index = descriptor.at("type").get<size_t>() - 1;
+        if (!peer.descriptors[index].is_null() &&
+            peer.descriptors[index] != descriptor)
             return pending("peer pool descriptor changed");
-        peer.descriptors[index] = j;
+        peer.descriptors[index] = descriptor;
     }
     return Status::OK();
 }
-Status MemFabricSharedMemory::importLocked(const Json& j,
-                                           const std::string& owner) {
-    CHECK_STATUS(recordLocked(j, owner));
-    auto& peer = peers_.at(j.at("rank").get<uint32_t>());
-    if (api_->importBlob(entity_, true,
-                         j.at("entity_blob").get<std::vector<uint8_t>>()))
+Status MemFabricSharedMemory::importPeer(const Json& descriptor,
+                                         const std::string& owner) {
+    CHECK_STATUS(recordPeer(descriptor, owner));
+    auto& peer = peers_.at(descriptor.at("rank").get<uint32_t>());
+    if (api_->importBlob(
+            entity_, true,
+            descriptor.at("entity_blob").get<std::vector<uint8_t>>()))
         return nativeError("import entity");
-    if (j.contains("type")) {
-        size_t index = j.at("type").get<size_t>() - 1;
+    if (descriptor.contains("type")) {
+        size_t index = descriptor.at("type").get<size_t>() - 1;
         if (peer.imported[index]) return Status::OK();
-        if (api_->importBlob(entity_, false,
-                             j.at("slice_blob").get<std::vector<uint8_t>>())) {
+        if (api_->importBlob(
+                entity_, false,
+                descriptor.at("slice_blob").get<std::vector<uint8_t>>())) {
             return nativeError("import slice (rank retained for cleanup)");
         }
         peer.imported[index] = true;
     }
     return Status::OK();
 }
-Status MemFabricSharedMemory::verifyLocked(const Peer& p) {
+Status MemFabricSharedMemory::verifyPeerMapping(const Peer& peer) {
     uint32_t reach = 0;
     uint32_t rank = 0;
     bool found = false;
-    for (const auto& d : p.descriptors)
-        if (!d.is_null()) {
-            rank = d.at("rank").get<uint32_t>();
+    for (const auto& descriptor : peer.descriptors)
+        if (!descriptor.is_null()) {
+            rank = descriptor.at("rank").get<uint32_t>();
             found = true;
             break;
         }
@@ -367,14 +395,16 @@ Status MemFabricSharedMemory::verifyLocked(const Peer& p) {
     if (api_->reach(entity_, rank, reach) || !(reach & 1u))
         return Status::NotImplemented(
             "Peer lacks HYBM MTE direct device access");
-    for (const auto& d : p.descriptors)
-        if (!d.is_null()) {
-            auto a = d.at("address").get<uint64_t>(),
-                 n = d.at("size").get<uint64_t>();
+    for (const auto& descriptor : peer.descriptors)
+        if (!descriptor.is_null()) {
+            auto address = descriptor.at("address").get<uint64_t>(),
+                 size = descriptor.at("size").get<uint64_t>();
             uint64_t first = 0, last = 0;
-            if (api_->translate(a, 1, first) || !first || first == a ||
-                n > std::numeric_limits<uint64_t>::max() - first ||
-                api_->translate(a + n - 1, 1, last) || last != first + n - 1)
+            if (api_->translate(address, 1, first) || !first ||
+                first == address ||
+                size > std::numeric_limits<uint64_t>::max() - first ||
+                api_->translate(address + size - 1, 1, last) ||
+                last != first + size - 1)
                 return Status::InvalidArgument(
                     "Peer logical GVA does not resolve to a distinct "
                     "contiguous device VA");
@@ -410,26 +440,30 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
         const Json* requested = nullptr;
         std::set<uint32_t> types;
         uint32_t rank = descriptors.front().at("rank").get<uint32_t>();
-        for (const auto& d : descriptors) {
-            CHECK_STATUS(validateLocked(d, owner));
-            if (d.at("rank").get<uint32_t>() != rank ||
-                d.at("generation") != descriptors.front().at("generation") ||
-                d.at("entity_blob") != descriptors.front().at("entity_blob") ||
-                !types.insert(d.at("type").get<uint32_t>()).second)
+        for (const auto& descriptor : descriptors) {
+            CHECK_STATUS(validateDescriptor(descriptor, owner));
+            if (descriptor.at("rank").get<uint32_t>() != rank ||
+                descriptor.at("generation") !=
+                    descriptors.front().at("generation") ||
+                descriptor.at("entity_blob") !=
+                    descriptors.front().at("entity_blob") ||
+                !types.insert(descriptor.at("type").get<uint32_t>()).second)
                 return Status::InvalidArgument("Inconsistent GVA pool bundle");
-            if (d.at("address").get<uint64_t>() == address &&
-                d.at("size").get<uint64_t>() == size)
-                requested = &d;
+            if (descriptor.at("address").get<uint64_t>() == address &&
+                descriptor.at("size").get<uint64_t>() == size)
+                requested = &descriptor;
         }
         if (!requested)
             return Status::InvalidArgument(
                 "Map requires complete published pool");
-        CHECK_STATUS(recordLocked(*requested, owner));
+        CHECK_STATUS(initializeContext());
+        CHECK_STATUS(recordPeer(*requested, owner));
         auto& peer = peers_.at(rank);
         peer.mapped = false;
         peer.copy_ready = false;
         peer.active[requested->at("type").get<size_t>() - 1] = true;
-        for (const auto& d : descriptors) CHECK_STATUS(importLocked(d, owner));
+        for (const auto& descriptor : descriptors)
+            CHECK_STATUS(importPeer(descriptor, owner));
         // Reciprocal imports are driven by each application's map calls.
         if (api_->map(entity_))
             return pending(
@@ -448,7 +482,7 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
             peer.copy_ready = true;
         }
         if (direct || config_.protocol == "device_sdma") {
-            CHECK_STATUS(verifyLocked(peer));
+            CHECK_STATUS(verifyPeerMapping(peer));
             peer.mapped = true;
             peer.copy_ready = true;
         }
@@ -457,28 +491,29 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
         return Status::InvalidArgument("Malformed GVA pool bundle");
     }
 }
-Status MemFabricSharedMemory::cleanupLocked(uint32_t rank, Peer& p) {
-    if (p.cleaned) return Status::OK();
-    if (p.active[0] || p.active[1]) return pending("another pool is active");
-    CHECK_STATUS(ensureLocked());
+Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, Peer& peer) {
+    if (peer.cleaned) return Status::OK();
+    if (peer.active[0] || peer.active[1])
+        return pending("another pool is active");
+    CHECK_STATUS(bindDevice());
     // remove_imported propagates segment errors; unmap_rank alone swallows
     // them.
     if (api_->remove(entity_, rank) || api_->unmap(entity_, rank))
         return pending("native rank removal failed");
-    for (const auto& d : p.descriptors)
-        if (!d.is_null()) {
-            auto a = d.at("address").get<uint64_t>(),
-                 n = d.at("size").get<uint64_t>();
+    for (const auto& descriptor : peer.descriptors)
+        if (!descriptor.is_null()) {
+            auto address = descriptor.at("address").get<uint64_t>(),
+                 size = descriptor.at("size").get<uint64_t>();
             uint64_t va = 0;
-            if (api_->translate(a, 1, va) != -12 ||
-                api_->translate(a + n - 1, 1, va) != -12)
+            if (api_->translate(address, 1, va) != -12 ||
+                api_->translate(address + size - 1, 1, va) != -12)
                 return pending("GVA registry still contains imported mappings");
         }
     // Native HAL errors are not observable through this ABI. This certifies
     // the native API and registry contract, not independent HAL revocation.
-    p.mapped = false;
-    p.copy_ready = false;
-    p.cleaned = true;
+    peer.mapped = false;
+    peer.copy_ready = false;
+    peer.cleaned = true;
     return Status::OK();
 }
 Status MemFabricSharedMemory::unmap(const std::string& owner,
@@ -489,11 +524,12 @@ Status MemFabricSharedMemory::unmap(const std::string& owner,
     for (auto& entry : peers_) {
         auto& peer = entry.second;
         if (peer.owner != owner) continue;
-        for (size_t i = 0; i < 2; ++i) {
-            if (!peer.descriptors[i].is_null() &&
-                peer.descriptors[i].at("address").get<uint64_t>() == address) {
-                peer.active[i] = false;
-                return cleanupLocked(entry.first, peer);
+        for (size_t index = 0; index < 2; ++index) {
+            if (!peer.descriptors[index].is_null() &&
+                peer.descriptors[index].at("address").get<uint64_t>() ==
+                    address) {
+                peer.active[index] = false;
+                return cleanupPeer(entry.first, peer);
             }
         }
     }
@@ -517,15 +553,15 @@ Status MemFabricSharedMemory::resolve(uint64_t address, size_t size,
     for (const auto& entry : peers_) {
         const auto& peer = entry.second;
         if (peer.cleaned || !peer.mapped) continue;
-        for (size_t i = 0; i < peer.descriptors.size(); ++i)
-            if (peer.active[i] && !peer.descriptors[i].is_null() &&
-                contains(peer.descriptors[i].at("address").get<uint64_t>(),
-                         peer.descriptors[i].at("size").get<uint64_t>()))
+        for (size_t index = 0; index < peer.descriptors.size(); ++index)
+            if (peer.active[index] && !peer.descriptors[index].is_null() &&
+                contains(peer.descriptors[index].at("address").get<uint64_t>(),
+                         peer.descriptors[index].at("size").get<uint64_t>()))
                 live = true;
     }
     if (!live)
         return Status::InvalidArgument("GVA range is not locally accessible");
-    CHECK_STATUS(ensureLocked());
+    CHECK_STATUS(bindDevice());
     uint64_t first = 0, last = 0;
     if (api_->translate(address, 1, first) || !first || first == address ||
         size > UINT64_MAX - first ||
@@ -541,12 +577,13 @@ Status MemFabricSharedMemory::validateCopyTarget(
     std::lock_guard<std::mutex> lock(mutex_);
     try {
         const auto published = Json::parse(descriptor);
-        CHECK_STATUS(validateLocked(published, owner));
-        auto it = peers_.find(published.at("rank").get<uint32_t>());
+        CHECK_STATUS(validateDescriptor(published, owner));
+        auto iterator = peers_.find(published.at("rank").get<uint32_t>());
         auto type = published.at("type").get<uint32_t>();
-        if (it == peers_.end() || type < 1 || type > 2 || it->second.cleaned ||
-            !it->second.copy_ready || !it->second.active[type - 1] ||
-            it->second.descriptors[type - 1] != published)
+        if (iterator == peers_.end() || type < 1 || type > 2 ||
+            iterator->second.cleaned || !iterator->second.copy_ready ||
+            !iterator->second.active[type - 1] ||
+            iterator->second.descriptors[type - 1] != published)
             return Status::InvalidArgument(
                 "Remote GVA publication differs from mapped pool");
         return Status::OK();
@@ -568,18 +605,19 @@ Status MemFabricSharedMemory::beginCopy(uint64_t source, uint64_t destination,
             return address >= base && address - base < length &&
                    size <= length - (address - base);
         };
-        for (size_t i = 0; i < pools_.size(); ++i)
-            if (pools_[i].slice && pools_[i].published &&
-                contains(pools_[i].address, pools_[i].length))
-                return i + 1;
+        for (size_t index = 0; index < pools_.size(); ++index)
+            if (pools_[index].slice && pools_[index].published &&
+                contains(pools_[index].address, pools_[index].length))
+                return index + 1;
         for (const auto& entry : peers_) {
             const auto& peer = entry.second;
             if (peer.cleaned || !peer.copy_ready) continue;
-            for (size_t i = 0; i < peer.descriptors.size(); ++i)
-                if (peer.active[i] && !peer.descriptors[i].is_null() &&
-                    contains(peer.descriptors[i].at("address").get<uint64_t>(),
-                             peer.descriptors[i].at("size").get<uint64_t>()))
-                    return i + 1;
+            for (size_t index = 0; index < peer.descriptors.size(); ++index)
+                if (peer.active[index] && !peer.descriptors[index].is_null() &&
+                    contains(
+                        peer.descriptors[index].at("address").get<uint64_t>(),
+                        peer.descriptors[index].at("size").get<uint64_t>()))
+                    return index + 1;
         }
         return 0;
     };
@@ -589,7 +627,6 @@ Status MemFabricSharedMemory::beginCopy(uint64_t source, uint64_t destination,
             "GVA copy requires published local or active mapped logical pools");
     // HYBM_GLOBAL_{HOST,DEVICE}_TO_GLOBAL_{HOST,DEVICE}.
     direction = (src_type == 1 ? 8u : 4u) + (dst_type == 1 ? 1u : 0u);
-    CHECK_STATUS(ensureLocked());
     ++pending_copies_;
     return Status::OK();
 }
@@ -629,21 +666,22 @@ Status MemFabricSharedMemory::close() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
-    for (const auto& p : pools_)
-        if (p.slice) return pending("local pools still allocated");
-    for (const auto& kv : peers_)
-        if (!kv.second.cleaned) return pending("peer mappings remain");
+    for (const auto& pool : pools_)
+        if (pool.slice) return pending("local pools still allocated");
+    for (const auto& entry : peers_)
+        if (!entry.second.cleaned) return pending("peer mappings remain");
     if (!initialized_) return Status::OK();
     if (api_->bind(config_.device)) return nativeError("bind for cleanup");
-    for (auto it = rollback_.begin(); it != rollback_.end();) {
-        if (api_->free(entity_, *it))
+    for (auto iterator = rollback_.begin(); iterator != rollback_.end();) {
+        if (api_->free(entity_, *iterator))
             return pending("allocation rollback failed");
-        it = rollback_.erase(it);
+        iterator = rollback_.erase(iterator);
     }
     if (entity_) {
         if (api_->unreserve(entity_)) return pending("window release failed");
         api_->destroy(entity_);
         entity_ = nullptr;
+        entity_blob_ = Json{};
     }
     api_->uninitialize();
     initialized_ = false;

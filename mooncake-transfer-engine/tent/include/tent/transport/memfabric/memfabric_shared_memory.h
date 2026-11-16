@@ -100,15 +100,20 @@ class MemFabricSharedMemory {
     };
     Status mapOrPrepare(const std::string&, const std::string&, uint64_t,
                         size_t, bool);
-    Status ensureLocked();
-    Status validateLocked(const Json&, const std::string&) const;
-    Status recordLocked(const Json&, const std::string&);
-    Status importLocked(const Json&, const std::string&);
-    Status verifyLocked(const Peer&);
-    Status cleanupLocked(uint32_t, Peer&);
-    Json identityLocked() const;
+    Status validateConfig() const;
+    // Resource helpers below require mutex_ to be held by the caller.
+    // Configuration is immutable; device binding belongs to each native caller.
+    Status initializeContext();
+    Status bindDevice();
+    Status validateDescriptor(const Json&, const std::string&) const;
+    Status recordPeer(const Json&, const std::string&);
+    Status importPeer(const Json&, const std::string&);
+    Status verifyPeerMapping(const Peer&);
+    Status cleanupPeer(uint32_t, Peer&);
+    Json makeIdentity() const;
     mutable std::mutex mutex_;
     MemFabricGvaConfig config_;
+    Status config_status_ = Status::OK();
     std::string owner_, generation_;
     std::shared_ptr<MemFabricGvaApi> api_;
     void* entity_ = nullptr;

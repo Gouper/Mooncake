@@ -7,6 +7,8 @@ class FakeHybm : public MemFabricGvaApi {
    public:
     int creates = 0, frees = 0, imports = 0, unmaps = 0, slice_imports = 0;
     int slice_exports = 0;
+    int initializes = 0, binds = 0, entity_exports = 0;
+    bool fail_bind = false;
     bool fail_slice_export = false, empty_slice_export = false;
     uint32_t rank = 0;
     bool mismatch = false, fail_unmap = false, stale = false,
@@ -15,9 +17,15 @@ class FakeHybm : public MemFabricGvaApi {
     bool require_hbm = false;
     std::set<uint64_t> imported;
     std::map<uint64_t, uint64_t> addresses;
-    int initialize(uint16_t) override { return 0; }
+    int initialize(uint16_t) override {
+        ++initializes;
+        return 0;
+    }
     void uninitialize() override {}
-    int bind(uint16_t) override { return 0; }
+    int bind(uint16_t) override {
+        ++binds;
+        return fail_bind ? -1 : 0;
+    }
     void* create(const MemFabricGvaConfig& c) override {
         rank = c.rank;
         ++creates;
@@ -49,6 +57,7 @@ class FakeHybm : public MemFabricGvaApi {
         return 0;
     }
     int exportBlob(void*, void* p, std::vector<uint8_t>& b) override {
+        if (!p) ++entity_exports;
         if (!p && fail_entity_export) return -1;
         if (p) {
             ++slice_exports;
@@ -700,4 +709,41 @@ TEST(MemFabricGva, UnsupportedNetworkProtocolRejectsAllocation) {
     EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(address, nullptr);
     EXPECT_EQ(api->creates, 0);
+}
+
+TEST(MemFabricGva, ExistingContextOnlyRebindsDeviceAndRetriesBindFailure) {
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(config(), "owner", api);
+    void* address = nullptr;
+    ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
+    EXPECT_EQ(api->initializes, 1);
+    EXPECT_EQ(api->entity_exports, 1);
+    api->fail_bind = true;
+    std::string descriptor;
+    EXPECT_FALSE(memory.publish(address, M, descriptor).ok());
+    EXPECT_EQ(api->slice_exports, 0);
+    api->fail_bind = false;
+    ASSERT_TRUE(memory.publish(address, M, descriptor).ok());
+    EXPECT_EQ(api->binds, 3);
+    EXPECT_EQ(api->initializes, 1);
+    EXPECT_EQ(api->entity_exports, 1);
+    ASSERT_TRUE(memory.unpublish(address).ok());
+    ASSERT_TRUE(memory.free(address, M).ok());
+    EXPECT_EQ(api->initializes, 1);
+    EXPECT_EQ(api->entity_exports, 1);
+    ASSERT_TRUE(memory.close().ok());
+}
+TEST(MemFabricGva, ClosedContextRecreatesEntityAndExportsFreshIdentity) {
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(config(), "owner", api);
+    void* address = nullptr;
+    ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
+    ASSERT_TRUE(memory.free(address, M).ok());
+    ASSERT_TRUE(memory.close().ok());
+    ASSERT_TRUE(memory.allocate(&address, M, 2, 0).ok());
+    EXPECT_EQ(api->initializes, 2);
+    EXPECT_EQ(api->creates, 2);
+    EXPECT_EQ(api->entity_exports, 2);
+    ASSERT_TRUE(memory.free(address, M).ok());
+    ASSERT_TRUE(memory.close().ok());
 }

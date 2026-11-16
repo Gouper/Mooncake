@@ -64,10 +64,10 @@ class NativeHybm final : public MemFabricGvaApi {
     int wait(void* entity) override {
         return hybm_wait_ ? hybm_wait_(entity) : -1;
     }
-    int bind(uint16_t d) override { return aclrtSetDevice(d); }
+    int bind(uint16_t device) override { return aclrtSetDevice(device); }
     // HYBM itself reference-counts init/uninit, also used by smem_trans_init.
-    int initialize(uint16_t d) override {
-        const auto result = hybm_init_(d, 0);
+    int initialize(uint16_t device) override {
+        const auto result = hybm_init_(device, 0);
         if (result) return result;
         // Older libraries expose the same symbols but collapse registry misses
         // and arbitrary conversion failures into BM_ERROR. Refuse allocation
@@ -83,84 +83,107 @@ class NativeHybm final : public MemFabricGvaApi {
         return 0;
     }
     void uninitialize() override { hybm_uninit_(); }
-    void* create(const MemFabricGvaConfig& c) override {
-        hybm_options o{};
-        o.bmType = HYBM_TYPE_HOST_INITIATE;
-        o.memType = static_cast<hybm_mem_type>(
-            (c.hbm_window ? HYBM_MEM_TYPE_DEVICE : 0) |
-            (c.dram_window ? HYBM_MEM_TYPE_HOST : 0));
-        o.bmDataOpType = c.protocol == "device_rdma" ? HYBM_DOP_TYPE_DEVICE_RDMA
-                         : c.protocol == "device_urma"
-                             ? HYBM_DOP_TYPE_DEVICE_URMA
-                             : HYBM_DOP_TYPE_SDMA;
-        if (c.trans_url.size() >= sizeof(o.transUrl)) return nullptr;
-        std::memcpy(o.transUrl, c.trans_url.c_str(), c.trans_url.size() + 1);
-        o.rankCount = c.rank_count;
-        o.rankId = c.rank;
-        o.devId = c.device;
-        o.maxHBMSize = c.hbm_window;
-        o.maxDRAMSize = c.dram_window;
-        o.deviceVASpace = c.hbm_size;
-        o.hostVASpace = c.dram_size;
-        o.scene = HYBM_SCENE_DEFAULT;
-        o.enable56BitsGva = true;
-        o.dramShmFd = -1;
-        return hybm_create_entity_(c.entity, &o, 0);
+    void* create(const MemFabricGvaConfig& config) override {
+        hybm_options options{};
+        options.bmType = HYBM_TYPE_HOST_INITIATE;
+        options.memType = static_cast<hybm_mem_type>(
+            (config.hbm_window ? HYBM_MEM_TYPE_DEVICE : 0) |
+            (config.dram_window ? HYBM_MEM_TYPE_HOST : 0));
+        options.bmDataOpType =
+            config.protocol == "device_rdma"   ? HYBM_DOP_TYPE_DEVICE_RDMA
+            : config.protocol == "device_urma" ? HYBM_DOP_TYPE_DEVICE_URMA
+                                               : HYBM_DOP_TYPE_SDMA;
+        if (config.trans_url.size() >= sizeof(options.transUrl)) return nullptr;
+        std::memcpy(options.transUrl, config.trans_url.c_str(),
+                    config.trans_url.size() + 1);
+        options.rankCount = config.rank_count;
+        options.rankId = config.rank;
+        options.devId = config.device;
+        options.maxHBMSize = config.hbm_window;
+        options.maxDRAMSize = config.dram_window;
+        options.deviceVASpace = config.hbm_size;
+        options.hostVASpace = config.dram_size;
+        options.scene = HYBM_SCENE_DEFAULT;
+        options.enable56BitsGva = true;
+        options.dramShmFd = -1;
+        return hybm_create_entity_(config.entity, &options, 0);
     }
-    void destroy(void* e) override { hybm_destroy_entity_(e, 0); }
-    int reserve(void* e) override { return hybm_reserve_mem_space_(e, 0); }
-    int unreserve(void* e) override { return hybm_unreserve_mem_space_(e, 0); }
-    void* allocate(void* e, uint32_t t, uint64_t n) override {
-        return hybm_alloc_local_memory_(e, static_cast<hybm_mem_type>(t), n, 0);
+    void destroy(void* entity_handle) override {
+        hybm_destroy_entity_(entity_handle, 0);
     }
-    int free(void* e, void* s) override {
-        return hybm_free_local_memory_(e, s, 1, 0);
+    int reserve(void* entity_handle) override {
+        return hybm_reserve_mem_space_(entity_handle, 0);
     }
-    uint64_t address(void* e, void* s) override {
+    int unreserve(void* entity_handle) override {
+        return hybm_unreserve_mem_space_(entity_handle, 0);
+    }
+    void* allocate(void* entity_handle, uint32_t memory_type,
+                   uint64_t size_bytes) override {
+        return hybm_alloc_local_memory_(entity_handle,
+                                        static_cast<hybm_mem_type>(memory_type),
+                                        size_bytes, 0);
+    }
+    int free(void* entity_handle, void* slice) override {
+        return hybm_free_local_memory_(entity_handle, slice, 1, 0);
+    }
+    uint64_t address(void* entity_handle, void* slice) override {
         return reinterpret_cast<uint64_t>(
-            hybm_get_slice_va_(e, s, HYBM_GET_SLICE_GVA));
+            hybm_get_slice_va_(entity_handle, slice, HYBM_GET_SLICE_GVA));
     }
-    uint64_t size(void* e, void* s) override {
-        return hybm_get_slice_size_(e, s);
+    uint64_t size(void* entity_handle, void* slice) override {
+        return hybm_get_slice_size_(entity_handle, slice);
     }
-    int translate(uint64_t p, uint32_t t, uint64_t& out) override {
-        return hybm_gva_to_va_(p, static_cast<hybm_mem_type>(t), &out);
+    int translate(uint64_t address, uint32_t memory_type,
+                  uint64_t& out) override {
+        return hybm_gva_to_va_(address, static_cast<hybm_mem_type>(memory_type),
+                               &out);
     }
-    int exportBlob(void* e, void* s, std::vector<uint8_t>& b) override {
-        hybm_exchange_info x{};
-        int rc = hybm_export_(e, s, s ? 0 : HYBM_FLAG_EXPORT_ENTITY, &x);
-        if (rc == 0 && x.desc && x.descLen && x.descLen <= (1U << 20))
-            b.assign(x.desc, x.desc + x.descLen);
-        else if (rc == 0)
-            rc = -1;
-        hybm_export_info_free_(&x);
-        return rc;
+    int exportBlob(void* entity_handle, void* slice,
+                   std::vector<uint8_t>& blob) override {
+        hybm_exchange_info exchange_info{};
+        int result =
+            hybm_export_(entity_handle, slice,
+                         slice ? 0 : HYBM_FLAG_EXPORT_ENTITY, &exchange_info);
+        if (result == 0 && exchange_info.desc && exchange_info.descLen &&
+            exchange_info.descLen <= (1U << 20))
+            blob.assign(exchange_info.desc,
+                        exchange_info.desc + exchange_info.descLen);
+        else if (result == 0)
+            result = -1;
+        hybm_export_info_free_(&exchange_info);
+        return result;
     }
-    int importBlob(void* e, bool entity,
-                   const std::vector<uint8_t>& b) override {
-        hybm_exchange_info x{const_cast<uint8_t*>(b.data()),
-                             static_cast<uint32_t>(b.size())};
-        return hybm_import_(e, &x, 1, nullptr,
+    int importBlob(void* entity_handle, bool entity,
+                   const std::vector<uint8_t>& blob) override {
+        hybm_exchange_info exchange_info{const_cast<uint8_t*>(blob.data()),
+                                         static_cast<uint32_t>(blob.size())};
+        return hybm_import_(entity_handle, &exchange_info, 1, nullptr,
                             entity ? HYBM_FLAG_EXPORT_ENTITY : 0);
     }
     bool supportsConnect() const override {
         return hybm_transport_connect_ != nullptr;
     }
-    int connect(void* e, uint32_t rank) override {
-        return hybm_transport_connect_ ? hybm_transport_connect_(e, &rank, 1, 0)
-                                       : -1;
+    int connect(void* entity_handle, uint32_t rank) override {
+        return hybm_transport_connect_
+                   ? hybm_transport_connect_(entity_handle, &rank, 1, 0)
+                   : -1;
     }
-    int map(void* e) override { return hybm_mmap_(e, 0); }
-    int reach(void* e, uint32_t r, uint32_t& out) override {
-        hybm_data_op_type t = HYBM_DOP_TYPE_DEFAULT;
-        auto rc = hybm_entity_reach_types_(e, r, t, 0);
-        out = t;
-        return rc;
+    int map(void* entity_handle) override {
+        return hybm_mmap_(entity_handle, 0);
     }
-    int remove(void* e, uint32_t r) override {
-        return hybm_remove_imported_(e, r, 0);
+    int reach(void* entity_handle, uint32_t rank, uint32_t& out) override {
+        hybm_data_op_type capabilities = HYBM_DOP_TYPE_DEFAULT;
+        auto result =
+            hybm_entity_reach_types_(entity_handle, rank, capabilities, 0);
+        out = capabilities;
+        return result;
     }
-    int unmap(void* e, uint32_t r) override { return hybm_unmap_rank_(e, r); }
+    int remove(void* entity_handle, uint32_t rank) override {
+        return hybm_remove_imported_(entity_handle, rank, 0);
+    }
+    int unmap(void* entity_handle, uint32_t rank) override {
+        return hybm_unmap_rank_(entity_handle, rank);
+    }
 
    private:
     void* library_ = nullptr;
@@ -190,8 +213,8 @@ class NativeHybm final : public MemFabricGvaApi {
 };
 }  // namespace
 std::shared_ptr<MemFabricGvaApi> MemFabricGvaApi::load() {
-    auto a = std::make_shared<NativeHybm>();
-    return a->loadSymbols() ? a : nullptr;
+    auto api = std::make_shared<NativeHybm>();
+    return api->loadSymbols() ? api : nullptr;
 }
 }  // namespace tent
 }  // namespace mooncake
