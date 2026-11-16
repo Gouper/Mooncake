@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
+#include "tent/common/concurrent/thread_pool.h"
 
 using namespace mooncake::tent;
 namespace {
@@ -75,6 +76,10 @@ void barrier(int fd, const char* phase) {
 }
 int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             bool hbm_only) {
+    const char* requested_protocol = std::getenv("MF_GVA_SMOKE_PROTOCOL");
+    const std::string protocol =
+        requested_protocol ? requested_protocol : "device_sdma";
+    const bool network = protocol != "device_sdma";
     try {
         aclCheck(aclInit(nullptr), "aclInit");
         aclCheck(aclrtSetDevice(device), "aclrtSetDevice");
@@ -83,6 +88,12 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             throw std::runtime_error("Compatible HYBM symbols unavailable");
         MemFabricGvaConfig config;
         config.enabled = true;
+        config.protocol = protocol;
+        if (const char* url = std::getenv("MF_GVA_SMOKE_TRANS_URL"))
+            config.trans_url = url;
+        if (const char* url = std::getenv(rank ? "MF_GVA_SMOKE_TRANS_URL_1"
+                                               : "MF_GVA_SMOKE_TRANS_URL_0"))
+            config.trans_url = url;
         config.group = "tent-native-smoke-" + std::to_string(getppid());
         config.rank_count = 2;
         config.rank = rank;
@@ -92,7 +103,8 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
         config.dram_size = kDramSize;
         config.hbm_window = config.dram_window = kWindowSize;
         if (hbm_only) config.dram_size = config.dram_window = 0;
-        const char* kernel_path = std::getenv("MF_GVA_SMOKE_KERNEL");
+        const char* kernel_path =
+            network ? nullptr : std::getenv("MF_GVA_SMOKE_KERNEL");
         {
             const auto owner = "rank-" + std::to_string(rank);
             const auto peer = "rank-" + std::to_string(1 - rank);
@@ -168,7 +180,10 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             auto mapPool = [&](uint64_t address, size_t size) {
                 Status status = Status::TooManyRequests("peer preparing");
                 for (int attempt = 0; attempt < 100; ++attempt) {
-                    status = memory.map(peer, descriptor, address, size);
+                    status =
+                        network
+                            ? memory.prepare(peer, descriptor, address, size)
+                            : memory.map(peer, descriptor, address, size);
                     if (status.ok()) return status;
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 }
@@ -177,16 +192,16 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             if (!hbm_only)
                 require(mapPool(dram_address, kDramSize), "map DRAM first");
             require(mapPool(hbm_address, kHbmSize), "map HBM");
-            require(memory.map(peer, descriptor, hbm_address, kHbmSize),
-                    "idempotent map");
-            std::cerr << "rank=" << rank << " remote HBM GVA="
-                      << reinterpret_cast<void*>(hbm_address)
-                      << " DVA=" << deviceAddress(hbm_address, kSize)
-                      << std::endl;
+            require(mapPool(hbm_address, kHbmSize), "idempotent map");
+            if (!network)
+                std::cerr << "rank=" << rank << " remote HBM GVA="
+                          << reinterpret_cast<void*>(hbm_address)
+                          << " DVA=" << deviceAddress(hbm_address, kSize)
+                          << std::endl;
             barrier(sync, "mapped");
             std::vector<uint64_t> addresses{hbm_address};
             if (!hbm_only) addresses.push_back(dram_address);
-            if (copy) {
+            if (copy && !network) {
                 for (auto address : addresses) {
                     std::fill(host.begin(), host.end(), 0);
                     aclCheck(aclrtMemcpy(host.data(), kSize,
@@ -276,6 +291,64 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                 aclCheck(aclrtFree(output), "free kernel output");
                 dlclose(library);
             }
+            if (copy) {
+                // Dedicated single-device worker, as used by the GVA copy path.
+                // Keep sources/destinations disjoint while both ranks transfer.
+                ThreadPool copy_worker(1);
+                std::vector<uint64_t> local_addresses{
+                    reinterpret_cast<uint64_t>(hbm)};
+                if (!hbm_only)
+                    local_addresses.push_back(reinterpret_cast<uint64_t>(dram));
+                for (size_t i = 0; i < local_addresses.size(); ++i) {
+                    std::fill(
+                        host.begin(), host.end(),
+                        static_cast<unsigned char>(0x60 + rank + i * 0x10));
+                    aclCheck(
+                        aclrtMemcpy(deviceAddress(local_addresses[i], kSize),
+                                    kSize, host.data(), kSize,
+                                    ACL_MEMCPY_HOST_TO_DEVICE),
+                        "fill HYBM copy source");
+                }
+                barrier(sync, "hybm-sources-ready");
+                auto nativeCopy = [&](uint64_t source, uint64_t destination) {
+                    uint32_t direction = 0;
+                    require(
+                        memory.beginCopy(source, destination, kSize, direction),
+                        "pin HYBM copy");
+                    auto completion = copy_worker.enqueue(
+                        [&, source, destination, direction] {
+                            return memory.runCopy(source, destination, kSize,
+                                                  direction);
+                        });
+                    require(completion.get(), "worker HYBM copy");
+                };
+                for (size_t i = 0; i < addresses.size(); ++i)
+                    nativeCopy(local_addresses[i], addresses[i] + kSize);
+                barrier(sync, "hybm-writes-done");
+                auto checkDestination = [&](size_t i, size_t offset) {
+                    std::fill(host.begin(), host.end(), 0);
+                    aclCheck(
+                        aclrtMemcpy(
+                            host.data(), kSize,
+                            deviceAddress(local_addresses[i] + offset, kSize),
+                            kSize, ACL_MEMCPY_DEVICE_TO_HOST),
+                        "verify HYBM copy destination");
+                    for (auto value : host)
+                        if (value != 0x60 + (1 - rank) + i * 0x10)
+                            throw std::runtime_error("HYBM copy data mismatch");
+                };
+                for (size_t i = 0; i < addresses.size(); ++i)
+                    checkDestination(i, kSize);
+                for (size_t i = 0; i < addresses.size(); ++i)
+                    nativeCopy(addresses[i], local_addresses[i] + 2 * kSize);
+                for (size_t i = 0; i < addresses.size(); ++i)
+                    checkDestination(i, 2 * kSize);
+                barrier(sync, "hybm-reads-done");
+                std::cerr
+                    << "rank=" << rank
+                    << " PASS worker HYBM logical GVA READ/WRITE verification"
+                    << std::endl;
+            }
             barrier(sync, "readers-stopped");
             if (!hbm_only &&
                 !memory.unmap(peer, dram_address).IsTooManyRequests())
@@ -315,8 +388,8 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             require(memory.close(), "close mismatch context");
         }
         aclCheck(aclFinalize(), "aclFinalize");
-        std::cerr << "rank=" << rank << " PASS native mapping"
-                  << (copy ? " and ACL copy" : "")
+        std::cerr << "rank=" << rank << " protocol=" << protocol
+                  << " PASS native mapping" << (copy ? " and ACL copy" : "")
                   << (kernel_path ? "; AI core remote GVA read/write verified"
                                   : "; NPU kernel access not tested")
                   << std::endl;

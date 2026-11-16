@@ -18,6 +18,7 @@ struct MemFabricGvaConfig {
     bool enabled = false;
     bool explicit_copy = false;
     std::string group;
+    std::string protocol = "device_sdma", trans_url;
     uint32_t rank_count = 0, rank = 0;
     uint16_t device = 0, entity = 64;
     uint64_t hbm_window = 0, dram_window = 0, hbm_size = 0, dram_size = 0;
@@ -28,6 +29,9 @@ class MemFabricGvaApi {
    public:
     virtual ~MemFabricGvaApi() = default;
     static std::shared_ptr<MemFabricGvaApi> load();
+    virtual bool supportsCopy() const { return true; }
+    virtual int copy(void*, uint64_t, uint64_t, size_t, uint32_t) { return -1; }
+    virtual int wait(void*) { return -1; }
     virtual int bind(uint16_t) = 0;
     virtual int initialize(uint16_t) = 0;
     virtual void uninitialize() = 0;
@@ -43,6 +47,8 @@ class MemFabricGvaApi {
     virtual int exportBlob(void*, void*, std::vector<uint8_t>&) = 0;
     virtual int importBlob(void*, bool, const std::vector<uint8_t>&) = 0;
     virtual int map(void*) = 0;
+    virtual bool supportsConnect() const { return false; }
+    virtual int connect(void*, uint32_t) { return -1; }
     virtual int reach(void*, uint32_t, uint32_t&) = 0;
     virtual int remove(void*, uint32_t) = 0;
     virtual int unmap(void*, uint32_t) = 0;
@@ -61,9 +67,19 @@ class MemFabricSharedMemory {
     Status unpublish(void*);
     Status map(const std::string& owner, const std::string& descriptor,
                uint64_t address, size_t size);
+    Status prepare(const std::string& owner, const std::string& descriptor,
+                   uint64_t address, size_t size);
     Status unmap(const std::string& owner, uint64_t address);
     // Resolve only live local pools or successfully mapped, active peer pools.
     Status resolve(uint64_t address, size_t size, void** device_address);
+    Status validateCopyTarget(const std::string& owner,
+                              const std::string& descriptor) const;
+    Status beginCopy(uint64_t source, uint64_t destination, size_t size,
+                     uint32_t& direction);
+    Status runCopy(uint64_t source, uint64_t destination, size_t size,
+                   uint32_t direction);
+    void cancelCopy();
+    void failCopy();
     Status close();
 
    private:
@@ -80,8 +96,10 @@ class MemFabricSharedMemory {
         std::array<Json, 2> descriptors;
         std::array<bool, 2> active{{false, false}};
         std::array<bool, 2> imported{{false, false}};
-        bool cleaned = false, mapped = false;
+        bool cleaned = false, mapped = false, copy_ready = false;
     };
+    Status mapOrPrepare(const std::string&, const std::string&, uint64_t,
+                        size_t, bool);
     Status ensureLocked();
     Status validateLocked(const Json&, const std::string&) const;
     Status recordLocked(const Json&, const std::string&);
@@ -101,6 +119,8 @@ class MemFabricSharedMemory {
     std::map<uint32_t, Peer> peers_;
     Json entity_blob_;
     uint64_t pool_generation_ = 0;
+    size_t pending_copies_ = 0;
+    bool copy_failed_ = false;
 };
 }  // namespace tent
 }  // namespace mooncake

@@ -4,8 +4,10 @@
 #ifdef TENT_WITH_HYBM_GVA
 #include <acl/acl.h>
 #include <dlfcn.h>
+#include <cstring>
 #include <glog/logging.h>
 #include <hybm_big_mem.h>
+#include <hybm_data_op.h>
 static_assert(BM_GVA_NOT_FOUND == -12,
               "MemFabric GVA requires distinct missing-registry errors");
 namespace mooncake {
@@ -40,8 +42,27 @@ class NativeHybm final : public MemFabricGvaApi {
         LOAD(hybm_entity_reach_types);
         LOAD(hybm_remove_imported);
         LOAD(hybm_unmap_rank);
+        hybm_data_copy_ = reinterpret_cast<decltype(hybm_data_copy_)>(
+            dlsym(library_, "hybm_data_copy"));
+        hybm_transport_connect_ =
+            reinterpret_cast<decltype(hybm_transport_connect_)>(
+                dlsym(library_, "hybm_transport_connect"));
+        hybm_wait_ = reinterpret_cast<decltype(hybm_wait_)>(
+            dlsym(library_, "hybm_wait"));
 #undef LOAD
         return true;
+    }
+    bool supportsCopy() const override { return hybm_data_copy_ && hybm_wait_; }
+    int copy(void* entity, uint64_t source, uint64_t destination, size_t size,
+             uint32_t direction) override {
+        hybm_copy_params params{reinterpret_cast<void*>(source),
+                                reinterpret_cast<void*>(destination), size};
+        return hybm_data_copy_(entity, &params,
+                               static_cast<hybm_data_copy_direction>(direction),
+                               nullptr, 0);
+    }
+    int wait(void* entity) override {
+        return hybm_wait_ ? hybm_wait_(entity) : -1;
     }
     int bind(uint16_t d) override { return aclrtSetDevice(d); }
     // HYBM itself reference-counts init/uninit, also used by smem_trans_init.
@@ -68,7 +89,12 @@ class NativeHybm final : public MemFabricGvaApi {
         o.memType = static_cast<hybm_mem_type>(
             (c.hbm_window ? HYBM_MEM_TYPE_DEVICE : 0) |
             (c.dram_window ? HYBM_MEM_TYPE_HOST : 0));
-        o.bmDataOpType = HYBM_DOP_TYPE_SDMA;
+        o.bmDataOpType = c.protocol == "device_rdma" ? HYBM_DOP_TYPE_DEVICE_RDMA
+                         : c.protocol == "device_urma"
+                             ? HYBM_DOP_TYPE_DEVICE_URMA
+                             : HYBM_DOP_TYPE_SDMA;
+        if (c.trans_url.size() >= sizeof(o.transUrl)) return nullptr;
+        std::memcpy(o.transUrl, c.trans_url.c_str(), c.trans_url.size() + 1);
         o.rankCount = c.rank_count;
         o.rankId = c.rank;
         o.devId = c.device;
@@ -117,6 +143,13 @@ class NativeHybm final : public MemFabricGvaApi {
         return hybm_import_(e, &x, 1, nullptr,
                             entity ? HYBM_FLAG_EXPORT_ENTITY : 0);
     }
+    bool supportsConnect() const override {
+        return hybm_transport_connect_ != nullptr;
+    }
+    int connect(void* e, uint32_t rank) override {
+        return hybm_transport_connect_ ? hybm_transport_connect_(e, &rank, 1, 0)
+                                       : -1;
+    }
     int map(void* e) override { return hybm_mmap_(e, 0); }
     int reach(void* e, uint32_t r, uint32_t& out) override {
         hybm_data_op_type t = HYBM_DOP_TYPE_DEFAULT;
@@ -132,6 +165,9 @@ class NativeHybm final : public MemFabricGvaApi {
    private:
     void* library_ = nullptr;
 #define FN(name) decltype(&name) name##_ = nullptr
+    FN(hybm_data_copy);
+    FN(hybm_wait);
+    FN(hybm_transport_connect);
     FN(hybm_init);
     FN(hybm_uninit);
     FN(hybm_create_entity);

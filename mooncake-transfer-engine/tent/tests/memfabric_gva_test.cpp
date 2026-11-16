@@ -499,3 +499,205 @@ TEST(MemFabricGva, DeviceAliasesRemainProtectedUntilPhysicalCleanup) {
     ASSERT_TRUE(p.a.unmap("b", reinterpret_cast<uint64_t>(p.bd)).ok());
     EXPECT_FALSE(p.a.overlaps(reinterpret_cast<uint64_t>(remote_dva), M));
 }
+
+TEST(MemFabricGva, QueuedCopyPinsPublishedPoolsAndMappedPeerUntilCancelled) {
+    Pair p;
+    std::string local;
+    ASSERT_TRUE(p.a.publish(p.ah, M, local).ok());
+    ASSERT_TRUE(p.mapH().ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah),
+                              reinterpret_cast<uint64_t>(p.bh), 64, direction)
+                    .ok());
+    EXPECT_EQ(direction, 9u);
+    EXPECT_FALSE(p.a.unpublish(p.ah).ok());
+    EXPECT_FALSE(p.unmapH().ok());
+    p.a.cancelCopy();
+    EXPECT_TRUE(p.a.unpublish(p.ah).ok());
+    EXPECT_TRUE(p.unmapH().ok());
+}
+TEST(MemFabricGva, CopyRejectsUnpublishedLogicalPoolAndDeviceAlias) {
+    Pair p;
+    ASSERT_TRUE(p.mapH().ok());
+    uint32_t direction = 0;
+    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah),
+                               reinterpret_cast<uint64_t>(p.bh), 64, direction)
+                     .ok());
+    std::string local;
+    ASSERT_TRUE(p.a.publish(p.ah, M, local).ok());
+    void* dva = nullptr;
+    ASSERT_TRUE(p.a.resolve(reinterpret_cast<uint64_t>(p.ah), 64, &dva).ok());
+    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(dva),
+                               reinterpret_cast<uint64_t>(p.bh), 64, direction)
+                     .ok());
+    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah) + M - 1,
+                               reinterpret_cast<uint64_t>(p.bh), 64, direction)
+                     .ok());
+    EXPECT_TRUE(p.unmapH().ok());
+}
+
+TEST(MemFabricGva, CopyTargetRejectsChangedGenerationAtReusedLogicalAddress) {
+    Pair p;
+    ASSERT_TRUE(p.mapH().ok());
+    EXPECT_TRUE(p.a.validateCopyTarget("b", p.h).ok());
+    auto changed = nlohmann::json::parse(p.h);
+    changed["generation"] = "restarted-owner";
+    EXPECT_FALSE(p.a.validateCopyTarget("b", changed.dump()).ok());
+    EXPECT_FALSE(p.a.validateCopyTarget("different-owner", p.h).ok());
+    ASSERT_TRUE(p.unmapH().ok());
+    EXPECT_FALSE(p.a.validateCopyTarget("b", p.h).ok());
+}
+
+namespace {
+class NetworkHybm : public FakeHybm {
+   public:
+    uint32_t protocol_bit = 4;
+    int connect_calls = 0, copy_calls = 0, wait_calls = 0;
+    int connect_result = 0, copy_result = 0;
+    int translate(uint64_t address, uint32_t type, uint64_t& out) override {
+        for (auto base : imported)
+            if (address >= base && address - base < M) return -1;
+        return FakeHybm::translate(address, type, out);
+    }
+    bool connect_available = true;
+    bool supportsConnect() const override { return connect_available; }
+    int connect(void*, uint32_t) override {
+        ++connect_calls;
+        return connect_result;
+    }
+    int reach(void*, uint32_t, uint32_t& result) override {
+        result = protocol_bit;
+        return 0;
+    }
+    int copy(void*, uint64_t, uint64_t, size_t, uint32_t) override {
+        ++copy_calls;
+        return copy_result;
+    }
+    int wait(void*) override {
+        ++wait_calls;
+        return 0;
+    }
+};
+class MemFabricNetworkGva : public ::testing::TestWithParam<const char*> {
+   protected:
+    void SetUp() override {
+        auto local_config = config();
+        local_config.protocol = GetParam();
+        local_config.trans_url = "tcp://127.0.0.1:19001";
+        auto remote_config = local_config;
+        remote_config.rank = 1;
+        remote_config.trans_url = "tcp://127.0.0.1:19002";
+        local_api = std::make_shared<NetworkHybm>();
+        remote_api = std::make_shared<NetworkHybm>();
+        local_api->protocol_bit =
+            std::string(GetParam()) == "device_urma" ? 256 : 4;
+        remote_api->protocol_bit = local_api->protocol_bit;
+        local = std::make_unique<MemFabricSharedMemory>(local_config, "local",
+                                                        local_api);
+        remote = std::make_unique<MemFabricSharedMemory>(remote_config,
+                                                         "remote", remote_api);
+        ASSERT_TRUE(local->allocate(&source, M, 1, 0).ok());
+        ASSERT_TRUE(remote->allocate(&target, M, 1, 0).ok());
+        ASSERT_TRUE(local->publish(source, M, local_desc).ok());
+        ASSERT_TRUE(remote->publish(target, M, remote_desc).ok());
+    }
+    void TearDown() override {
+        local->unmap("remote", reinterpret_cast<uint64_t>(target));
+        local->unpublish(source);
+        remote->unpublish(target);
+        local->free(source, M);
+        remote->free(target, M);
+    }
+    Status prepare() {
+        return local->prepare("remote", remote_desc,
+                              reinterpret_cast<uint64_t>(target), M);
+    }
+    Status begin(uint32_t& direction) {
+        return local->beginCopy(reinterpret_cast<uint64_t>(source),
+                                reinterpret_cast<uint64_t>(target), M,
+                                direction);
+    }
+    std::shared_ptr<NetworkHybm> local_api, remote_api;
+    std::unique_ptr<MemFabricSharedMemory> local, remote;
+    void *source = nullptr, *target = nullptr;
+    std::string local_desc, remote_desc;
+};
+TEST_P(MemFabricNetworkGva, MissingConnectSymbolFailsBeforeImport) {
+    local_api->connect_available = false;
+    EXPECT_TRUE(prepare().IsNotImplemented());
+    EXPECT_EQ(local_api->imports, 0);
+    EXPECT_EQ(local_api->connect_calls, 0);
+}
+TEST_P(MemFabricNetworkGva, NetworkCopyDoesNotRequireRemoteDeviceAddress) {
+    uint32_t direction = 0;
+    EXPECT_FALSE(begin(direction).ok());
+    ASSERT_TRUE(prepare().ok());
+    EXPECT_GE(local_api->connect_calls, 1);
+    void* device_address = reinterpret_cast<void*>(1);
+    EXPECT_FALSE(
+        local->resolve(reinterpret_cast<uint64_t>(target), M, &device_address)
+            .ok());
+    EXPECT_EQ(device_address, nullptr);
+    ASSERT_TRUE(local->validateCopyTarget("remote", remote_desc).ok());
+    ASSERT_TRUE(begin(direction).ok());
+    EXPECT_EQ(direction, 9u);
+    ASSERT_TRUE(local
+                    ->runCopy(reinterpret_cast<uint64_t>(source),
+                              reinterpret_cast<uint64_t>(target), M, direction)
+                    .ok());
+    EXPECT_EQ(local_api->copy_calls, 1);
+    EXPECT_FALSE(
+        local->map("remote", remote_desc, reinterpret_cast<uint64_t>(target), M)
+            .ok());
+}
+TEST_P(MemFabricNetworkGva, FailedConnectCannotAuthorizeCopyAndCanRetry) {
+    local_api->connect_result = -1;
+    EXPECT_FALSE(prepare().ok());
+    uint32_t direction = 0;
+    EXPECT_FALSE(begin(direction).ok());
+    local_api->connect_result = 0;
+    ASSERT_TRUE(prepare().ok());
+    ASSERT_TRUE(begin(direction).ok());
+    local->cancelCopy();
+}
+TEST_P(MemFabricNetworkGva, WrongReachabilityProtocolCannotAuthorizeCopy) {
+    local_api->protocol_bit = 1;
+    EXPECT_FALSE(prepare().ok());
+    uint32_t direction = 0;
+    EXPECT_FALSE(begin(direction).ok());
+}
+TEST_P(MemFabricNetworkGva, FailedNetworkCopyQuarantinesDespiteWaitSuccess) {
+    ASSERT_TRUE(prepare().ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(begin(direction).ok());
+    local_api->copy_result = -1;
+    EXPECT_FALSE(local
+                     ->runCopy(reinterpret_cast<uint64_t>(source),
+                               reinterpret_cast<uint64_t>(target), M, direction)
+                     .ok());
+    EXPECT_FALSE(begin(direction).ok());
+    EXPECT_FALSE(
+        local->unmap("remote", reinterpret_cast<uint64_t>(target)).ok());
+    EXPECT_FALSE(local->unpublish(source).ok());
+    EXPECT_FALSE(local->close().ok());
+}
+TEST_P(MemFabricNetworkGva, GenerationChangeInvalidatesPreparedCopyTarget) {
+    ASSERT_TRUE(prepare().ok());
+    auto descriptor = nlohmann::json::parse(remote_desc);
+    descriptor["generation"] = "new-owner-instance";
+    EXPECT_FALSE(local->validateCopyTarget("remote", descriptor.dump()).ok());
+}
+INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
+                         ::testing::Values("device_rdma", "device_urma"));
+}  // namespace
+
+TEST(MemFabricGva, UnsupportedNetworkProtocolRejectsAllocation) {
+    auto options = config();
+    options.protocol = "unknown_protocol";
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(options, "owner", api);
+    void* address = nullptr;
+    EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
+    EXPECT_EQ(address, nullptr);
+    EXPECT_EQ(api->creates, 0);
+}

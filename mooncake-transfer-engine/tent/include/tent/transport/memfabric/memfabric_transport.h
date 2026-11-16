@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "memfabric_types.h"
+#include "tent/common/concurrent/thread_pool.h"
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
@@ -31,7 +32,11 @@ struct MemFabricConfig {
     std::string data_op_type_str;
 };
 
+struct MemFabricCopyCompletion {
+    std::atomic<TransferStatusEnum> status{TransferStatusEnum::PENDING};
+};
 struct MemFabricTask {
+    std::shared_ptr<MemFabricCopyCompletion> gva_completion;
     Request request;
     volatile TransferStatusEnum status_word = TransferStatusEnum::PENDING;
     uint64_t batch_id = 0;
@@ -43,6 +48,7 @@ struct MemFabricSubBatch : public Transport::SubBatch {
     std::vector<MemFabricTask> task_list;
     std::unordered_map<uint64_t, TransferStatusEnum> batch_status_cache;
     size_t pending_batch_count = 0;
+    size_t capacity = 0;
     size_t size() const override { return task_list.size(); }
     ~MemFabricSubBatch() override;
 };
@@ -82,6 +88,7 @@ class MemFabricTransport : public Transport {
     Status mapRemoteMemory(SegmentID, void*, size_t) override;
     virtual Status mapRemoteMemory(SegmentID, void*, size_t, void**);
     virtual Status resolveGlobalAddress(void*, size_t, void**);
+    Status prepareRemoteMemoryForCopy(SegmentID, void*, size_t);
     Status unmapRemoteMemory(SegmentID, void*) override;
     virtual bool describeAllocation(void*, size_t, MemoryOptions&) const;
     virtual bool overlapsAllocation(void*, size_t) const;
@@ -89,6 +96,12 @@ class MemFabricTransport : public Transport {
     bool supportNotification() const override { return false; }
 
    private:
+    Status submitGvaCopies(MemFabricSubBatch*, const std::vector<Request>&);
+    std::unique_ptr<ThreadPool> copy_pool_;
+    std::shared_ptr<std::atomic<size_t>> gva_pending_ =
+        std::make_shared<std::atomic<size_t>>(0);
+    size_t max_pending_copies_ = 256;
+    Status prepareGva(SegmentID, void*, size_t, void**, bool);
     Status loadConfig(const std::shared_ptr<Config>& conf);
     // Called with inflight_mu_ held; also serializes registration and teardown.
     Status initializeLocked();

@@ -48,10 +48,11 @@ Status MemFabricSharedMemory::ensureLocked() {
         return Status::NotImplemented(
             "MemFabric GVA requires compatible HYBM headers and library "
             "symbols");
-    if (config_.explicit_copy)
-        return Status::NotImplemented(
-            "Explicit trans copy of GVA pools is not validated; disable "
-            "gva/explicit_copy");
+    if (config_.protocol != "device_sdma" &&
+        config_.protocol != "device_rdma" && config_.protocol != "device_urma")
+        return Status::InvalidArgument("Unsupported GVA protocol");
+    if (config_.trans_url.size() >= 64)
+        return Status::InvalidArgument("GVA transport URL too long");
     if (config_.group.empty() || config_.group.size() > 256 ||
         config_.rank_count == 0 || config_.rank >= config_.rank_count ||
         config_.entity < 64 || config_.entity >= 128 ||
@@ -91,6 +92,7 @@ Status MemFabricSharedMemory::ensureLocked() {
 }
 MemFabricSharedMemory::Json MemFabricSharedMemory::identityLocked() const {
     return Json{{"version", 2u},
+                {"protocol", config_.protocol},
                 {"address_mode", "logical56"},
                 {"group", config_.group},
                 {"owner", owner_},
@@ -110,6 +112,8 @@ Status MemFabricSharedMemory::allocate(void** out, size_t n, uint32_t t,
     if (!out) return Status::InvalidArgument("Null GVA output");
     *out = nullptr;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_ || copy_failed_)
+        return pending("GVA copies retain resources");
     if (t != 1 && t != 2)
         return Status::InvalidArgument("Unknown GVA memory type");
     if (n == 0 || n % kPage ||
@@ -224,6 +228,8 @@ Status MemFabricSharedMemory::publish(void* ptr, size_t n, std::string& out) {
 }
 Status MemFabricSharedMemory::unpublish(void* ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_ || copy_failed_)
+        return pending("GVA copies retain resources");
     for (auto& p : pools_)
         if (p.slice && p.address == reinterpret_cast<uint64_t>(ptr)) {
             p.published = false;
@@ -233,6 +239,8 @@ Status MemFabricSharedMemory::unpublish(void* ptr) {
 }
 Status MemFabricSharedMemory::free(void* ptr, size_t n) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_ || copy_failed_)
+        return pending("GVA copies retain resources");
     for (auto& p : pools_)
         if (p.slice && p.address == reinterpret_cast<uint64_t>(ptr) &&
             p.length == n) {
@@ -250,6 +258,8 @@ Status MemFabricSharedMemory::free(void* ptr, size_t n) {
 Status MemFabricSharedMemory::validateLocked(const Json& j,
                                              const std::string& owner) const {
     try {
+        if (j.value("protocol", std::string("device_sdma")) != config_.protocol)
+            return Status::InvalidArgument("GVA peer protocol differs");
         if (j.at("version").get<uint64_t>() != 2 ||
             j.at("address_mode").get<std::string>() != "logical56" ||
             j.at("owner").get<std::string>() != owner || owner.empty() ||
@@ -374,7 +384,24 @@ Status MemFabricSharedMemory::verifyLocked(const Peer& p) {
 Status MemFabricSharedMemory::map(const std::string& owner,
                                   const std::string& descriptor,
                                   uint64_t address, size_t size) {
+    return mapOrPrepare(owner, descriptor, address, size, true);
+}
+Status MemFabricSharedMemory::prepare(const std::string& owner,
+                                      const std::string& descriptor,
+                                      uint64_t address, size_t size) {
+    return mapOrPrepare(owner, descriptor, address, size, false);
+}
+Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
+                                           const std::string& descriptor,
+                                           uint64_t address, size_t size,
+                                           bool direct) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_ || copy_failed_)
+        return pending("GVA copies retain resources");
+    if (config_.protocol != "device_sdma" &&
+        (!api_ || !api_->supportsConnect()))
+        return Status::NotImplemented(
+            "HYBM network connect symbol unavailable");
     try {
         auto descriptors = Json::parse(descriptor);
         if (!descriptors.is_array()) descriptors = Json::array({descriptors});
@@ -400,14 +427,31 @@ Status MemFabricSharedMemory::map(const std::string& owner,
         CHECK_STATUS(recordLocked(*requested, owner));
         auto& peer = peers_.at(rank);
         peer.mapped = false;
+        peer.copy_ready = false;
         peer.active[requested->at("type").get<size_t>() - 1] = true;
         for (const auto& d : descriptors) CHECK_STATUS(importLocked(d, owner));
         // Reciprocal imports are driven by each application's map calls.
         if (api_->map(entity_))
             return pending(
                 "native map failed; ensure both peers have imported and retry");
-        CHECK_STATUS(verifyLocked(peer));
-        peer.mapped = true;
+        if (config_.protocol != "device_sdma") {
+            if (api_->connect(entity_, rank))
+                return pending(
+                    "network connection not ready; prepare both peers and "
+                    "retry");
+            uint32_t reach = 0;
+            const uint32_t required =
+                config_.protocol == "device_rdma" ? 4u : 256u;
+            if (api_->reach(entity_, rank, reach) || !(reach & required))
+                return Status::NotImplemented(
+                    "Peer lacks configured network copy capability");
+            peer.copy_ready = true;
+        }
+        if (direct || config_.protocol == "device_sdma") {
+            CHECK_STATUS(verifyLocked(peer));
+            peer.mapped = true;
+            peer.copy_ready = true;
+        }
         return Status::OK();
     } catch (const Json::exception&) {
         return Status::InvalidArgument("Malformed GVA pool bundle");
@@ -433,12 +477,15 @@ Status MemFabricSharedMemory::cleanupLocked(uint32_t rank, Peer& p) {
     // Native HAL errors are not observable through this ABI. This certifies
     // the native API and registry contract, not independent HAL revocation.
     p.mapped = false;
+    p.copy_ready = false;
     p.cleaned = true;
     return Status::OK();
 }
 Status MemFabricSharedMemory::unmap(const std::string& owner,
                                     uint64_t address) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_ || copy_failed_)
+        return pending("GVA copies retain resources");
     for (auto& entry : peers_) {
         auto& peer = entry.second;
         if (peer.owner != owner) continue;
@@ -489,8 +536,99 @@ Status MemFabricSharedMemory::resolve(uint64_t address, size_t size,
     *device_address = reinterpret_cast<void*>(first);
     return Status::OK();
 }
+Status MemFabricSharedMemory::validateCopyTarget(
+    const std::string& owner, const std::string& descriptor) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    try {
+        const auto published = Json::parse(descriptor);
+        CHECK_STATUS(validateLocked(published, owner));
+        auto it = peers_.find(published.at("rank").get<uint32_t>());
+        auto type = published.at("type").get<uint32_t>();
+        if (it == peers_.end() || type < 1 || type > 2 || it->second.cleaned ||
+            !it->second.copy_ready || !it->second.active[type - 1] ||
+            it->second.descriptors[type - 1] != published)
+            return Status::InvalidArgument(
+                "Remote GVA publication differs from mapped pool");
+        return Status::OK();
+    } catch (const Json::exception&) {
+        return Status::InvalidArgument("Malformed GVA copy descriptor");
+    }
+}
+Status MemFabricSharedMemory::beginCopy(uint64_t source, uint64_t destination,
+                                        size_t size, uint32_t& direction) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!size || !source || !destination || size > UINT64_MAX - source ||
+        size > UINT64_MAX - destination)
+        return Status::InvalidArgument("Invalid GVA copy range");
+    if (copy_failed_) return pending("native copy completion remains unknown");
+    if (!api_ || !api_->supportsCopy())
+        return Status::NotImplemented("HYBM copy symbols unavailable");
+    auto type = [&](uint64_t address) -> uint32_t {
+        auto contains = [&](uint64_t base, uint64_t length) {
+            return address >= base && address - base < length &&
+                   size <= length - (address - base);
+        };
+        for (size_t i = 0; i < pools_.size(); ++i)
+            if (pools_[i].slice && pools_[i].published &&
+                contains(pools_[i].address, pools_[i].length))
+                return i + 1;
+        for (const auto& entry : peers_) {
+            const auto& peer = entry.second;
+            if (peer.cleaned || !peer.copy_ready) continue;
+            for (size_t i = 0; i < peer.descriptors.size(); ++i)
+                if (peer.active[i] && !peer.descriptors[i].is_null() &&
+                    contains(peer.descriptors[i].at("address").get<uint64_t>(),
+                             peer.descriptors[i].at("size").get<uint64_t>()))
+                    return i + 1;
+        }
+        return 0;
+    };
+    const auto src_type = type(source), dst_type = type(destination);
+    if (!src_type || !dst_type)
+        return Status::InvalidArgument(
+            "GVA copy requires published local or active mapped logical pools");
+    // HYBM_GLOBAL_{HOST,DEVICE}_TO_GLOBAL_{HOST,DEVICE}.
+    direction = (src_type == 1 ? 8u : 4u) + (dst_type == 1 ? 1u : 0u);
+    CHECK_STATUS(ensureLocked());
+    ++pending_copies_;
+    return Status::OK();
+}
+Status MemFabricSharedMemory::runCopy(uint64_t source, uint64_t destination,
+                                      size_t size, uint32_t direction) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (copy_failed_) {
+            if (pending_copies_) --pending_copies_;
+            return pending("previous native copy completion remains unknown");
+        }
+    }
+    // beginCopy pins entity and all pools before queue admission. No native
+    // blocking call holds mutex_, so status queries and teardown can progress.
+    const auto bound = api_->bind(config_.device);
+    const auto result =
+        bound ? bound
+              : api_->copy(entity_, source, destination, size, direction);
+    const bool drained =
+        bound || result == 0 ||
+        (config_.protocol == "device_sdma" && api_->wait(entity_) == 0);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_) --pending_copies_;
+    if (!drained) copy_failed_ = true;
+    return result == 0 ? Status::OK() : nativeError("synchronous copy");
+}
+void MemFabricSharedMemory::failCopy() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_) --pending_copies_;
+    copy_failed_ = true;
+}
+void MemFabricSharedMemory::cancelCopy() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_) --pending_copies_;
+}
 Status MemFabricSharedMemory::close() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_copies_ || copy_failed_)
+        return pending("GVA copies retain resources");
     for (const auto& p : pools_)
         if (p.slice) return pending("local pools still allocated");
     for (const auto& kv : peers_)
