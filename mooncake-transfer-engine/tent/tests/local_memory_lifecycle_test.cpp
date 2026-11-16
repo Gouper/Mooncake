@@ -584,10 +584,9 @@ class MemFabricEngineRegistration : public ::testing::Test {
         tcp = std::make_shared<RegistrationObserver>();
         engine->swapTransportForTest(MEMFABRIC, memfabric);
         engine->swapTransportForTest(TCP, tcp);
-        MemoryOptions options;
         options.type = MEMFABRIC;
         options.location = "cpu:0";
-        // A zero request still produces a managed GVA pool.
+        // Preserve allocation options for explicit GVA registration.
         ASSERT_TRUE(engine->allocateLocalMemory(&pool, kSize, options).ok());
         EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(pool));
     }
@@ -597,12 +596,11 @@ class MemFabricEngineRegistration : public ::testing::Test {
     TransferEngineImpl* engine = nullptr;
     std::shared_ptr<DeviceAddressMemFabricTransport> memfabric;
     std::shared_ptr<RegistrationObserver> tcp;
+    MemoryOptions options;
     void* pool = nullptr;
 };
 
-TEST_F(MemFabricEngineRegistration, KnownDeviceAddressBypassesCpuProbing) {
-    MemoryOptions options;
-    options.location = "cpu:0";
+TEST_F(MemFabricEngineRegistration, AllocationOptionsBypassCpuProbing) {
     auto status = engine->registerLocalMemory({pool}, {kSize}, options);
     ASSERT_TRUE(status.ok()) << status;
     const auto buffers = TransferEngineImplTestPeer::localBuffers(*engine);
@@ -614,9 +612,7 @@ TEST_F(MemFabricEngineRegistration, KnownDeviceAddressBypassesCpuProbing) {
     EXPECT_TRUE(tcp->registered.empty());
 }
 
-TEST_F(MemFabricEngineRegistration,
-       RejectsPartialOrCrossTransportRegistration) {
-    MemoryOptions options;
+TEST_F(MemFabricEngineRegistration, BackendRejectsPartialPoolRegistration) {
     for (auto range : std::vector<std::pair<void*, size_t>>{
              {pool, kSize - 1},
              {reinterpret_cast<void*>(reinterpret_cast<uint64_t>(pool) + 1),
@@ -626,60 +622,8 @@ TEST_F(MemFabricEngineRegistration,
             engine->registerLocalMemory({range.first}, {range.second}, options)
                 .IsInvalidArgument());
     }
-    options.type = TCP;
-    EXPECT_TRUE(engine->registerLocalMemory({pool}, {kSize}, options)
-                    .IsInvalidArgument());
     EXPECT_EQ(tcp->warmup_calls, 0);
     EXPECT_TRUE(tcp->registered.empty());
-}
-
-TEST_F(MemFabricEngineRegistration, UnknownGlobalAddressCannotBypassProbing) {
-    std::vector<char> ordinary(kSize);
-    MemoryOptions options;
-    options.global_address = reinterpret_cast<uint64_t>(ordinary.data());
-    EXPECT_TRUE(engine->registerLocalMemory({ordinary.data()}, {kSize}, options)
-                    .IsInvalidArgument());
-    EXPECT_EQ(tcp->warmup_calls, 0);
-    EXPECT_TRUE(tcp->registered.empty());
-}
-
-TEST_F(MemFabricEngineRegistration, MissingGlobalOwnerCannotPublishPool) {
-    engine->swapTransportForTest(MEMFABRIC, nullptr);
-    EXPECT_TRUE(engine->registerLocalMemory(pool, kSize).IsInvalidArgument());
-    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());
-    EXPECT_EQ(tcp->warmup_calls, 0);
-    EXPECT_TRUE(tcp->registered.empty());
-    engine->swapTransportForTest(MEMFABRIC, memfabric);
-}
-
-TEST_F(MemFabricEngineRegistration,
-       DifferentGlobalOwnersRequireSeparateBatches) {
-    class OtherGlobalTransport : public DeviceAddressMemFabricTransport {
-       public:
-        Status allocateLocalMemory(void** address, size_t size,
-                                   MemoryOptions& options) override {
-            CHECK_STATUS(DeviceAddressMemFabricTransport::allocateLocalMemory(
-                address, size, options));
-            options.type = NVLINK;
-            return Status::OK();
-        }
-    };
-    auto other = std::make_shared<OtherGlobalTransport>();
-    other->fail_registration = true;
-    engine->swapTransportForTest(NVLINK, other);
-    MemoryOptions allocation;
-    allocation.type = NVLINK;
-    void* other_pool = nullptr;
-    ASSERT_TRUE(
-        engine->allocateLocalMemory(&other_pool, kSize, allocation).ok());
-    MemoryOptions registration;
-    EXPECT_TRUE(engine
-                    ->registerLocalMemory({pool, other_pool}, {kSize, kSize},
-                                          registration)
-                    .IsInvalidArgument());
-    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());
-    EXPECT_EQ(tcp->warmup_calls, 0);
-    EXPECT_TRUE(engine->freeLocalMemory(other_pool).ok());
 }
 
 TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {
@@ -701,34 +645,15 @@ TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {
     EXPECT_TRUE(engine->unregisterLocalMemory(ordinary.data()).ok());
 }
 
-TEST_F(MemFabricEngineRegistration, MixedBatchLimitsDevicePoolToMemFabric) {
-    std::vector<char> ordinary(kSize);
-    MemoryOptions options;
-    auto status = engine->registerLocalMemory({pool, ordinary.data()},
-                                              {kSize, kSize}, options);
-    ASSERT_TRUE(status.ok()) << status;
-    const auto buffers = TransferEngineImplTestPeer::localBuffers(*engine);
-    ASSERT_EQ(buffers.size(), 2u);
-    for (const auto& buffer : buffers) {
-        if (buffer.addr == reinterpret_cast<uint64_t>(pool)) {
-            EXPECT_EQ(buffer.transports, std::vector<TransportType>{MEMFABRIC});
-        }
-    }
-    EXPECT_EQ(
-        tcp->registered,
-        std::vector<uint64_t>{reinterpret_cast<uint64_t>(ordinary.data())});
-    EXPECT_TRUE(engine->unregisterLocalMemory(ordinary.data()).ok());
-}
-
-TEST_F(MemFabricEngineRegistration, ExportFailureCannotFallBackToCpuTransport) {
+TEST_F(MemFabricEngineRegistration, ExplicitExportFailureDoesNotPublish) {
     memfabric->fail_registration = true;
-    EXPECT_FALSE(engine->registerLocalMemory(pool, kSize).ok());
+    EXPECT_FALSE(engine->registerLocalMemory({pool}, {kSize}, options).ok());
     EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());
     EXPECT_TRUE(tcp->registered.empty());
 }
 
 TEST_F(MemFabricEngineRegistration, ZeroRequestCannotFreePublishedPool) {
-    ASSERT_TRUE(engine->registerLocalMemory(pool, kSize).ok());
+    ASSERT_TRUE(engine->registerLocalMemory({pool}, {kSize}, options).ok());
     EXPECT_TRUE(engine->freeLocalMemory(pool).IsInvalidArgument());
     EXPECT_EQ(memfabric->free_calls, 0);
     ASSERT_TRUE(engine->unregisterLocalMemory(pool).ok());

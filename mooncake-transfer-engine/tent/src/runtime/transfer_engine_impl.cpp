@@ -915,8 +915,7 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
     for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
          ++it) {
         if (it->addr == addr) {
-            bool managed_gva = it->options.global_address != 0;
-            if (managed_gva) {
+            if (it->options.global_address) {
                 auto segment = metadata_->segmentManager().getLocal();
                 if (segment) {
                     const auto base = reinterpret_cast<uint64_t>(addr);
@@ -1060,97 +1059,62 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
     desc_list.reserve(addr_list.size());
-    std::vector<AllocatedMemory> global_allocations;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& allocation : allocated_memory_)
-            if (allocation.options.global_address)
-                global_allocations.push_back(allocation);
-    }
-    std::map<uint64_t, TransportType> allocation_owners;
-    std::unordered_set<TransportType> required_transports;
     for (size_t i = 0; i < addr_list.size(); ++i) {
         BufferDesc desc;
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
-        if (!desc.addr || !desc.length || desc.length > UINT64_MAX - desc.addr)
-            return Status::InvalidArgument(
-                "Invalid memory registration range" LOC_MARK);
-
-        bool global_allocation = false;
-        for (const auto& allocation : global_allocations) {
-            const auto base = reinterpret_cast<uint64_t>(allocation.addr);
-            const bool overlaps = desc.addr >= base
-                                      ? desc.addr - base < allocation.size
-                                      : base - desc.addr < desc.length;
-            if (!overlaps) continue;
-            if (desc.addr < base || desc.addr - base >= allocation.size ||
-                desc.length > allocation.size - (desc.addr - base))
-                return Status::InvalidArgument(
-                    "Registration exceeds global allocation" LOC_MARK);
-            const auto owner = allocation.options.type;
-            if (options.type != UNSPEC && options.type != owner)
-                return Status::InvalidArgument(
-                    "Global allocations require their owning "
-                    "transport" LOC_MARK);
-            if (std::find(transports.begin(), transports.end(), owner) ==
-                transports.end())
-                return Status::InvalidArgument(
-                    "Global allocation transport is unavailable" LOC_MARK);
-            desc.location = allocation.options.location;
-            allocation_owners.emplace(desc.addr, owner);
-            required_transports.insert(owner);
-            global_allocation = true;
-            break;
+        // Logical MemFabric addresses cannot be probed as ordinary pointers.
+        // Register them with the options returned by allocateLocalMemory().
+        if (options.type == MEMFABRIC && options.global_address) {
+            desc.location = options.location;
+            desc.ref_count = 1;
+            desc.internal = options.internal;
+            desc.permission = options.perm;
+            desc_list.push_back(std::move(desc));
+            continue;
         }
-        if (!global_allocation && options.global_address)
+
+        auto& platform = Platform::getLoader();
+#ifdef USE_CUDA
+        // Warm-up can register memory temporarily, so validate it first.
+        auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
+        CudaPointerInfo pointer_info;
+        if (cuda)
+            CHECK_STATUS(
+                cuda->validateMemoryRegistration(addr_list[i], pointer_info));
+#endif
+
+        // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
+        // subsequent RDMA registration and NUMA probing
+        bool pages_pinned = false;
+        for (auto type : transports) {
+            if (transport_list_[type]->warmupMemory(addr_list[i],
+                                                    size_list[i])) {
+                pages_pinned = true;
+                break;
+            }
+        }
+
+        // NUMA probe: skip prefault if warm-up already pinned pages
+        std::vector<RangeLocation> entries;
+#ifdef USE_CUDA
+        if (cuda) {
+            entries = cuda->getLocation(addr_list[i], size_list[i],
+                                        pages_pinned, pointer_info);
+        } else
+#endif
+        {
+            entries =
+                platform.getLocation(addr_list[i], size_list[i], pages_pinned);
+        }
+        if (entries.empty())
             return Status::InvalidArgument(
-                "Unknown global allocation" LOC_MARK);
-        // Only tracked global allocations bypass pointer probing. Their
-        // backend validates registration constraints before publication.
-        if (!global_allocation) {
-            auto& platform = Platform::getLoader();
-#ifdef USE_CUDA
-            // Warm-up can register memory temporarily, so validate it first.
-            auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
-            CudaPointerInfo pointer_info;
-            if (cuda)
-                CHECK_STATUS(cuda->validateMemoryRegistration(addr_list[i],
-                                                              pointer_info));
-#endif
-
-            // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
-            // subsequent RDMA registration and NUMA probing
-            bool pages_pinned = false;
-            for (auto type : transports) {
-                if (transport_list_[type]->warmupMemory(addr_list[i],
-                                                        size_list[i])) {
-                    pages_pinned = true;
-                    break;
-                }
-            }
-
-            // NUMA probe: skip prefault if warm-up already pinned pages
-            std::vector<RangeLocation> entries;
-#ifdef USE_CUDA
-            if (cuda) {
-                entries = cuda->getLocation(addr_list[i], size_list[i],
-                                            pages_pinned, pointer_info);
-            } else
-#endif
-            {
-                entries = platform.getLocation(addr_list[i], size_list[i],
-                                               pages_pinned);
-            }
-            if (entries.empty())
-                return Status::InvalidArgument(
-                    "Unable to locate registered memory range" LOC_MARK);
-            if (entries.size() == 1) {
-                desc.location = entries[0].location;
-            } else {
-                desc.location = entries[0].location;
-                desc.regions = coalesceRegions(entries);
-            }
+                "Unable to locate registered memory range" LOC_MARK);
+        if (entries.size() == 1) {
+            desc.location = entries[0].location;
+        } else {
+            desc.location = entries[0].location;
+            desc.regions = coalesceRegions(entries);
         }
         desc.ref_count = 1;
         // The probe is the source of truth for transport selection: it
@@ -1163,7 +1127,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         // make getTypeEnum() return MTYPE_UNKNOWN and break transport
         // selection. Validate before overriding: keep the probe when the
         // caller is a wildcard, unknown, or a different type.
-        if (!global_allocation && options.location != kWildcardLocation &&
+        if (options.location != kWildcardLocation &&
             !options.location.empty()) {
             auto probed_type =
                 getTypeEnum(LocationParser(desc.location).type());
@@ -1189,18 +1153,6 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
-    if (required_transports.size() > 1)
-        return Status::InvalidArgument(
-            "Register global allocations from different transports "
-            "separately" LOC_MARK);
-
-    // Register owning transports first; a global allocation cannot fall back
-    // to a backend that interprets its logical address as an ordinary pointer.
-    std::stable_partition(transports.begin(), transports.end(),
-                          [&](TransportType type) {
-                              return required_transports.count(type) != 0;
-                          });
-
     bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
         desc_list,
@@ -1212,30 +1164,13 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             std::vector<TransportType> registered_transports;
             Status first_error = Status::OK();
             for (auto type : transports) {
-                std::vector<BufferDesc> filtered;
-                std::vector<size_t> indices;
-                auto* selected = &descs;
-                if (!allocation_owners.empty()) {
-                    for (size_t i = 0; i < descs.size(); ++i) {
-                        const auto owner =
-                            allocation_owners.find(descs[i].addr);
-                        if (owner != allocation_owners.end() &&
-                            owner->second != type)
-                            continue;
-                        indices.push_back(i);
-                        filtered.push_back(descs[i]);
-                    }
-                    if (filtered.empty()) continue;
-                    selected = &filtered;
-                }
-                auto s =
-                    transport_list_[type]->addMemoryBuffer(*selected, options);
+                auto s = transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) {
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
                     // transport as defensive cleanup for a partially
                     // constructed backend.
-                    for (auto& desc : *selected) {
+                    for (auto& desc : descs) {
                         auto cleanup =
                             transport_list_[type]->removeMemoryBuffer(desc);
                         if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
@@ -1247,13 +1182,9 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     // the long-standing best-effort behavior across several
                     // installed transports, but may not publish a buffer for
                     // which every backend failed.
-                    if (options.type != UNSPEC ||
-                        required_transports.count(type))
-                        return s;
+                    if (options.type != UNSPEC) return s;
                     continue;
                 }
-                for (size_t i = 0; i < indices.size(); ++i)
-                    descs[indices[i]] = std::move(filtered[i]);
                 registered_transports.push_back(type);
             }
             if (registered_transports.empty() && !first_error.ok()) {
