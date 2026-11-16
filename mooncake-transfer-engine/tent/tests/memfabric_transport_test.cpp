@@ -672,12 +672,8 @@ class MemFabricTransportTest : public ::testing::Test {
             }));
         CHECK_STATUS(
             metadata_->segmentManager().openRemote(copy_peer_, peer_name_));
-        if (config.protocol != "device_sdma")
-            return transport_->mapRemoteMemory(copy_peer_, copy_dram_,
-                                               remote.length);
-        void* dva = nullptr;
         return transport_->mapRemoteMemory(copy_peer_, copy_dram_,
-                                           remote.length, &dva);
+                                           remote.length);
     }
     Request GvaWrite(void* source, uint64_t target, size_t size) {
         auto request = MakeWrite(source, target, size);
@@ -2120,11 +2116,11 @@ TEST_F(MemFabricTransportTest, TransBatchZeroCannotCompletePendingGvaCopy) {
     EXPECT_EQ(status.transferred_bytes, 64u);
 }
 
-TEST_F(MemFabricTransportTest, SdmaMappingStillRequiresDeviceAddressOutput) {
+TEST_F(MemFabricTransportTest, SdmaMappingPreparesCopyThroughExistingEntry) {
     ASSERT_TRUE(PrepareGvaCopy().ok());
     EXPECT_TRUE(
         transport_->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize)
-            .IsNotImplemented());
+            .ok());
 }
 
 TEST_F(MemFabricTransportTest,

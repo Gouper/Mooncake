@@ -309,18 +309,6 @@ class TransferEngine {
     Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
                            TransportType type = UNSPEC);
 
-    // Map a complete published region and return this caller's device pointer. The output
-    // may differ from gva; kernels must use the output. Unmap uses gva.
-    Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
-                           void** device_address, TransportType type = UNSPEC);
-
-    // Resolve a live local allocation or active remote mapping. The returned
-    // pointer is valid only until the region is unmapped/freed. MEMFABRIC
-    // allocations return logical GVA tokens for registration and free; use
-    // this method before passing them to kernels or device copy APIs.
-    Status resolveGlobalAddress(void* gva, size_t size, void** device_address,
-                                TransportType type = UNSPEC);
-
     // gva must be the published region base. The application synchronizes
     // kernels and transfers using the region before unmapping it. The owner
     // unregisters/frees only after all peers have finished using it.

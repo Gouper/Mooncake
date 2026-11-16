@@ -525,11 +525,14 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
     }
 
     Status mapRemoteMemory(SegmentID, void*, size_t) override {
-        return Status::NotImplemented("Use the device-address output overload");
+        ++map_calls;
+        return Status::OK();
     }
 
     Status mapRemoteMemory(SegmentID, void* gva, size_t size,
                            void** device_address) override {
+        if (!device_address)
+            return Status::InvalidArgument("Null device-address output");
         ++map_calls;
         return resolveGlobalAddress(gva, size, device_address);
     }
@@ -691,45 +694,35 @@ TEST_F(MemFabricEngineRegistration, ZeroRequestCannotFreePublishedPool) {
 }
 
 TEST_F(MemFabricEngineRegistration, ExplicitMappingDispatchesToMemFabric) {
-    void* device_address = nullptr;
-    EXPECT_TRUE(
-        frontend->mapRemoteMemory(1, pool, kSize, &device_address, MEMFABRIC)
-            .ok());
-    EXPECT_EQ(reinterpret_cast<uint64_t>(device_address),
-              reinterpret_cast<uint64_t>(pool) + (1ULL << 40));
-    EXPECT_TRUE(engine->unmapRemoteMemory(1, pool, MEMFABRIC).ok());
+    EXPECT_TRUE(frontend->mapRemoteMemory(1, pool, kSize, MEMFABRIC).ok());
+    EXPECT_TRUE(frontend->unmapRemoteMemory(1, pool, MEMFABRIC).ok());
     EXPECT_EQ(memfabric->map_calls, 1);
     EXPECT_EQ(memfabric->unmap_calls, 1);
 }
-TEST_F(MemFabricEngineRegistration, StrictMappingRejectsLogicalAddressMode) {
-    EXPECT_TRUE(frontend->mapRemoteMemory(1, pool, kSize, MEMFABRIC)
-                    .IsNotImplemented());
+TEST_F(MemFabricEngineRegistration, MappingRejectsInvalidRangeBeforeDispatch) {
+    EXPECT_TRUE(
+        frontend->mapRemoteMemory(1, pool, 0, MEMFABRIC).IsInvalidArgument());
     EXPECT_EQ(memfabric->map_calls, 0);
 }
 
-TEST_F(MemFabricEngineRegistration, ResolveDispatchesLogicalRangeToMemFabric) {
+TEST_F(MemFabricEngineRegistration, MemFabricResolvesLogicalRangeInternally) {
     auto* offset =
         reinterpret_cast<void*>(reinterpret_cast<uint64_t>(pool) + 32);
     void* device_address = nullptr;
     ASSERT_TRUE(
-        frontend->resolveGlobalAddress(offset, 64, &device_address, MEMFABRIC)
-            .ok());
+        memfabric->resolveGlobalAddress(offset, 64, &device_address).ok());
     EXPECT_EQ(reinterpret_cast<uint64_t>(device_address),
               reinterpret_cast<uint64_t>(offset) + (1ULL << 40));
     EXPECT_FALSE(
-        frontend
-            ->resolveGlobalAddress(pool, kSize + 1, &device_address, MEMFABRIC)
-            .ok());
+        memfabric->resolveGlobalAddress(pool, kSize + 1, &device_address).ok());
     EXPECT_EQ(device_address, nullptr);
-    EXPECT_FALSE(
-        frontend->resolveGlobalAddress(pool, kSize, nullptr, MEMFABRIC).ok());
+    EXPECT_FALSE(memfabric->resolveGlobalAddress(pool, kSize, nullptr).ok());
 }
 
-TEST_F(MemFabricEngineRegistration, MappingRejectsMissingOutputBeforeDispatch) {
-    EXPECT_FALSE(frontend
-                     ->mapRemoteMemory(1, pool, kSize,
-                                       static_cast<void**>(nullptr), MEMFABRIC)
-                     .ok());
+TEST_F(MemFabricEngineRegistration, MemFabricMappingRejectsMissingOutput) {
+    EXPECT_FALSE(
+        memfabric->mapRemoteMemory(1, pool, kSize, static_cast<void**>(nullptr))
+            .ok());
     EXPECT_EQ(memfabric->map_calls, 0);
 }
 #endif

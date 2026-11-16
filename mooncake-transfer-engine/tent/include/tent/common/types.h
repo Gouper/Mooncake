@@ -241,7 +241,7 @@ struct MemoryOptions {
     size_t shm_offset = 0;
     bool internal = false;
     // Nonzero requests allocation at this exact global address. For MemFabric
-    // this is a logical GVA token: resolveGlobalAddress returns the device VA.
+    // this is a logical GVA token, distinct from the local device VA.
     // CUDA VMM allocations use the same global and device address.
     // Participants choose a common global layout. Zero lets the backend choose
     // the global address. MemFabric device pointers remain local to each rank.

@@ -117,14 +117,8 @@ Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
 }
 Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
                                            size_t size) {
-    if (gva_config_.protocol == "device_rdma" ||
-        gva_config_.protocol == "device_urma") {
-        void* ignored = nullptr;
-        return prepareGva(id, addr, size, &ignored, false);
-    }
-    return Status::NotImplemented(
-        "MemFabric logical GVA requires mapRemoteMemory with device address "
-        "output");
+    void* ignored = nullptr;
+    return prepareGva(id, addr, size, &ignored, false);
 }
 Status MemFabricTransport::resolveGlobalAddress(void* gva, size_t size,
                                                 void** device_address) {
