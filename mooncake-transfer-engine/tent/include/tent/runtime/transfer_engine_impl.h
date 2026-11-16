@@ -306,18 +306,6 @@ class TransferEngineImpl {
     Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
                            TransportType type);
 
-    // Map a logical GVA and return this caller's device pointer. The output
-    // may differ from gva; kernels must use the output. Unmap uses gva.
-    Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
-                           void** device_address, TransportType type);
-
-    // Resolve a live local allocation or active remote mapping. The returned
-    // pointer is valid only until the region is unmapped/freed. MEMFABRIC
-    // allocations return logical GVA tokens for registration and free; use
-    // this method before passing them to kernels or device copy APIs.
-    Status resolveGlobalAddress(void* gva, size_t size, void** device_address,
-                                TransportType type);
-
     Status unmapRemoteMemory(SegmentID peer, void* gva, TransportType type);
 
     Status registerLocalMemory(void* addr, size_t size,

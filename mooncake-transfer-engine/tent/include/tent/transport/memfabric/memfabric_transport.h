@@ -80,8 +80,8 @@ class MemFabricTransport : public Transport {
     Status freeLocalMemory(void*, size_t) override;
     bool supportsGlobalAddressing() const override;
     Status mapRemoteMemory(SegmentID, void*, size_t) override;
-    Status mapRemoteMemory(SegmentID, void*, size_t, void**) override;
-    Status resolveGlobalAddress(void*, size_t, void**) override;
+    virtual Status mapRemoteMemory(SegmentID, void*, size_t, void**);
+    virtual Status resolveGlobalAddress(void*, size_t, void**);
     Status unmapRemoteMemory(SegmentID, void*) override;
     virtual bool describeAllocation(void*, size_t, MemoryOptions&) const;
     virtual bool overlapsAllocation(void*, size_t) const;

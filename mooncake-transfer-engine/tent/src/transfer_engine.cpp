@@ -16,7 +16,11 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/topology.h"
+#include <algorithm>
 #include <glog/logging.h>
+#ifdef USE_MEMFABRIC
+#include "tent/transport/memfabric/memfabric_transport.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -106,12 +110,72 @@ Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
 Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
                                        void** device_address,
                                        TransportType type) {
-    return impl_->mapRemoteMemory(peer, gva, size, device_address, type);
+    if (!device_address)
+        return Status::InvalidArgument("Null device address output" LOC_MARK);
+    *device_address = nullptr;
+    const auto address = reinterpret_cast<uint64_t>(gva);
+    if (peer == LOCAL_SEGMENT_ID || !address || !size ||
+        size > UINT64_MAX - address || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid global mapping range or transport" LOC_MARK);
+    std::vector<TransportType> exported;
+    if (type == UNSPEC) {
+        SegmentDescRef pin;
+        CHECK_STATUS(impl_->metadata_->segmentManager().withCachedSegment(
+            peer, pin, [&](SegmentDesc* segment) -> Status {
+                auto* buffer = segment->findBuffer(address, size);
+                if (!buffer)
+                    return Status::NeedsRefreshCache(
+                        "Memory range is not registered" LOC_MARK);
+                exported = buffer->transports;
+                return Status::OK();
+            }));
+    }
+    for (auto candidate : impl_->getSupportedTransports(type)) {
+        if (impl_->transport_list_[candidate]->supportsGlobalAddressing() &&
+            (type != UNSPEC || std::find(exported.begin(), exported.end(),
+                                         candidate) != exported.end())) {
+#ifdef USE_MEMFABRIC
+            if (candidate == MEMFABRIC) {
+                auto transport = std::dynamic_pointer_cast<MemFabricTransport>(
+                    impl_->transport_list_[candidate]);
+                if (!transport)
+                    return Status::NotImplemented(
+                        "Invalid MemFabric transport");
+                return transport->mapRemoteMemory(peer, gva, size,
+                                                  device_address);
+            }
+#endif
+            CHECK_STATUS(impl_->transport_list_[candidate]->mapRemoteMemory(
+                peer, gva, size));
+            *device_address = gva;
+            return Status::OK();
+        }
+    }
+    return Status::NotImplemented("No global-address transport" LOC_MARK);
 }
+
 Status TransferEngine::resolveGlobalAddress(void* gva, size_t size,
                                             void** device_address,
                                             TransportType type) {
-    return impl_->resolveGlobalAddress(gva, size, device_address, type);
+    if (!device_address)
+        return Status::InvalidArgument("Null device address output" LOC_MARK);
+    *device_address = nullptr;
+    auto address = reinterpret_cast<uint64_t>(gva);
+    if (!address || !size || size > UINT64_MAX - address || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid GVA resolution arguments" LOC_MARK);
+#ifdef USE_MEMFABRIC
+    if (type == UNSPEC || type == MEMFABRIC) {
+        auto transport = std::dynamic_pointer_cast<MemFabricTransport>(
+            impl_->transport_list_[MEMFABRIC]);
+        if (transport)
+            return transport->resolveGlobalAddress(gva, size, device_address);
+    }
+#endif
+    return Status::NotImplemented("No address resolver" LOC_MARK);
 }
 
 Status TransferEngine::unmapRemoteMemory(SegmentID peer, void* gva,

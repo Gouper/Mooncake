@@ -986,61 +986,6 @@ Status TransferEngineImpl::mapRemoteMemory(SegmentID peer, void* gva,
     return Status::NotImplemented("No global-address transport" LOC_MARK);
 }
 
-Status TransferEngineImpl::mapRemoteMemory(SegmentID peer, void* gva,
-                                           size_t size, void** device_address,
-                                           TransportType type) {
-    if (!device_address)
-        return Status::InvalidArgument("Null device address output" LOC_MARK);
-    *device_address = nullptr;
-    const auto address = reinterpret_cast<uint64_t>(gva);
-    if (peer == LOCAL_SEGMENT_ID || !address || !size ||
-        size > UINT64_MAX - address || type < UNSPEC ||
-        type >= kNumTransportTypes)
-        return Status::InvalidArgument(
-            "Invalid global mapping range or transport" LOC_MARK);
-    std::vector<TransportType> exported;
-    if (type == UNSPEC) {
-        SegmentDescRef pin;
-        CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
-            peer, pin, [&](SegmentDesc* segment) -> Status {
-                auto* buffer = segment->findBuffer(address, size);
-                if (!buffer)
-                    return Status::NeedsRefreshCache(
-                        "Memory range is not registered" LOC_MARK);
-                exported = buffer->transports;
-                return Status::OK();
-            }));
-    }
-    for (auto candidate : getSupportedTransports(type)) {
-        if (transport_list_[candidate]->supportsGlobalAddressing() &&
-            (type != UNSPEC || std::find(exported.begin(), exported.end(),
-                                         candidate) != exported.end()))
-            return transport_list_[candidate]->mapRemoteMemory(peer, gva, size,
-                                                               device_address);
-    }
-    return Status::NotImplemented("No global-address transport" LOC_MARK);
-}
-
-Status TransferEngineImpl::resolveGlobalAddress(void* gva, size_t size,
-                                                void** device_address,
-                                                TransportType type) {
-    if (!device_address)
-        return Status::InvalidArgument("Null device address output" LOC_MARK);
-    *device_address = nullptr;
-    auto address = reinterpret_cast<uint64_t>(gva);
-    if (!address || !size || size > UINT64_MAX - address || type < UNSPEC ||
-        type >= kNumTransportTypes)
-        return Status::InvalidArgument(
-            "Invalid GVA resolution arguments" LOC_MARK);
-    Status result = Status::NotImplemented("No address resolver" LOC_MARK);
-    for (auto candidate : getSupportedTransports(type)) {
-        result = transport_list_[candidate]->resolveGlobalAddress(
-            gva, size, device_address);
-        if (!result.IsNotImplemented()) return result;
-    }
-    return result;
-}
-
 Status TransferEngineImpl::unmapRemoteMemory(SegmentID peer, void* gva,
                                              TransportType type) {
     if (peer == LOCAL_SEGMENT_ID || !gva || type < UNSPEC ||

@@ -24,6 +24,7 @@
 #include <utility>
 
 #include "tent/common/config.h"
+#include "tent/transfer_engine.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/proxy_manager.h"
@@ -55,6 +56,9 @@ __wrap__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
 namespace mooncake {
 class TransferEngineImplTestPeer {
    public:
+    static tent::TransferEngineImpl* impl(tent::TransferEngine& engine) {
+        return engine.impl_.get();
+    }
     static std::vector<tent::BufferDesc> localBuffers(
         tent::TransferEngineImpl& engine) {
         const auto local = engine.metadata_->segmentManager().getLocal();
@@ -576,7 +580,8 @@ class MemFabricEngineRegistration : public ::testing::Test {
     void SetUp() override {
         auto config = makeConfig();
         config->set("transports/memfabric/enable", false);
-        engine = std::make_unique<TransferEngineImpl>(config);
+        frontend = std::make_unique<TransferEngine>(config);
+        engine = TransferEngineImplTestPeer::impl(*frontend);
         ASSERT_TRUE(engine->available());
         memfabric = std::make_shared<DeviceAddressMemFabricTransport>();
         tcp = std::make_shared<RegistrationObserver>();
@@ -591,7 +596,8 @@ class MemFabricEngineRegistration : public ::testing::Test {
     }
 
     static constexpr size_t kSize = 4096;
-    std::unique_ptr<TransferEngineImpl> engine;
+    std::unique_ptr<TransferEngine> frontend;
+    TransferEngineImpl* engine = nullptr;
     std::shared_ptr<DeviceAddressMemFabricTransport> memfabric;
     std::shared_ptr<RegistrationObserver> tcp;
     void* pool = nullptr;
@@ -687,7 +693,7 @@ TEST_F(MemFabricEngineRegistration, ZeroRequestCannotFreePublishedPool) {
 TEST_F(MemFabricEngineRegistration, ExplicitMappingDispatchesToMemFabric) {
     void* device_address = nullptr;
     EXPECT_TRUE(
-        engine->mapRemoteMemory(1, pool, kSize, &device_address, MEMFABRIC)
+        frontend->mapRemoteMemory(1, pool, kSize, &device_address, MEMFABRIC)
             .ok());
     EXPECT_EQ(reinterpret_cast<uint64_t>(device_address),
               reinterpret_cast<uint64_t>(pool) + (1ULL << 40));
@@ -696,8 +702,8 @@ TEST_F(MemFabricEngineRegistration, ExplicitMappingDispatchesToMemFabric) {
     EXPECT_EQ(memfabric->unmap_calls, 1);
 }
 TEST_F(MemFabricEngineRegistration, StrictMappingRejectsLogicalAddressMode) {
-    EXPECT_TRUE(
-        engine->mapRemoteMemory(1, pool, kSize, MEMFABRIC).IsNotImplemented());
+    EXPECT_TRUE(frontend->mapRemoteMemory(1, pool, kSize, MEMFABRIC)
+                    .IsNotImplemented());
     EXPECT_EQ(memfabric->map_calls, 0);
 }
 
@@ -706,21 +712,21 @@ TEST_F(MemFabricEngineRegistration, ResolveDispatchesLogicalRangeToMemFabric) {
         reinterpret_cast<void*>(reinterpret_cast<uint64_t>(pool) + 32);
     void* device_address = nullptr;
     ASSERT_TRUE(
-        engine->resolveGlobalAddress(offset, 64, &device_address, MEMFABRIC)
+        frontend->resolveGlobalAddress(offset, 64, &device_address, MEMFABRIC)
             .ok());
     EXPECT_EQ(reinterpret_cast<uint64_t>(device_address),
               reinterpret_cast<uint64_t>(offset) + (1ULL << 40));
     EXPECT_FALSE(
-        engine
+        frontend
             ->resolveGlobalAddress(pool, kSize + 1, &device_address, MEMFABRIC)
             .ok());
     EXPECT_EQ(device_address, nullptr);
     EXPECT_FALSE(
-        engine->resolveGlobalAddress(pool, kSize, nullptr, MEMFABRIC).ok());
+        frontend->resolveGlobalAddress(pool, kSize, nullptr, MEMFABRIC).ok());
 }
 
 TEST_F(MemFabricEngineRegistration, MappingRejectsMissingOutputBeforeDispatch) {
-    EXPECT_FALSE(engine
+    EXPECT_FALSE(frontend
                      ->mapRemoteMemory(1, pool, kSize,
                                        static_cast<void**>(nullptr), MEMFABRIC)
                      .ok());
