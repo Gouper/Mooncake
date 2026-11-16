@@ -309,9 +309,8 @@ class TransferEngine {
     Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
                            TransportType type = UNSPEC);
 
-    // Map a complete published region and return this caller's device pointer.
-    // The output may differ from gva; kernels must use the output. Unmap uses
-    // gva.
+    // Map a complete published region and return this caller's device pointer. The output
+    // may differ from gva; kernels must use the output. Unmap uses gva.
     Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
                            void** device_address, TransportType type = UNSPEC);
 
@@ -319,11 +318,6 @@ class TransferEngine {
     // pointer is valid only until the region is unmapped/freed. MEMFABRIC
     // allocations return logical GVA tokens for registration and free; use
     // this method before passing them to kernels or device copy APIs.
-    // Prepare a logical GVA pool for network copy, without promising a device
-    // VA. Both peers prepare before submitting copies. Release with
-    // unmapRemoteMemory.
-    Status prepareRemoteMemoryForCopy(SegmentID peer, void* gva, size_t size,
-                                      TransportType type = MEMFABRIC);
     Status resolveGlobalAddress(void* gva, size_t size, void** device_address,
                                 TransportType type = UNSPEC);
 

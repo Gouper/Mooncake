@@ -156,25 +156,6 @@ Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
     return Status::NotImplemented("No global-address transport" LOC_MARK);
 }
 
-Status TransferEngine::prepareRemoteMemoryForCopy(SegmentID peer, void* gva,
-                                                  size_t size,
-                                                  TransportType type) {
-    const auto address = reinterpret_cast<uint64_t>(gva);
-    if (peer == LOCAL_SEGMENT_ID || !address || !size ||
-        size > UINT64_MAX - address)
-        return Status::InvalidArgument(
-            "Invalid copy preparation range" LOC_MARK);
-#ifdef USE_MEMFABRIC
-    if (type == MEMFABRIC || type == UNSPEC) {
-        auto transport = std::dynamic_pointer_cast<MemFabricTransport>(
-            impl_->transport_list_[MEMFABRIC]);
-        if (transport)
-            return transport->prepareRemoteMemoryForCopy(peer, gva, size);
-    }
-#endif
-    return Status::NotImplemented("No GVA copy preparation backend" LOC_MARK);
-}
-
 Status TransferEngine::resolveGlobalAddress(void* gva, size_t size,
                                             void** device_address,
                                             TransportType type) {

@@ -623,6 +623,7 @@ class MemFabricTransportTest : public ::testing::Test {
         config.entity = 64;
         config.hbm_size = config.dram_size = config.hbm_window =
             config.dram_window = CopyTestHybm::kSize;
+        transport_->gva_config_ = config;
         copy_api_ = std::make_shared<CopyTestHybm>();
         transport_->gva_ =
             std::make_shared<MemFabricSharedMemory>(config, name_, copy_api_);
@@ -672,8 +673,8 @@ class MemFabricTransportTest : public ::testing::Test {
         CHECK_STATUS(
             metadata_->segmentManager().openRemote(copy_peer_, peer_name_));
         if (config.protocol != "device_sdma")
-            return transport_->prepareRemoteMemoryForCopy(
-                copy_peer_, copy_dram_, remote.length);
+            return transport_->mapRemoteMemory(copy_peer_, copy_dram_,
+                                               remote.length);
         void* dva = nullptr;
         return transport_->mapRemoteMemory(copy_peer_, copy_dram_,
                                            remote.length, &dva);
@@ -2119,10 +2120,44 @@ TEST_F(MemFabricTransportTest, TransBatchZeroCannotCompletePendingGvaCopy) {
     EXPECT_EQ(status.transferred_bytes, 64u);
 }
 
+TEST_F(MemFabricTransportTest, SdmaMappingStillRequiresDeviceAddressOutput) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    EXPECT_TRUE(
+        transport_->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize)
+            .IsNotImplemented());
+}
+
 TEST_F(MemFabricTransportTest,
        NetworkPreparationAllowsCopyWithoutDirectMapping) {
     ASSERT_TRUE(PrepareGvaCopy(256, "device_rdma").ok());
     void* dva = reinterpret_cast<void*>(1);
+    EXPECT_FALSE(
+        transport_
+            ->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize, &dva)
+            .ok());
+    EXPECT_EQ(dva, nullptr);
+    EXPECT_FALSE(transport_->resolveGlobalAddress(copy_dram_, 32, &dva).ok());
+    EXPECT_EQ(dva, nullptr);
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    auto request =
+        GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(copy_dram_), 32);
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(state_->batch_copy_calls, 0);
+    EXPECT_EQ(copy_api_->copies.size(), 1u);
+}
+
+TEST_F(MemFabricTransportTest, UrmaMappingAllowsCopyWithoutDirectMapping) {
+    ASSERT_TRUE(PrepareGvaCopy(256, "device_urma").ok());
+    void* dva = reinterpret_cast<void*>(1);
+    EXPECT_FALSE(
+        transport_
+            ->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize, &dva)
+            .ok());
+    EXPECT_EQ(dva, nullptr);
     EXPECT_FALSE(transport_->resolveGlobalAddress(copy_dram_, 32, &dva).ok());
     EXPECT_EQ(dva, nullptr);
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
