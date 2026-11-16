@@ -486,9 +486,12 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
 
     bool supportsGlobalAddressing() const override { return true; }
 
-    bool warmupMemory(void*, size_t) override {
+    bool warmupMemory(void* address, size_t size) override {
         ++warmup_calls;
-        return false;
+        const auto base = reinterpret_cast<uint64_t>(pool);
+        const auto start = reinterpret_cast<uint64_t>(address);
+        return pool && size &&
+               (start >= base ? start - base < pool_size : base - start < size);
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
@@ -583,12 +586,11 @@ class MemFabricEngineRegistration : public ::testing::Test {
         memfabric = std::make_shared<DeviceAddressMemFabricTransport>();
         tcp = std::make_shared<RegistrationObserver>();
         engine->swapTransportForTest(MEMFABRIC, memfabric);
-        engine->swapTransportForTest(TCP, tcp);
         options.type = MEMFABRIC;
         options.location = "cpu:0";
-        // Preserve allocation options for explicit GVA registration.
         ASSERT_TRUE(engine->allocateLocalMemory(&pool, kSize, options).ok());
         EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(pool));
+        options = MemoryOptions{};
     }
 
     static constexpr size_t kSize = 4096;
@@ -600,14 +602,14 @@ class MemFabricEngineRegistration : public ::testing::Test {
     void* pool = nullptr;
 };
 
-TEST_F(MemFabricEngineRegistration, AllocationOptionsBypassCpuProbing) {
-    auto status = engine->registerLocalMemory({pool}, {kSize}, options);
+TEST_F(MemFabricEngineRegistration, DefaultRegistrationSkipsGvaPrefault) {
+    auto status = engine->registerLocalMemory(pool, kSize);
     ASSERT_TRUE(status.ok()) << status;
     const auto buffers = TransferEngineImplTestPeer::localBuffers(*engine);
     ASSERT_EQ(buffers.size(), 1u);
     EXPECT_EQ(buffers[0].location, "npu:0");
     EXPECT_EQ(buffers[0].transports, std::vector<TransportType>{MEMFABRIC});
-    EXPECT_EQ(memfabric->warmup_calls, 0);
+    EXPECT_EQ(memfabric->warmup_calls, 1);
     EXPECT_EQ(tcp->warmup_calls, 0);
     EXPECT_TRUE(tcp->registered.empty());
 }
@@ -627,6 +629,7 @@ TEST_F(MemFabricEngineRegistration, BackendRejectsPartialPoolRegistration) {
 }
 
 TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {
+    engine->swapTransportForTest(TCP, tcp);
     std::vector<char> ordinary(kSize);
     MemoryOptions options;
     options.location = "npu:0";
@@ -645,7 +648,7 @@ TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {
     EXPECT_TRUE(engine->unregisterLocalMemory(ordinary.data()).ok());
 }
 
-TEST_F(MemFabricEngineRegistration, ExplicitExportFailureDoesNotPublish) {
+TEST_F(MemFabricEngineRegistration, ExportFailureDoesNotPublish) {
     memfabric->fail_registration = true;
     EXPECT_FALSE(engine->registerLocalMemory({pool}, {kSize}, options).ok());
     EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(*engine).empty());

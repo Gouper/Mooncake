@@ -921,9 +921,8 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
                     const auto base = reinterpret_cast<uint64_t>(addr);
                     for (const auto& buffer :
                          std::get<MemorySegmentDesc>(segment->detail).buffers) {
-                        if (buffer.addr >= base
-                                ? buffer.addr - base < it->size
-                                : base - buffer.addr < buffer.length)
+                        if (buffer.addr < base + it->size &&
+                            base < buffer.addr + buffer.length)
                             return Status::InvalidArgument(
                                 "Unregister GVA memory before freeing "
                                 "it" LOC_MARK);
@@ -1063,16 +1062,6 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         BufferDesc desc;
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
-        // Logical MemFabric addresses cannot be probed as ordinary pointers.
-        // Register them with the options returned by allocateLocalMemory().
-        if (options.type == MEMFABRIC && options.global_address) {
-            desc.location = options.location;
-            desc.ref_count = 1;
-            desc.internal = options.internal;
-            desc.permission = options.perm;
-            desc_list.push_back(std::move(desc));
-            continue;
-        }
 
         auto& platform = Platform::getLoader();
 #ifdef USE_CUDA

@@ -84,6 +84,7 @@ class MemFabricTransport : public Transport {
 
     Status allocateLocalMemory(void**, size_t, MemoryOptions&) override;
     Status freeLocalMemory(void*, size_t) override;
+    bool warmupMemory(void* address, size_t size) override;
     bool supportsGlobalAddressing() const override;
     Status mapRemoteMemory(SegmentID, void*, size_t) override;
     virtual Status mapRemoteMemory(SegmentID, void*, size_t, void**);

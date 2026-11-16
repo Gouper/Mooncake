@@ -81,6 +81,11 @@ bool MemFabricTransport::supportsGlobalAddressing() const {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     return gva_ && gva_->available();
 }
+bool MemFabricTransport::warmupMemory(void* address, size_t size) {
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    // Logical GVA pools have no CPU pages to prefault during location probing.
+    return gva_ && gva_->overlaps(reinterpret_cast<uint64_t>(address), size);
+}
 Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
     std::lock_guard<std::mutex> lock(inflight_mu_);

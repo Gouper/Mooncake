@@ -2147,7 +2147,12 @@ TEST_F(MemFabricTransportTest, GvaAllocationReturnsRegistrationOptions) {
         desc.addr = options.global_address;
         desc.length = CopyTestHybm::kSize;
         desc.location = "cpu:7";
-        ASSERT_TRUE(transport_->addMemoryBuffer(desc, options).ok());
+        EXPECT_TRUE(transport_->warmupMemory(*output, CopyTestHybm::kSize));
+        EXPECT_TRUE(transport_->warmupMemory(
+            reinterpret_cast<void*>(desc.addr + 1), 64));
+        char ordinary[64];
+        EXPECT_FALSE(transport_->warmupMemory(ordinary, sizeof(ordinary)));
+        ASSERT_TRUE(transport_->addMemoryBuffer(desc, MemoryOptions{}).ok());
         EXPECT_EQ(desc.location, "npu:0");
         EXPECT_EQ(desc.transports, std::vector<TransportType>{MEMFABRIC});
     }
