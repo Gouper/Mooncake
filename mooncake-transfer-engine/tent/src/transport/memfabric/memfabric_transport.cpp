@@ -206,7 +206,6 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
             protocol != "device_urma")
             return Status::InvalidArgument(
                 "Unsupported MemFabric GVA protocol");
-        gva_config_.trans_url = conf->get(prefix + "trans_url", "");
         gva_config_.group = conf->get(prefix + "group", "");
         const auto ranks = conf->get(prefix + "rank_count", int64_t{0});
         const auto rank = conf->get(prefix + "rank", int64_t{-1});
@@ -307,7 +306,7 @@ Status MemFabricTransport::install(std::string& local_segment_name,
     caps.gpu_to_gpu = true;
     if (gva_config_.enabled) {
         auto context = std::make_shared<MemFabricSharedMemory>(
-            gva_config_, local_segment_name_, MemFabricGvaApi::load());
+            gva_config_, local_segment_name_);
         CHECK_STATUS(context->initialize());
         gva_ = std::move(context);
     }

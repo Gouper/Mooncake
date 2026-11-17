@@ -23,7 +23,6 @@ using Clock = std::chrono::steady_clock;
 namespace {
 struct Options {
     std::string protocol = "device_sdma", bind_ip = "127.0.0.1";
-    std::string urls[2];
     int devices[2] = {0, 1};
     size_t pool = 1ULL << 30;
     unsigned timeout = 180;
@@ -142,7 +141,6 @@ void child(const Options& o, int rank, int fd) {
         config->set(prefix + "hbm_size", uint64_t{o.pool});
         config->set(prefix + "dram_window", uint64_t{0});
         config->set(prefix + "dram_size", uint64_t{0});
-        config->set(prefix + "trans_url", o.urls[rank]);
         // Deliberately leak on failure: exiting the process is safer than
         // attempting object teardown while failed device work may be in flight.
         auto* engine = new TransferEngine(config);
@@ -286,8 +284,7 @@ int main(int argc, char** argv) {
                 std::cout << "--protocol device_sdma|device_rdma|device_urma "
                              "--device0 N --device1 N\n"
                              "--pool-size BYTES (default 1073741824; multiple "
-                             "of 1 GiB) --url0 URL "
-                             "--url1 URL --bind-ip IP\n"
+                             "of 1 GiB) --bind-ip IP\n"
                              "--allocations 1|2 (default 1) "
                              "--timeout-sec N (default 180) --hbm-only "
                              "(currently the only mode)\n";
@@ -304,10 +301,6 @@ int main(int argc, char** argv) {
                 o.devices[1] = std::stoi(value);
             else if (arg == "--pool-size")
                 o.pool = std::stoull(value);
-            else if (arg == "--url0")
-                o.urls[0] = value;
-            else if (arg == "--url1")
-                o.urls[1] = value;
             else if (arg == "--bind-ip")
                 o.bind_ip = value;
             else if (arg == "--allocations")
@@ -326,10 +319,6 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 "invalid protocol, timeout, pool (must be 1 GiB aligned) or "
                 "devices");
-        if (o.protocol != "device_sdma" &&
-            (o.urls[0].empty() || o.urls[1].empty() || o.urls[0] == o.urls[1]))
-            throw std::runtime_error(
-                "network mode requires two distinct --url0/--url1 endpoints");
         int sockets[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets))
             throw std::runtime_error("socketpair failed");

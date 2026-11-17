@@ -34,9 +34,13 @@ bool blobValid(const nlohmann::json& descriptor) {
     return true;
 }
 }  // namespace
+MemFabricSharedMemory::MemFabricSharedMemory(MemFabricGvaConfig config,
+                                             std::string owner)
+    : MemFabricSharedMemory(std::move(config), std::move(owner),
+                            MemFabricGvaCalls{}) {}
 MemFabricSharedMemory::MemFabricSharedMemory(
     MemFabricGvaConfig config, std::string owner,
-    std::shared_ptr<MemFabricGvaApi> api)
+    MemFabricGvaCalls api)
     : config_(std::move(config)),
       owner_(std::move(owner)),
       api_(std::move(api)) {
@@ -52,7 +56,7 @@ MemFabricSharedMemory::~MemFabricSharedMemory() {
         // Native functions and initialized state must outlive unreleased maps.
         // A failed teardown is deliberately quarantined for process lifetime.
         static auto* retained =
-            new std::vector<std::shared_ptr<MemFabricGvaApi>>;
+            new std::vector<MemFabricGvaCalls>;
         static auto* lock = new std::mutex;
         std::lock_guard<std::mutex> guard(*lock);
         retained->push_back(std::move(api_));

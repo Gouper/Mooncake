@@ -83,17 +83,12 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
     try {
         aclCheck(aclInit(nullptr), "aclInit");
         aclCheck(aclrtSetDevice(device), "aclrtSetDevice");
-        auto api = MemFabricGvaApi::load();
-        if (!api)
+        const auto loaded = MemFabricGvaApi::LoadLibrary();
+        if (!loaded)
             throw std::runtime_error("Compatible HYBM symbols unavailable");
         MemFabricGvaConfig config;
         config.enabled = true;
         config.protocol = protocol;
-        if (const char* url = std::getenv("MF_GVA_SMOKE_TRANS_URL"))
-            config.trans_url = url;
-        if (const char* url = std::getenv(rank ? "MF_GVA_SMOKE_TRANS_URL_1"
-                                               : "MF_GVA_SMOKE_TRANS_URL_0"))
-            config.trans_url = url;
         config.group = "tent-native-smoke-" + std::to_string(getppid());
         config.rank_count = 2;
         config.rank = rank;
@@ -108,7 +103,7 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
         {
             const auto owner = "rank-" + std::to_string(rank);
             const auto peer = "rank-" + std::to_string(1 - rank);
-            MemFabricSharedMemory memory(config, owner, api);
+            MemFabricSharedMemory memory(config, owner);
             require(memory.initialize(), "initialize GVA context");
             auto deviceAddress = [&](uint64_t gva, size_t size) {
                 void* dva = nullptr;
@@ -387,7 +382,7 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
         if (mismatch) {
             config.entity = 65;
             MemFabricSharedMemory memory(
-                config, "mismatch-" + std::to_string(rank), api);
+                config, "mismatch-" + std::to_string(rank));
             require(memory.initialize(), "initialize GVA context");
             void* address = nullptr;
             auto status = memory.allocate(&address, kHbmSize, 1, 1);

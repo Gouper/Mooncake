@@ -226,7 +226,7 @@ struct MemFabricGvaConfig {
     bool enabled = false;
     bool explicit_copy = false;
     std::string group;
-    std::string protocol = "device_sdma", trans_url;
+    std::string protocol = "device_sdma";
     uint32_t rank_count = 0, rank = 0;
     uint16_t device = 0, entity = 64;
     uint64_t hbm_window = 0, dram_window = 0, hbm_size = 0, dram_size = 0;
@@ -235,32 +235,40 @@ struct MemFabricGvaConfig {
 // structures or implementation-dependent handles appear in wire metadata.
 class MemFabricGvaApi {
    public:
-    virtual ~MemFabricGvaApi() = default;
-    static std::shared_ptr<MemFabricGvaApi> load();
-    virtual bool supportsCopy() const { return true; }
-    virtual int copy(void*, uint64_t, uint64_t, size_t, uint32_t) { return -1; }
-    virtual int wait(void*) { return -1; }
-    virtual int bind(uint16_t) = 0;
-    virtual int initialize(uint16_t) = 0;
-    virtual void uninitialize() = 0;
-    virtual void* create(const MemFabricGvaConfig&) = 0;
-    virtual void destroy(void*) = 0;
-    virtual int reserve(void*) = 0;
-    virtual int unreserve(void*) = 0;
-    virtual void* allocate(void*, uint32_t, uint64_t) = 0;
-    virtual int free(void*, void*) = 0;
-    virtual uint64_t address(void*, void*) = 0;
-    virtual uint64_t size(void*, void*) = 0;
-    virtual uint64_t base(void*, uint32_t) { return 0; }
-    virtual int translate(uint64_t, uint32_t, uint64_t&) = 0;
-    virtual int exportBlob(void*, void*, std::vector<uint8_t>&) = 0;
-    virtual int importBlob(void*, bool, const std::vector<uint8_t>&) = 0;
-    virtual int map(void*) = 0;
-    virtual bool supportsConnect() const { return false; }
-    virtual int connect(void*, uint32_t) { return -1; }
-    virtual int reach(void*, uint32_t, uint32_t&) = 0;
-    virtual int remove(void*, uint32_t) = 0;
-    virtual int unmap(void*, uint32_t) = 0;
+    // Symbols are shared for process lifetime, including failed teardown.
+    // No CleanupLibrary: unloading could invalidate live entities or workers.
+    static bool LoadLibrary();
+    static bool IsLoaded();
+    static bool supportsCopy();
+    static int copy(void* entity, uint64_t source, uint64_t destination,
+                    size_t size, uint32_t direction);
+    static int wait(void* entity);
+    static int bind(uint16_t device);
+    static int initialize(uint16_t device);
+    static void uninitialize();
+    static void* create(const MemFabricGvaConfig& config);
+    static void destroy(void* entity);
+    static int reserve(void* entity);
+    static int unreserve(void* entity);
+    static void* allocate(void* entity, uint32_t memory_type, uint64_t size);
+    static int free(void* entity, void* slice);
+    static uint64_t address(void* entity, void* slice);
+    static uint64_t size(void* entity, void* slice);
+    static uint64_t base(void* entity, uint32_t memory_type);
+    static int translate(uint64_t address, uint32_t memory_type, uint64_t& out);
+    static int exportBlob(void* entity, void* slice,
+                          std::vector<uint8_t>& blob);
+    static int importBlob(void* entity, bool entity_info,
+                          const std::vector<uint8_t>& blob);
+    static int map(void* entity);
+    static bool supportsConnect();
+    static int connect(void* entity, uint32_t rank);
+    static int reach(void* entity, uint32_t rank, uint32_t& out);
+    static int remove(void* entity, uint32_t rank);
+    static int unmap(void* entity, uint32_t rank);
+
+   private:
+    MemFabricGvaApi() = delete;
 };
 
 }  // namespace tent

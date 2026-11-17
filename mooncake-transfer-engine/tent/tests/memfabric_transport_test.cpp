@@ -379,7 +379,7 @@ Request MakeRead(void* src, uint64_t dest, size_t len) {
 
 // Deterministic native copy gate exercises worker completion independently of
 // polling.
-class CopyTestHybm : public MemFabricGvaApi {
+class CopyTestHybm : public MemFabricGvaBackend {
    public:
     static constexpr uint64_t kSize = 2ULL << 20;
     std::mutex mutex;
@@ -650,7 +650,6 @@ class MemFabricTransportTest : public ::testing::Test {
         config.enabled = true;
         config.group = "copy-test";
         config.protocol = protocol;
-        config.trans_url = "tcp://127.0.0.1:19001";
         config.rank_count = 2;
         config.entity = 64;
         config.hbm_size = config.dram_size = config.hbm_window =

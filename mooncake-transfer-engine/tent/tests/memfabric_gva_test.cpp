@@ -3,7 +3,7 @@
 using namespace mooncake::tent;
 namespace {
 constexpr uint64_t M = 2ULL << 20;
-class FakeHybm : public MemFabricGvaApi {
+class FakeHybm : public MemFabricGvaBackend {
    public:
     int creates = 0, frees = 0, imports = 0, unmaps = 0, slice_imports = 0;
     int slice_exports = 0;
@@ -627,10 +627,8 @@ class MemFabricNetworkGva : public ::testing::TestWithParam<const char*> {
     void SetUp() override {
         auto local_config = config();
         local_config.protocol = GetParam();
-        local_config.trans_url = "tcp://127.0.0.1:19001";
         auto remote_config = local_config;
         remote_config.rank = 1;
-        remote_config.trans_url = "tcp://127.0.0.1:19002";
         local_api = std::make_shared<NetworkHybm>();
         remote_api = std::make_shared<NetworkHybm>();
         local_api->protocol_bit =

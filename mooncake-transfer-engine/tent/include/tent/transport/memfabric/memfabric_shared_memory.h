@@ -15,10 +15,160 @@
 #include "tent/transport/memfabric/memfabric_library.h"
 namespace mooncake {
 namespace tent {
+// Optional backend injection for deterministic CPU tests. Production calls the
+// process-wide static API directly; no native virtual adapter is instantiated.
+class MemFabricGvaBackend {
+   public:
+    virtual ~MemFabricGvaBackend() = default;
+    virtual bool supportsCopy() const { return true; }
+    virtual int copy(void*, uint64_t, uint64_t, size_t, uint32_t) { return -1; }
+    virtual int wait(void*) { return -1; }
+    virtual int bind(uint16_t) = 0;
+    virtual int initialize(uint16_t) = 0;
+    virtual void uninitialize() = 0;
+    virtual void* create(const MemFabricGvaConfig&) = 0;
+    virtual void destroy(void*) = 0;
+    virtual int reserve(void*) = 0;
+    virtual int unreserve(void*) = 0;
+    virtual void* allocate(void*, uint32_t, uint64_t) = 0;
+    virtual int free(void*, void*) = 0;
+    virtual uint64_t address(void*, void*) = 0;
+    virtual uint64_t size(void*, void*) = 0;
+    virtual uint64_t base(void*, uint32_t) { return 0; }
+    virtual int translate(uint64_t, uint32_t, uint64_t&) = 0;
+    virtual int exportBlob(void*, void*, std::vector<uint8_t>&) = 0;
+    virtual int importBlob(void*, bool, const std::vector<uint8_t>&) = 0;
+    virtual int map(void*) = 0;
+    virtual bool supportsConnect() const { return false; }
+    virtual int connect(void*, uint32_t) { return -1; }
+    virtual int reach(void*, uint32_t, uint32_t&) = 0;
+    virtual int remove(void*, uint32_t) = 0;
+    virtual int unmap(void*, uint32_t) = 0;
+};
+class MemFabricGvaCalls {
+   public:
+    MemFabricGvaCalls() : available_(MemFabricGvaApi::LoadLibrary()) {}
+    MemFabricGvaCalls(std::nullptr_t) : available_(false) {}
+    template <typename Backend>
+    MemFabricGvaCalls(std::shared_ptr<Backend> backend)
+        : backend_(std::move(backend)), available_(bool(backend_)) {}
+    explicit operator bool() const { return available_; }
+    const MemFabricGvaCalls* operator->() const { return this; }
+    bool supportsCopy() const {
+        return backend_ ? backend_->supportsCopy()
+                        : MemFabricGvaApi::supportsCopy();
+    }
+    int copy(void* entity, uint64_t source, uint64_t destination, size_t size,
+             uint32_t direction) const {
+        return backend_ ? backend_->copy(entity, source, destination, size,
+                                         direction)
+                        : MemFabricGvaApi::copy(entity, source, destination,
+                                                size, direction);
+    }
+    int wait(void* entity) const {
+        return backend_ ? backend_->wait(entity)
+                        : MemFabricGvaApi::wait(entity);
+    }
+    int bind(uint16_t device) const {
+        return backend_ ? backend_->bind(device)
+                        : MemFabricGvaApi::bind(device);
+    }
+    int initialize(uint16_t device) const {
+        return backend_ ? backend_->initialize(device)
+                        : MemFabricGvaApi::initialize(device);
+    }
+    void uninitialize() const {
+        if (backend_)
+            backend_->uninitialize();
+        else
+            MemFabricGvaApi::uninitialize();
+    }
+    void* create(const MemFabricGvaConfig& config) const {
+        return backend_ ? backend_->create(config)
+                        : MemFabricGvaApi::create(config);
+    }
+    void destroy(void* entity) const {
+        if (backend_)
+            backend_->destroy(entity);
+        else
+            MemFabricGvaApi::destroy(entity);
+    }
+    int reserve(void* entity) const {
+        return backend_ ? backend_->reserve(entity)
+                        : MemFabricGvaApi::reserve(entity);
+    }
+    int unreserve(void* entity) const {
+        return backend_ ? backend_->unreserve(entity)
+                        : MemFabricGvaApi::unreserve(entity);
+    }
+    void* allocate(void* entity, uint32_t memory_type, uint64_t size) const {
+        return backend_ ? backend_->allocate(entity, memory_type, size)
+                        : MemFabricGvaApi::allocate(entity, memory_type, size);
+    }
+    int free(void* entity, void* slice) const {
+        return backend_ ? backend_->free(entity, slice)
+                        : MemFabricGvaApi::free(entity, slice);
+    }
+    uint64_t address(void* entity, void* slice) const {
+        return backend_ ? backend_->address(entity, slice)
+                        : MemFabricGvaApi::address(entity, slice);
+    }
+    uint64_t size(void* entity, void* slice) const {
+        return backend_ ? backend_->size(entity, slice)
+                        : MemFabricGvaApi::size(entity, slice);
+    }
+    uint64_t base(void* entity, uint32_t memory_type) const {
+        return backend_ ? backend_->base(entity, memory_type)
+                        : MemFabricGvaApi::base(entity, memory_type);
+    }
+    int translate(uint64_t address, uint32_t memory_type, uint64_t& out) const {
+        return backend_ ? backend_->translate(address, memory_type, out)
+                        : MemFabricGvaApi::translate(address, memory_type, out);
+    }
+    int exportBlob(void* entity, void* slice,
+                   std::vector<uint8_t>& blob) const {
+        return backend_ ? backend_->exportBlob(entity, slice, blob)
+                        : MemFabricGvaApi::exportBlob(entity, slice, blob);
+    }
+    int importBlob(void* entity, bool entity_info,
+                   const std::vector<uint8_t>& blob) const {
+        return backend_
+                   ? backend_->importBlob(entity, entity_info, blob)
+                   : MemFabricGvaApi::importBlob(entity, entity_info, blob);
+    }
+    int map(void* entity) const {
+        return backend_ ? backend_->map(entity) : MemFabricGvaApi::map(entity);
+    }
+    bool supportsConnect() const {
+        return backend_ ? backend_->supportsConnect()
+                        : MemFabricGvaApi::supportsConnect();
+    }
+    int connect(void* entity, uint32_t rank) const {
+        return backend_ ? backend_->connect(entity, rank)
+                        : MemFabricGvaApi::connect(entity, rank);
+    }
+    int reach(void* entity, uint32_t rank, uint32_t& out) const {
+        return backend_ ? backend_->reach(entity, rank, out)
+                        : MemFabricGvaApi::reach(entity, rank, out);
+    }
+    int remove(void* entity, uint32_t rank) const {
+        return backend_ ? backend_->remove(entity, rank)
+                        : MemFabricGvaApi::remove(entity, rank);
+    }
+    int unmap(void* entity, uint32_t rank) const {
+        return backend_ ? backend_->unmap(entity, rank)
+                        : MemFabricGvaApi::unmap(entity, rank);
+    }
+
+   private:
+    std::shared_ptr<MemFabricGvaBackend> backend_;
+    bool available_;
+};
 class MemFabricSharedMemory {
    public:
+    MemFabricSharedMemory(MemFabricGvaConfig config, std::string owner);
     MemFabricSharedMemory(MemFabricGvaConfig config, std::string owner,
-                          std::shared_ptr<MemFabricGvaApi> api);
+                          MemFabricGvaCalls api);
     ~MemFabricSharedMemory();
     bool available() const { return config_.enabled && bool(api_); }
     // Initialize the entity and reserve windows before allocation or mapping.
@@ -87,7 +237,7 @@ class MemFabricSharedMemory {
     MemFabricGvaConfig config_;
     Status config_status_ = Status::OK();
     std::string owner_, generation_;
-    std::shared_ptr<MemFabricGvaApi> api_;
+    MemFabricGvaCalls api_;
     void* entity_ = nullptr;
     bool initialized_ = false;
     std::map<uint64_t, Pool> pools_;
