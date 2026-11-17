@@ -66,6 +66,13 @@ if(BUILD_UNIT_TESTS)
 endif()
 
 # Explicit opt-in hardware integration smoke; never registered with CTest.
+# Configure with USE_MEMFABRIC=ON, BUILD_UNIT_TESTS=OFF, ASCEND_HOME_PATH set
+# and MEMFABRIC_HYBM_INCLUDE_DIR pointing at compatible HYBM headers, then run
+# the binary on an idle two-NPU host:
+#   tent_memfabric_gva_engine_smoke --protocol device_sdma \
+#     --device0 0 --device1 1 --pool-size 1073741824 --hbm-only
+# Use device_rdma/device_urma with real --bind-ip and unused --url0/--url1 for
+# network copies. The pool size must be a positive multiple of 1 GiB.
 option(BUILD_MEMFABRIC_GVA_ENGINE_SMOKE
        "Build two-process public TransferEngine MemFabric GVA hardware smoke" OFF)
 if(BUILD_MEMFABRIC_GVA_ENGINE_SMOKE)

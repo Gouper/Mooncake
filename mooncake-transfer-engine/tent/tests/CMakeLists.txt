@@ -901,18 +901,22 @@ target_include_directories(tent_segment_desc_retry_test
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 
 if(USE_MEMFABRIC)
-  add_library(tent_memfabric_library_fixture SHARED memfabric_library_fixture.cpp)
+  add_library(
+    tent_memfabric_library_fixture SHARED memfabric_library_fixture.cpp)
   add_executable(tent_memfabric_library_test memfabric_library_test.cpp)
-  target_include_directories(tent_memfabric_library_test PRIVATE
-                             ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_include_directories(tent_memfabric_library_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_compile_definitions(tent_memfabric_library_test PRIVATE
     MEMFABRIC_TEST_LIBRARY_PATH="$<TARGET_FILE:tent_memfabric_library_fixture>")
-  target_link_libraries(tent_memfabric_library_test PRIVATE gtest gtest_main dl pthread)
+  target_link_libraries(
+    tent_memfabric_library_test PRIVATE gtest gtest_main dl pthread)
   add_dependencies(tent_memfabric_library_test tent_memfabric_library_fixture)
   add_test(NAME tent_memfabric_library_test COMMAND tent_memfabric_library_test)
   add_executable(tent_memfabric_gva_test memfabric_gva_test.cpp)
-  target_link_libraries(tent_memfabric_gva_test PRIVATE gtest gtest_main tent_link_group)
-  target_include_directories(tent_memfabric_gva_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(
+    tent_memfabric_gva_test PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(
+    tent_memfabric_gva_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_memfabric_gva_test COMMAND tent_memfabric_gva_test)
   add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
   target_link_libraries(tent_memfabric_transport_test PRIVATE gtest gtest_main
@@ -922,10 +926,12 @@ if(USE_MEMFABRIC)
                                           ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
   add_test(NAME tent_memfabric_transport_test
            COMMAND tent_memfabric_transport_test)
-endif()
-if(USE_MEMFABRIC)
-  target_sources(tent_local_memory_lifecycle_test PRIVATE memfabric_test_acl_stubs.cpp)
-  target_include_directories(tent_local_memory_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
+  # The engine-level GVA registration cases link the full engine, including the
+  # Ascend platform, so supply host-only ACL entry points for this configuration.
+  target_sources(
+    tent_local_memory_lifecycle_test PRIVATE memfabric_test_acl_stubs.cpp)
+  target_include_directories(
+    tent_local_memory_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
 endif()
 option(BUILD_MEMFABRIC_GVA_NATIVE_SMOKE "Build opt-in two-NPU MemFabric GVA smoke executable" OFF)
 if(BUILD_MEMFABRIC_GVA_NATIVE_SMOKE)

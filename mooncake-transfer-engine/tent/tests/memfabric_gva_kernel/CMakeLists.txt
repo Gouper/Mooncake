@@ -17,9 +17,3 @@ add_library(gva_kernel SHARED wrapper.cpp)
 target_include_directories(gva_kernel PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
 target_link_directories(gva_kernel PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
 target_link_libraries(gva_kernel PRIVATE gva_device ascendcl)
-add_executable(normal_buffer_test normal_buffer_test.cpp)
-target_include_directories(normal_buffer_test
-                           PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
-target_link_directories(normal_buffer_test
-                        PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
-target_link_libraries(normal_buffer_test PRIVATE gva_kernel ascendcl)
