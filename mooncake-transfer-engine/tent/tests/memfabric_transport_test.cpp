@@ -427,7 +427,7 @@ class CopyTestHybm : public MemFabricGvaApi {
                             kSize !=
                         rank)
                     return -1;
-                out = p - 0x100000000000000ULL + 0x10000000;
+                out = p;
                 return 0;
             }
         }
@@ -611,23 +611,31 @@ class MemFabricTransportTest : public ::testing::Test {
         return api;
     }
 
+    bool Installed() const { return transport_->installed_; }
+    bool GvaEnabled() const { return transport_->gva_config_.enabled; }
+    bool HasGvaContext() const { return bool(transport_->gva_); }
+
     Status PrepareGvaAllocation() {
-        CHECK_STATUS(Install("device_sdma"));
         MemFabricGvaConfig config;
         config.enabled = true;
         config.group = "allocation-options";
         config.rank_count = 2;
         config.hbm_size = config.dram_size = config.hbm_window =
             config.dram_window = CopyTestHybm::kSize;
+        transport_->metadata_ = metadata_;
+        transport_->local_segment_name_ = name_;
+        transport_->installed_ = true;
+        transport_->stopping_ = false;
+        transport_->gva_config_ = config;
         copy_api_ = std::make_shared<CopyTestHybm>();
         transport_->gva_ =
             std::make_shared<MemFabricSharedMemory>(config, name_, copy_api_);
+        CHECK_STATUS(transport_->gva_->initialize());
         return Status::OK();
     }
 
     Status PrepareGvaCopy(size_t capacity = 256,
                           const char* protocol = "device_sdma") {
-        CHECK_STATUS(Install("device_sdma"));
         MemFabricGvaConfig config;
         config.enabled = true;
         config.group = "copy-test";
@@ -637,10 +645,15 @@ class MemFabricTransportTest : public ::testing::Test {
         config.entity = 64;
         config.hbm_size = config.dram_size = config.hbm_window =
             config.dram_window = CopyTestHybm::kSize;
+        transport_->metadata_ = metadata_;
+        transport_->local_segment_name_ = name_;
+        transport_->installed_ = true;
+        transport_->stopping_ = false;
         transport_->gva_config_ = config;
         copy_api_ = std::make_shared<CopyTestHybm>();
         transport_->gva_ =
             std::make_shared<MemFabricSharedMemory>(config, name_, copy_api_);
+        CHECK_STATUS(transport_->gva_->initialize());
         transport_->max_pending_copies_ = capacity;
         CHECK_STATUS(
             transport_->gva_->allocate(&copy_hbm_, CopyTestHybm::kSize, 1, 0));
@@ -669,6 +682,7 @@ class MemFabricTransportTest : public ::testing::Test {
         config.rank = 1;
         peer_memory_ = std::make_shared<MemFabricSharedMemory>(
             config, peer_name_, std::make_shared<CopyTestHybm>());
+        CHECK_STATUS(peer_memory_->initialize());
         CHECK_STATUS(
             peer_memory_->allocate(&copy_dram_, CopyTestHybm::kSize, 2, 0));
         BufferDesc remote{};
@@ -2027,7 +2041,7 @@ TEST_F(MemFabricTransportTest,
     copy_api_->release();
     ASSERT_TRUE(WaitCopiesWithoutPolling());
 }
-TEST_F(MemFabricTransportTest, GvaMixedAddressRequestDoesNotFallBackToTrans) {
+TEST_F(MemFabricTransportTest, GvaRejectsUnregisteredLocalAddress) {
     ASSERT_TRUE(PrepareGvaCopy().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     char ordinary[64]{};
@@ -2060,8 +2074,7 @@ TEST_F(MemFabricTransportTest, GvaCopyFailureIsReportedAfterWorkerDrains) {
     EXPECT_EQ(state_->batch_copy_calls, 0);
 }
 
-TEST_F(MemFabricTransportTest,
-       GvaMixedBatchRejectsBeforeEitherBackendDispatches) {
+TEST_F(MemFabricTransportTest, GvaInvalidBatchRejectsBeforeDispatch) {
     ASSERT_TRUE(PrepareGvaCopy().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
     char ordinary[64]{};
@@ -2100,15 +2113,19 @@ TEST_F(MemFabricTransportTest,
         transport_->freeLocalMemory(copy_hbm_, CopyTestHybm::kSize).ok());
 }
 
-TEST_F(MemFabricTransportTest, TransBatchZeroCannotCompletePendingGvaCopy) {
+TEST_F(MemFabricTransportTest,
+       GvaInstanceRejectsOrdinaryCopyWithoutCreatingTrans) {
     ASSERT_TRUE(PrepareGvaCopy().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
     state_->next_batch_id.store(0);
     char ordinary[64]{};
-    ASSERT_TRUE(
+    EXPECT_FALSE(
         transport_
             ->submitTransferTasks(batch_, {MakeWrite(ordinary, 0x1000, 32)})
             .ok());
+    EXPECT_EQ(state_->init_calls, 0);
+    EXPECT_EQ(state_->create_calls, 0);
+    EXPECT_EQ(state_->batch_copy_calls, 0);
     copy_api_->blocked = true;
     ASSERT_TRUE(
         transport_
@@ -2119,13 +2136,11 @@ TEST_F(MemFabricTransportTest, TransBatchZeroCannotCompletePendingGvaCopy) {
     ASSERT_TRUE(copy_api_->awaitEntry());
     TransferStatus status{};
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
     EXPECT_EQ(status.transferred_bytes, 0u);
     copy_api_->release();
     ASSERT_TRUE(WaitCopiesWithoutPolling());
-    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, 64u);
 }
@@ -2151,7 +2166,7 @@ TEST_F(MemFabricTransportTest, GvaAllocationReturnsRegistrationOptions) {
         EXPECT_TRUE(transport_->warmupMemory(
             reinterpret_cast<void*>(desc.addr + 1), 64));
         char ordinary[64];
-        EXPECT_FALSE(transport_->warmupMemory(ordinary, sizeof(ordinary)));
+        EXPECT_TRUE(transport_->warmupMemory(ordinary, sizeof(ordinary)));
         ASSERT_TRUE(transport_->addMemoryBuffer(desc, MemoryOptions{}).ok());
         EXPECT_EQ(desc.location, "npu:0");
         EXPECT_EQ(desc.transports, std::vector<TransportType>{MEMFABRIC});
@@ -2180,6 +2195,10 @@ TEST_F(MemFabricTransportTest, SdmaMappingPreparesCopyThroughExistingEntry) {
 TEST_F(MemFabricTransportTest,
        NetworkPreparationAllowsCopyWithoutDirectMapping) {
     ASSERT_TRUE(PrepareGvaCopy(256, "device_rdma").ok());
+    EXPECT_TRUE(
+        transport_->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize)
+            .ok());
+    EXPECT_TRUE(copy_api_->copies.empty());
     void* dva = reinterpret_cast<void*>(1);
     EXPECT_FALSE(
         transport_
@@ -2191,17 +2210,29 @@ TEST_F(MemFabricTransportTest,
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     auto request =
         GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(copy_dram_), 32);
-    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_,
+                {request, GvaRead(copy_hbm_,
+                                  reinterpret_cast<uint64_t>(copy_dram_), 32)})
+            .ok());
     ASSERT_TRUE(WaitCopiesWithoutPolling());
     TransferStatus status{};
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(state_->batch_copy_calls, 0);
-    EXPECT_EQ(copy_api_->copies.size(), 1u);
+    EXPECT_EQ(copy_api_->copies.size(), 2u);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 }
 
-TEST_F(MemFabricTransportTest, UrmaMappingAllowsCopyWithoutDirectMapping) {
+TEST_F(MemFabricTransportTest, UrmaPreparationAllowsCopyWithoutDirectMapping) {
     ASSERT_TRUE(PrepareGvaCopy(256, "device_urma").ok());
+    EXPECT_TRUE(
+        transport_->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize)
+            .ok());
+    EXPECT_TRUE(copy_api_->copies.empty());
     void* dva = reinterpret_cast<void*>(1);
     EXPECT_FALSE(
         transport_
@@ -2213,13 +2244,75 @@ TEST_F(MemFabricTransportTest, UrmaMappingAllowsCopyWithoutDirectMapping) {
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     auto request =
         GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(copy_dram_), 32);
-    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_,
+                {request, GvaRead(copy_hbm_,
+                                  reinterpret_cast<uint64_t>(copy_dram_), 32)})
+            .ok());
     ASSERT_TRUE(WaitCopiesWithoutPolling());
     TransferStatus status{};
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(state_->batch_copy_calls, 0);
-    EXPECT_EQ(copy_api_->copies.size(), 1u);
+    EXPECT_EQ(copy_api_->copies.size(), 2u);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+}
+
+TEST_F(MemFabricTransportTest, GvaInstallFailureCanRetryWithGvaDisabled) {
+    setenv("MF_PROTOCOL", "device_sdma", 1);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/memfabric/gva/enabled", true);
+    // Missing group/windows is invalid even when compatible HYBM is present.
+    EXPECT_FALSE(transport_->install(name_, metadata_, nullptr, conf).ok());
+    EXPECT_FALSE(Installed());
+    EXPECT_FALSE(HasGvaContext());
+    EXPECT_EQ(state_->init_calls, 0);
+    EXPECT_EQ(state_->create_calls, 0);
+    ASSERT_TRUE(Configure().ok());
+    EXPECT_FALSE(GvaEnabled());
+    EXPECT_FALSE(HasGvaContext());
+    EXPECT_EQ(state_->init_calls, 0);
+    ASSERT_TRUE(Initialize(*transport_).ok());
+    EXPECT_EQ(state_->init_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, GvaInstallDoesNotRequireTransEndpoint) {
+    setenv("MF_PROTOCOL", "device_sdma", 1);
+    unsetenv("MF_STORE_PROTOCOL");
+    ASSERT_TRUE(SetRpcAddress("invalid-for-trans").ok());
+    auto conf = std::make_shared<Config>();
+    const std::string prefix = "transports/memfabric/gva/";
+    conf->set(prefix + "enabled", true);
+    conf->set(prefix + "group", "gva-only");
+    conf->set(prefix + "rank_count", int64_t{2});
+    conf->set(prefix + "rank", int64_t{0});
+    conf->set(prefix + "device", int64_t{0});
+    conf->set(prefix + "hbm_size", uint64_t{2ULL << 20});
+    conf->set(prefix + "hbm_window", uint64_t{2ULL << 20});
+    const auto status = transport_->install(name_, metadata_, nullptr, conf);
+    // Without HYBM symbols installation can fail, but it must reach the GVA
+    // backend instead of rejecting the trans RPC endpoint.
+    EXPECT_FALSE(status.IsInvalidArgument());
+    EXPECT_TRUE(GvaEnabled());
+    EXPECT_EQ(state_->init_calls, 0);
+    EXPECT_EQ(state_->create_calls, 0);
+}
+TEST_F(MemFabricTransportTest, GvaRejectsOrdinaryRegistrationAndFree) {
+    ASSERT_TRUE(PrepareGvaAllocation().ok());
+    char ordinary[64]{};
+    BufferDesc desc{};
+    desc.addr = reinterpret_cast<uint64_t>(ordinary);
+    desc.length = sizeof(ordinary);
+    EXPECT_FALSE(transport_->addMemoryBuffer(desc, MemoryOptions{}).ok());
+    EXPECT_FALSE(transport_->removeMemoryBuffer(desc).ok());
+    EXPECT_FALSE(transport_->freeLocalMemory(ordinary, sizeof(ordinary)).ok());
+    EXPECT_FALSE(Initialize(*transport_).ok());
+    EXPECT_EQ(state_->init_calls, 0);
+    EXPECT_EQ(state_->create_calls, 0);
+    EXPECT_EQ(state_->register_mem_calls, 0);
 }
 
 }  // namespace tent

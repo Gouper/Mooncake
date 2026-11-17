@@ -82,6 +82,10 @@ Status MemFabricSharedMemory::bindDevice() {
     if (api_->bind(config_.device)) return nativeError("bind device");
     return Status::OK();
 }
+Status MemFabricSharedMemory::initialize() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return initializeContext();
+}
 Status MemFabricSharedMemory::initializeContext() {
     CHECK_STATUS(config_status_);
     CHECK_STATUS(bindDevice());
@@ -106,9 +110,9 @@ Status MemFabricSharedMemory::initializeContext() {
     return Status::OK();
 }
 MemFabricSharedMemory::Json MemFabricSharedMemory::makeIdentity() const {
-    return Json{{"version", 2u},
+    return Json{{"version", 3u},
                 {"protocol", config_.protocol},
-                {"address_mode", "logical56"},
+                {"address_mode", "identity"},
                 {"group", config_.group},
                 {"owner", owner_},
                 {"generation", generation_},
@@ -147,7 +151,11 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     for (const auto& entry : peers_)
         if (!entry.second.cleaned)
             return pending("allocate pools before peer preparation");
-    CHECK_STATUS(initializeContext());
+    CHECK_STATUS(config_status_);
+    if (!entity_ || entity_blob_.is_null())
+        return Status::InvalidArgument(
+            "MemFabric GVA context is not initialized");
+    CHECK_STATUS(bindDevice());
     void* slice = api_->allocate(entity_, memory_type, size);
     if (!slice) return nativeError("allocate slice");
     consumed_[memory_type - 1] = size;
@@ -156,14 +164,15 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     auto mapped = api_->size(entity_, slice);
     bool valid = gva && mapped == size &&
                  size <= std::numeric_limits<uint64_t>::max() - gva &&
-                 !api_->translate(gva, 1, dva) && dva && dva != gva &&
+                 !api_->translate(gva, 1, dva) && dva && dva == gva &&
                  size <= std::numeric_limits<uint64_t>::max() - dva &&
                  !api_->translate(gva + size - 1, 1, end) &&
                  end == dva + size - 1 && (!requested || requested == gva);
     if (!valid) {
         if (api_->free(entity_, slice)) rollback_.push_back(slice);
         return Status::InvalidArgument(
-            "HYBM logical GVA must match the request and resolve to a distinct "
+            "HYBM logical GVA must match the request and resolve to an "
+            "identical "
             "contiguous device VA; allocation retained for cleanup if needed");
     }
     pool.slice = slice;
@@ -280,8 +289,8 @@ Status MemFabricSharedMemory::validateDescriptor(
         if (descriptor.value("protocol", std::string("device_sdma")) !=
             config_.protocol)
             return Status::InvalidArgument("GVA peer protocol differs");
-        if (descriptor.at("version").get<uint64_t>() != 2 ||
-            descriptor.at("address_mode").get<std::string>() != "logical56" ||
+        if (descriptor.at("version").get<uint64_t>() != 3 ||
+            descriptor.at("address_mode").get<std::string>() != "identity" ||
             descriptor.at("owner").get<std::string>() != owner ||
             owner.empty() ||
             descriptor.at("group").get<std::string>() != config_.group ||
@@ -401,12 +410,12 @@ Status MemFabricSharedMemory::verifyPeerMapping(const Peer& peer) {
                  size = descriptor.at("size").get<uint64_t>();
             uint64_t first = 0, last = 0;
             if (api_->translate(address, 1, first) || !first ||
-                first == address ||
+                first != address ||
                 size > std::numeric_limits<uint64_t>::max() - first ||
                 api_->translate(address + size - 1, 1, last) ||
                 last != first + size - 1)
                 return Status::InvalidArgument(
-                    "Peer logical GVA does not resolve to a distinct "
+                    "Peer logical GVA does not resolve to an identical "
                     "contiguous device VA");
         }
     return Status::OK();
@@ -428,6 +437,9 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
+    if (direct && config_.protocol != "device_sdma")
+        return Status::NotImplemented(
+            "Network GVA does not provide a direct device mapping");
     if (config_.protocol != "device_sdma" &&
         (!api_ || !api_->supportsConnect()))
         return Status::NotImplemented(
@@ -456,12 +468,17 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
         if (!requested)
             return Status::InvalidArgument(
                 "Map requires complete published pool");
-        CHECK_STATUS(initializeContext());
+        CHECK_STATUS(config_status_);
+        if (!entity_ || entity_blob_.is_null())
+            return Status::InvalidArgument(
+                "MemFabric GVA context is not initialized");
+        CHECK_STATUS(bindDevice());
         CHECK_STATUS(recordPeer(*requested, owner));
         auto& peer = peers_.at(rank);
+        const auto index = requested->at("type").get<size_t>() - 1;
         peer.mapped = false;
         peer.copy_ready = false;
-        peer.active[requested->at("type").get<size_t>() - 1] = true;
+        peer.active[index] = true;
         for (const auto& descriptor : descriptors)
             CHECK_STATUS(importPeer(descriptor, owner));
         // Reciprocal imports are driven by each application's map calls.
@@ -481,7 +498,7 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
                     "Peer lacks configured network copy capability");
             peer.copy_ready = true;
         }
-        if (direct || config_.protocol == "device_sdma") {
+        if (config_.protocol == "device_sdma") {
             CHECK_STATUS(verifyPeerMapping(peer));
             peer.mapped = true;
             peer.copy_ready = true;
@@ -563,7 +580,7 @@ Status MemFabricSharedMemory::resolve(uint64_t address, size_t size,
         return Status::InvalidArgument("GVA range is not locally accessible");
     CHECK_STATUS(bindDevice());
     uint64_t first = 0, last = 0;
-    if (api_->translate(address, 1, first) || !first || first == address ||
+    if (api_->translate(address, 1, first) || !first || first != address ||
         size > UINT64_MAX - first ||
         api_->translate(address + size - 1, 1, last) ||
         last != first + size - 1)

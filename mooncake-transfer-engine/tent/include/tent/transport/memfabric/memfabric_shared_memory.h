@@ -59,6 +59,8 @@ class MemFabricSharedMemory {
                           std::shared_ptr<MemFabricGvaApi> api);
     ~MemFabricSharedMemory();
     bool available() const { return config_.enabled && bool(api_); }
+    // Initialize the entity and reserve windows before allocation or mapping.
+    Status initialize();
     Status allocate(void**, size_t, uint32_t memory_type, uint64_t requested);
     Status free(void*, size_t);
     bool describe(void*, size_t, MemoryOptions&) const;

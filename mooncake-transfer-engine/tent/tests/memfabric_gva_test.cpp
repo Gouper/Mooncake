@@ -36,7 +36,7 @@ class FakeHybm : public MemFabricGvaApi {
     int unreserve(void*) override { return 0; }
     void* allocate(void*, uint32_t t, uint64_t) override {
         auto p = 0x10000000ULL + t * 0x1000000 + rank * M;
-        addresses[p] = mismatch ? p : p + 0x100000000ULL;
+        addresses[p] = mismatch ? p + 0x100000000ULL : p;
         return reinterpret_cast<void*>(p);
     }
     int free(void*, void* p) override {
@@ -77,7 +77,7 @@ class FakeHybm : public MemFabricGvaApi {
             if (fail_import) return -1;
             uint64_t p;
             std::memcpy(&p, b.data(), 8);
-            addresses[p] = p + 0x200000000ULL + rank * 0x100000000ULL;
+            addresses[p] = mismatch ? p + 0x100000000ULL : p;
             imported.insert(p);
         }
         return 0;
@@ -114,6 +114,7 @@ MemFabricGvaConfig config(uint32_t rank = 0) {
 }
 TEST(MemFabricGva, MissingApiRejectsAllocation) {
     MemFabricSharedMemory m(config(), "owner", nullptr);
+    EXPECT_FALSE(m.initialize().ok());
     void* p = nullptr;
     EXPECT_FALSE(m.allocate(&p, M, 1, 0).ok());
     EXPECT_EQ(p, nullptr);
@@ -123,6 +124,7 @@ TEST(MemFabricGva, ExplicitlyDisabledDramAllowsHbmOnlyContext) {
     auto options = config();
     options.dram_size = options.dram_window = 0;
     MemFabricSharedMemory memory(options, "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     EXPECT_TRUE(memory.allocate(&address, M, 1, 0).ok());
     void* dram = nullptr;
@@ -134,13 +136,15 @@ TEST(MemFabricGva, DisabledTypeMustHaveZeroWindowAndZeroLocalSize) {
     auto options = config();
     options.dram_size = 0;
     MemFabricSharedMemory memory(options, "owner", api);
+    EXPECT_FALSE(memory.initialize().ok());
     void* address = nullptr;
     EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(api->creates, 0);
 }
-TEST(MemFabricGva, IdentityDeviceAddressAndWrongLogicalRequestAreRejected) {
+TEST(MemFabricGva, NonIdentityDeviceAddressAndWrongFixedRequestAreRejected) {
     auto a = std::make_shared<FakeHybm>();
     MemFabricSharedMemory m(config(), "owner", a);
+    ASSERT_TRUE(m.initialize().ok());
     void* p = nullptr;
     a->mismatch = true;
     EXPECT_FALSE(m.allocate(&p, M, 1, 0).ok());
@@ -153,6 +157,7 @@ TEST(MemFabricGva, IdentityDeviceAddressAndWrongLogicalRequestAreRejected) {
 TEST(MemFabricGva, BothPoolsShareEntityAndFailedSecondPreservesFirst) {
     auto a = std::make_shared<FakeHybm>();
     MemFabricSharedMemory m(config(), "owner", a);
+    ASSERT_TRUE(m.initialize().ok());
     void* p = nullptr;
     ASSERT_TRUE(m.allocate(&p, M, 1, 0).ok());
     void* q = nullptr;
@@ -167,11 +172,12 @@ TEST(MemFabricGva, BothPoolsShareEntityAndFailedSecondPreservesFirst) {
 TEST(MemFabricGva, PublicationPreventsFreeAndDescriptorIsVersioned) {
     auto a = std::make_shared<FakeHybm>();
     MemFabricSharedMemory m(config(), "owner", a);
+    ASSERT_TRUE(m.initialize().ok());
     void* p = nullptr;
     ASSERT_TRUE(m.allocate(&p, M, 1, 0).ok());
     std::string desc;
     ASSERT_TRUE(m.publish(p, M, desc).ok());
-    EXPECT_NE(desc.find("\"version\":2"), std::string::npos);
+    EXPECT_NE(desc.find("\"version\":3"), std::string::npos);
     EXPECT_FALSE(m.free(p, M).ok());
     EXPECT_TRUE(m.unpublish(p).ok());
     EXPECT_TRUE(m.free(p, M).ok());
@@ -180,6 +186,7 @@ TEST(MemFabricGva, PublicationPreventsFreeAndDescriptorIsVersioned) {
 TEST(MemFabricGva, MalformedDescriptorDoesNotImport) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     EXPECT_FALSE(memory.map("peer", "{}", 0x11000000, M).ok());
     EXPECT_EQ(api->imports, 0);
 }
@@ -190,6 +197,8 @@ struct Pair {
     void *ah = nullptr, *ad = nullptr, *bh = nullptr, *bd = nullptr;
     std::string h, d;
     Pair() {
+        EXPECT_TRUE(a.initialize().ok());
+        EXPECT_TRUE(b.initialize().ok());
         EXPECT_TRUE(a.allocate(&ah, M, 1, 0).ok());
         EXPECT_TRUE(a.allocate(&ad, M, 2, 0).ok());
         EXPECT_TRUE(b.allocate(&bh, M, 1, 0).ok());
@@ -307,8 +316,10 @@ TEST(MemFabricGva, EntityExportFailureCanBeRetriedOnTheSameEntity) {
     MemFabricSharedMemory memory(config(), "owner", api);
     void* address = nullptr;
     api->fail_entity_export = true;
+    EXPECT_FALSE(memory.initialize().ok());
     EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
     api->fail_entity_export = false;
+    ASSERT_TRUE(memory.initialize().ok());
     EXPECT_TRUE(memory.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(api->creates, 1);
     EXPECT_TRUE(memory.free(address, M).ok());
@@ -316,6 +327,7 @@ TEST(MemFabricGva, EntityExportFailureCanBeRetriedOnTheSameEntity) {
 TEST(MemFabricGva, FailedFixedAddressDoesNotKeepConsumingNativeCapacity) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     EXPECT_FALSE(memory.allocate(&address, M, 1, 42).ok());
     EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
@@ -366,6 +378,7 @@ TEST(MemFabricGva, DramFirstImportsBothPoolsButOnlyActivatesRequestedPool) {
 TEST(MemFabricGva, RegistrationExportsSliceLazilyAndCachesSuccess) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     api->fail_slice_export = true;
     ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
@@ -389,6 +402,7 @@ TEST(MemFabricGva, RegistrationExportsSliceLazilyAndCachesSuccess) {
 TEST(MemFabricGva, FailedRegistrationLeavesAllocationFreeable) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
     api->fail_slice_export = true;
@@ -400,6 +414,7 @@ TEST(MemFabricGva, FailedRegistrationLeavesAllocationFreeable) {
 TEST(MemFabricGva, EmptyExportCannotPublishAndCanBeRetried) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
     api->empty_slice_export = true;
@@ -412,18 +427,19 @@ TEST(MemFabricGva, EmptyExportCannotPublishAndCanBeRetried) {
     EXPECT_TRUE(memory.free(address, M).ok());
 }
 
-TEST(MemFabricGva, FixedLogicalAddressResolvesToDistinctDeviceAddress) {
+TEST(MemFabricGva, FixedAddressResolvesToSameDeviceAddress) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* gva = nullptr;
     constexpr uint64_t requested = 0x11000000ULL;
     ASSERT_TRUE(memory.allocate(&gva, M, 1, requested).ok());
     EXPECT_EQ(reinterpret_cast<uint64_t>(gva), requested);
     void* dva = nullptr;
     ASSERT_TRUE(memory.resolve(requested, M, &dva).ok());
-    EXPECT_EQ(reinterpret_cast<uint64_t>(dva), requested + 0x100000000ULL);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(dva), requested);
     ASSERT_TRUE(memory.resolve(requested + 64, 32, &dva).ok());
-    EXPECT_EQ(reinterpret_cast<uint64_t>(dva), requested + 0x100000040ULL);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(dva), requested + 64);
     EXPECT_FALSE(memory.resolve(requested + M - 1, 2, &dva).ok());
     EXPECT_EQ(dva, nullptr);
     EXPECT_FALSE(memory.resolve(requested, 0, &dva).ok());
@@ -432,7 +448,7 @@ TEST(MemFabricGva, FixedLogicalAddressResolvesToDistinctDeviceAddress) {
     ASSERT_TRUE(memory.free(gva, M).ok());
     EXPECT_FALSE(memory.resolve(requested, 1, &dva).ok());
 }
-TEST(MemFabricGva, RemoteResolutionUsesCallerDeviceVaAndRequiresActiveMap) {
+TEST(MemFabricGva, RemoteResolutionPreservesSameAddressAndRequiresActiveMap) {
     Pair p;
     const auto gva = reinterpret_cast<uint64_t>(p.bh);
     void *owner_dva = nullptr, *remote_dva = nullptr;
@@ -440,12 +456,11 @@ TEST(MemFabricGva, RemoteResolutionUsesCallerDeviceVaAndRequiresActiveMap) {
     EXPECT_FALSE(p.a.resolve(gva, M, &remote_dva).ok());
     ASSERT_TRUE(p.mapH().ok());
     ASSERT_TRUE(p.a.resolve(gva, M, &remote_dva).ok());
-    EXPECT_NE(remote_dva, p.bh);
-    EXPECT_NE(remote_dva, owner_dva);
-    EXPECT_EQ(reinterpret_cast<uint64_t>(remote_dva), gva + 0x200000000ULL);
+    EXPECT_EQ(remote_dva, p.bh);
+    EXPECT_EQ(remote_dva, owner_dva);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(remote_dva), gva);
     ASSERT_TRUE(p.a.resolve(gva + 123, 50, &remote_dva).ok());
-    EXPECT_EQ(reinterpret_cast<uint64_t>(remote_dva),
-              gva + 0x200000000ULL + 123);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(remote_dva), gva + 123);
     // Importing a companion pool does not grant logical access to it.
     EXPECT_FALSE(
         p.a.resolve(reinterpret_cast<uint64_t>(p.bd), M, &remote_dva).ok());
@@ -474,16 +489,16 @@ TEST(MemFabricGva, LogicalUnmapRevokesResolutionBeforeRankCleanup) {
     EXPECT_FALSE(p.a.resolve(reinterpret_cast<uint64_t>(p.bh), M, &dva).ok());
     EXPECT_TRUE(p.a.resolve(reinterpret_cast<uint64_t>(p.bd), M, &dva).ok());
 }
-TEST(MemFabricGva, LegacyIdentityAddressMetadataIsRejectedBeforeImport) {
+TEST(MemFabricGva, Logical56AddressMetadataIsRejectedBeforeImport) {
     Pair p;
     auto descriptors = nlohmann::json::parse(p.bundle());
-    descriptors[0]["version"] = 1u;
+    descriptors[0]["version"] = 2u;
     EXPECT_FALSE(
         p.a.map("b", descriptors.dump(), reinterpret_cast<uint64_t>(p.bh), M)
             .ok());
     EXPECT_EQ(p.aa->imports, 0);
     descriptors = nlohmann::json::parse(p.bundle());
-    descriptors[0]["address_mode"] = "identity";
+    descriptors[0]["address_mode"] = "logical56";
     EXPECT_FALSE(
         p.a.map("b", descriptors.dump(), reinterpret_cast<uint64_t>(p.bh), M)
             .ok());
@@ -525,7 +540,7 @@ TEST(MemFabricGva, QueuedCopyPinsPublishedPoolsAndMappedPeerUntilCancelled) {
     EXPECT_TRUE(p.a.unpublish(p.ah).ok());
     EXPECT_TRUE(p.unmapH().ok());
 }
-TEST(MemFabricGva, CopyRejectsUnpublishedLogicalPoolAndDeviceAlias) {
+TEST(MemFabricGva, CopyRejectsUnpublishedPoolAndNonIdentityAlias) {
     Pair p;
     ASSERT_TRUE(p.mapH().ok());
     uint32_t direction = 0;
@@ -536,7 +551,7 @@ TEST(MemFabricGva, CopyRejectsUnpublishedLogicalPoolAndDeviceAlias) {
     ASSERT_TRUE(p.a.publish(p.ah, M, local).ok());
     void* dva = nullptr;
     ASSERT_TRUE(p.a.resolve(reinterpret_cast<uint64_t>(p.ah), 64, &dva).ok());
-    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(dva),
+    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(dva) + 0x100000000ULL,
                                reinterpret_cast<uint64_t>(p.bh), 64, direction)
                      .ok());
     EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah) + M - 1,
@@ -605,6 +620,8 @@ class MemFabricNetworkGva : public ::testing::TestWithParam<const char*> {
                                                         local_api);
         remote = std::make_unique<MemFabricSharedMemory>(remote_config,
                                                          "remote", remote_api);
+        ASSERT_TRUE(local->initialize().ok());
+        ASSERT_TRUE(remote->initialize().ok());
         ASSERT_TRUE(local->allocate(&source, M, 1, 0).ok());
         ASSERT_TRUE(remote->allocate(&target, M, 1, 0).ok());
         ASSERT_TRUE(local->publish(source, M, local_desc).ok());
@@ -655,8 +672,13 @@ TEST_P(MemFabricNetworkGva, NetworkCopyDoesNotRequireRemoteDeviceAddress) {
                               reinterpret_cast<uint64_t>(target), M, direction)
                     .ok());
     EXPECT_EQ(local_api->copy_calls, 1);
+    const auto copies = local_api->copy_calls;
     EXPECT_FALSE(
         local->map("remote", remote_desc, reinterpret_cast<uint64_t>(target), M)
+            .ok());
+    EXPECT_EQ(local_api->copy_calls, copies);
+    EXPECT_FALSE(
+        local->resolve(reinterpret_cast<uint64_t>(target), M, &device_address)
             .ok());
 }
 TEST_P(MemFabricNetworkGva, FailedConnectCannotAuthorizeCopyAndCanRetry) {
@@ -696,6 +718,39 @@ TEST_P(MemFabricNetworkGva, GenerationChangeInvalidatesPreparedCopyTarget) {
     descriptor["generation"] = "new-owner-instance";
     EXPECT_FALSE(local->validateCopyTarget("remote", descriptor.dump()).ok());
 }
+
+TEST_P(MemFabricNetworkGva,
+       NativePreparationDoesNotCopyOrRequireRemoteDeviceAddress) {
+    ASSERT_TRUE(local
+                    ->prepare("remote", remote_desc,
+                              reinterpret_cast<uint64_t>(target), M)
+                    .ok());
+    ASSERT_TRUE(local
+                    ->prepare("remote", remote_desc,
+                              reinterpret_cast<uint64_t>(target), M)
+                    .ok());
+    EXPECT_EQ(local_api->copy_calls, 0);
+    void* pointer = reinterpret_cast<void*>(1);
+    EXPECT_FALSE(
+        local->resolve(reinterpret_cast<uint64_t>(target), M, &pointer).ok());
+    EXPECT_EQ(pointer, nullptr);
+    uint32_t direction = 0;
+    ASSERT_TRUE(begin(direction).ok());
+    ASSERT_TRUE(local
+                    ->runCopy(reinterpret_cast<uint64_t>(source),
+                              reinterpret_cast<uint64_t>(target), M, direction)
+                    .ok());
+    ASSERT_TRUE(local
+                    ->beginCopy(reinterpret_cast<uint64_t>(target),
+                                reinterpret_cast<uint64_t>(source), M,
+                                direction)
+                    .ok());
+    ASSERT_TRUE(local
+                    ->runCopy(reinterpret_cast<uint64_t>(target),
+                              reinterpret_cast<uint64_t>(source), M, direction)
+                    .ok());
+    EXPECT_EQ(local_api->copy_calls, 2);
+}
 INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
                          ::testing::Values("device_rdma", "device_urma"));
 }  // namespace
@@ -705,6 +760,7 @@ TEST(MemFabricGva, UnsupportedNetworkProtocolRejectsAllocation) {
     options.protocol = "unknown_protocol";
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(options, "owner", api);
+    EXPECT_FALSE(memory.initialize().ok());
     void* address = nullptr;
     EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(address, nullptr);
@@ -714,6 +770,7 @@ TEST(MemFabricGva, UnsupportedNetworkProtocolRejectsAllocation) {
 TEST(MemFabricGva, ExistingContextOnlyRebindsDeviceAndRetriesBindFailure) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(api->initializes, 1);
@@ -724,7 +781,7 @@ TEST(MemFabricGva, ExistingContextOnlyRebindsDeviceAndRetriesBindFailure) {
     EXPECT_EQ(api->slice_exports, 0);
     api->fail_bind = false;
     ASSERT_TRUE(memory.publish(address, M, descriptor).ok());
-    EXPECT_EQ(api->binds, 3);
+    EXPECT_EQ(api->binds, 4);
     EXPECT_EQ(api->initializes, 1);
     EXPECT_EQ(api->entity_exports, 1);
     ASSERT_TRUE(memory.unpublish(address).ok());
@@ -736,14 +793,72 @@ TEST(MemFabricGva, ExistingContextOnlyRebindsDeviceAndRetriesBindFailure) {
 TEST(MemFabricGva, ClosedContextRecreatesEntityAndExportsFreshIdentity) {
     auto api = std::make_shared<FakeHybm>();
     MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
     ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
     ASSERT_TRUE(memory.free(address, M).ok());
     ASSERT_TRUE(memory.close().ok());
+    ASSERT_TRUE(memory.initialize().ok());
     ASSERT_TRUE(memory.allocate(&address, M, 2, 0).ok());
     EXPECT_EQ(api->initializes, 2);
     EXPECT_EQ(api->creates, 2);
     EXPECT_EQ(api->entity_exports, 2);
     ASSERT_TRUE(memory.free(address, M).ok());
     ASSERT_TRUE(memory.close().ok());
+}
+
+TEST(MemFabricGva, AllocationRequiresExplicitInitialization) {
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(config(), "owner", api);
+    void* address = nullptr;
+    EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
+    EXPECT_EQ(api->creates, 0);
+    ASSERT_TRUE(memory.initialize().ok());
+    ASSERT_TRUE(memory.initialize().ok());
+    EXPECT_EQ(api->creates, 1);
+    EXPECT_EQ(api->entity_exports, 1);
+    ASSERT_TRUE(memory.allocate(&address, M, 1, 0).ok());
+    ASSERT_TRUE(memory.free(address, M).ok());
+    ASSERT_TRUE(memory.close().ok());
+    EXPECT_FALSE(memory.allocate(&address, M, 2, 0).ok());
+    EXPECT_EQ(api->creates, 1);
+}
+
+TEST(MemFabricGva, MapOnlyContextRequiresExplicitInitialization) {
+    Pair owner;
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory receiver(config(0), "receiver", api);
+    auto address = reinterpret_cast<uint64_t>(owner.bh);
+    EXPECT_FALSE(receiver.map("b", owner.bundle(), address, M).ok());
+    EXPECT_EQ(api->creates, 0);
+    ASSERT_TRUE(receiver.initialize().ok());
+    ASSERT_TRUE(receiver.map("b", owner.bundle(), address, M).ok());
+    EXPECT_EQ(api->creates, 1);
+    ASSERT_TRUE(receiver.unmap("b", address).ok());
+    ASSERT_TRUE(receiver.close().ok());
+}
+
+TEST(MemFabricGva, NonIdentityPeerMapCannotAuthorizeAccessOrCopy) {
+    Pair p;
+    p.aa->mismatch = true;
+    EXPECT_FALSE(p.mapH().ok());
+    void* address = nullptr;
+    EXPECT_FALSE(
+        p.a.resolve(reinterpret_cast<uint64_t>(p.bh), 64, &address).ok());
+    EXPECT_EQ(address, nullptr);
+    std::string descriptor;
+    ASSERT_TRUE(p.a.publish(p.ah, M, descriptor).ok());
+    uint32_t direction = 0;
+    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah),
+                               reinterpret_cast<uint64_t>(p.bh), 64, direction)
+                     .ok());
+}
+TEST(MemFabricGva, ResolveRejectsChangedNonIdentityTranslation) {
+    Pair p;
+    ASSERT_TRUE(p.mapH().ok());
+    const auto address = reinterpret_cast<uint64_t>(p.bh);
+    p.aa->addresses[address] = address + 0x100000000ULL;
+    void* output = reinterpret_cast<void*>(1);
+    EXPECT_FALSE(p.a.resolve(address, 64, &output).ok());
+    EXPECT_EQ(output, nullptr);
 }

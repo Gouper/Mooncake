@@ -104,7 +104,7 @@ class NativeHybm final : public MemFabricGvaApi {
         options.deviceVASpace = config.hbm_size;
         options.hostVASpace = config.dram_size;
         options.scene = HYBM_SCENE_DEFAULT;
-        options.enable56BitsGva = true;
+        options.enable56BitsGva = false;
         options.dramShmFd = -1;
         return hybm_create_entity_(config.entity, &options, 0);
     }

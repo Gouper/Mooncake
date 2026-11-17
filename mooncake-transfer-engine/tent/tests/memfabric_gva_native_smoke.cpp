@@ -28,7 +28,7 @@ namespace {
 using Json = nlohmann::json;
 constexpr size_t kSize = 2ULL << 20;
 // The tested 910B3 runtime requires GiB-sized remote VA reservations in
-// 56-bit mode. Allocate GiB-sized pools while verifying only a 2 MiB payload.
+// prior 56-bit tests. Keep GiB pools while verifying only a 2 MiB payload.
 constexpr size_t kWindowSize = 1ULL << 30;
 constexpr size_t kDramSize = 1ULL << 30;
 constexpr size_t kHbmSize = 1ULL << 30;
@@ -109,11 +109,13 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             const auto owner = "rank-" + std::to_string(rank);
             const auto peer = "rank-" + std::to_string(1 - rank);
             MemFabricSharedMemory memory(config, owner, api);
+            require(memory.initialize(), "initialize GVA context");
             auto deviceAddress = [&](uint64_t gva, size_t size) {
                 void* dva = nullptr;
                 require(memory.resolve(gva, size, &dva), "resolve GVA");
-                if (!dva || reinterpret_cast<uint64_t>(dva) == gva)
-                    throw std::runtime_error("56-bit GVA must differ from DVA");
+                if (!dva || reinterpret_cast<uint64_t>(dva) != gva)
+                    throw std::runtime_error(
+                        "GVA must equal the directly accessible NPU address");
                 if (size > 32) {
                     void* offset = nullptr;
                     require(memory.resolve(gva + 32, size - 32, &offset),
@@ -239,7 +241,10 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                         aclrtMemcpy(output, sentinel.size(), sentinel.data(),
                                     sentinel.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                         "reset kernel read output");
-                    aclCheck(kernel(deviceAddress(address, 32), output, stream),
+                    (void)deviceAddress(
+                        address, 32);  // Assert P is directly accessible.
+                    aclCheck(kernel(reinterpret_cast<void*>(address), output,
+                                    stream),
                              "AI core remote GVA read");
                     std::array<unsigned char, 32> actual{};
                     aclCheck(
@@ -264,7 +269,10 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                         aclrtMemcpy(output, written.size(), written.data(),
                                     written.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                         "fill kernel write source");
-                    aclCheck(kernel(output, deviceAddress(address, 32), stream),
+                    (void)deviceAddress(
+                        address, 32);  // Assert P is directly accessible.
+                    aclCheck(kernel(output, reinterpret_cast<void*>(address),
+                                    stream),
                              "AI core remote GVA write");
                 }
                 barrier(sync, "kernel-writes-done");
@@ -380,6 +388,7 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             config.entity = 65;
             MemFabricSharedMemory memory(
                 config, "mismatch-" + std::to_string(rank), api);
+            require(memory.initialize(), "initialize GVA context");
             void* address = nullptr;
             auto status = memory.allocate(&address, kHbmSize, 1, 1);
             if (!status.IsInvalidArgument() || address)
