@@ -207,26 +207,32 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
             protocol != "device_urma")
             return Status::InvalidArgument(
                 "Unsupported MemFabric GVA protocol");
-        gva_config_.group = conf->get(prefix + "group", "");
+        gva_config_.group = conf->get(prefix + "group", "mooncake-memfabric");
         const auto ranks = conf->get(prefix + "rank_count", int64_t{0});
         const auto rank = conf->get(prefix + "rank", int64_t{-1});
-        const auto device = conf->get(prefix + "device", int64_t{-1});
+        // Capture the application's device before native initialization and
+        // retain it for registration and copy threads to bind explicitly.
+        int device = -1;
+        if (aclrtGetDevice(&device) != ACL_ERROR_NONE || device < 0 ||
+            device > UINT16_MAX)
+            return Status::InvalidArgument(
+                "MemFabric GVA requires an application-bound device");
         const auto entity = conf->get(prefix + "entity", int64_t{64});
         // Keep conversions safe; HYBM validates rank topology and sizes.
         if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX ||
-            device < 0 || device > UINT16_MAX || entity < 64 || entity >= 128)
+            entity < 64 || entity >= 128)
             return Status::InvalidArgument(
                 "Invalid MemFabric GVA configuration");
         gva_config_.rank_count = ranks;
         gva_config_.rank = rank;
-        gva_config_.device = device;
-        gva_config_.entity = entity;
+        gva_config_.device = static_cast<uint16_t>(device);
+        gva_config_.entity =
+            entity;  // 底层hybm端口号会自动生成，一个进程里面entity全局变量+1，不要再这个地方配置。
         gva_config_.hbm_window = conf->get(prefix + "hbm_window", uint64_t{0});
         gva_config_.dram_window =
             conf->get(prefix + "dram_window", uint64_t{0});
-        gva_config_.hbm_size = conf->get(prefix + "hbm_size", uint64_t{0});
-        gva_config_.dram_size = conf->get(prefix + "dram_size", uint64_t{0});
-        gva_config_.explicit_copy = conf->get(prefix + "explicit_copy", false);
+        gva_config_.hbm_size = gva_config_.hbm_window;
+        gva_config_.dram_size = gva_config_.dram_window;
         return Status::OK();
     }
     config_.data_op_type_str = protocol;
@@ -992,10 +998,16 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
                     "Register the complete GVA pool");
             desc.location = trusted.location;
         }
-        for (auto& desc : desc_list) {
-            CHECK_STATUS(gva_->publish(reinterpret_cast<void*>(desc.addr),
-                                       desc.length,
-                                       desc.transport_attrs[MEMFABRIC]));
+        std::vector<std::pair<void*, size_t>> ranges;
+        ranges.reserve(desc_list.size());
+        for (const auto& desc : desc_list)
+            ranges.emplace_back(reinterpret_cast<void*>(desc.addr),
+                                desc.length);
+        std::vector<std::string> descriptors;
+        CHECK_STATUS(gva_->publish(ranges, descriptors));
+        for (size_t index = 0; index < desc_list.size(); ++index) {
+            auto& desc = desc_list[index];
+            desc.transport_attrs[MEMFABRIC] = std::move(descriptors[index]);
             if (std::find(desc.transports.begin(), desc.transports.end(),
                           MEMFABRIC) == desc.transports.end())
                 desc.transports.push_back(MEMFABRIC);

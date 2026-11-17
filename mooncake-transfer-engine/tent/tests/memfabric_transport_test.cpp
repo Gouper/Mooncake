@@ -30,11 +30,13 @@
 namespace {
 
 thread_local int g_device_id = 0;
+thread_local aclError g_get_device_result = ACL_ERROR_NONE;
 thread_local aclrtContext g_context = reinterpret_cast<aclrtContext>(0x10000);
 int g_device_count = 1;
 
 void ResetAcl() {
     g_device_id = 0;
+    g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
     g_context = reinterpret_cast<aclrtContext>(0x10000);
 }
@@ -50,7 +52,7 @@ aclError aclrtGetDeviceCount(uint32_t* count) {
 
 aclError aclrtGetDevice(int* deviceId) {
     *deviceId = g_device_id;
-    return ACL_ERROR_NONE;
+    return g_get_device_result;
 }
 
 aclError aclrtSetDevice(int deviceId) {
@@ -654,6 +656,22 @@ class MemFabricTransportTest : public ::testing::Test {
     bool Installed() const { return transport_->installed_; }
     bool GvaEnabled() const { return transport_->gva_config_.enabled; }
     bool HasGvaContext() const { return bool(transport_->gva_); }
+    Status LoadConfig(const std::shared_ptr<Config>& config) {
+        return transport_->loadConfig(config);
+    }
+    const MemFabricGvaConfig& GvaConfig() const {
+        return transport_->gva_config_;
+    }
+    std::shared_ptr<Config> GvaInputConfig() {
+        setenv("MF_PROTOCOL", "device_rdma", 1);
+        auto config = std::make_shared<Config>();
+        config->set("transports/memfabric/gva/enabled", true);
+        config->set("transports/memfabric/gva/rank_count", int64_t{2});
+        config->set("transports/memfabric/gva/rank", int64_t{0});
+        config->set("transports/memfabric/gva/hbm_window",
+                    uint64_t{1ULL << 30});
+        return config;
+    }
 
     Status PrepareGvaAllocation(uint64_t budget = CopyTestHybm::kSize) {
         MemFabricGvaConfig config;
@@ -2315,11 +2333,49 @@ TEST_F(MemFabricTransportTest, UrmaPreparationAllowsCopyWithoutDirectMapping) {
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 }
 
+TEST_F(MemFabricTransportTest, GvaConfigUsesApplicationDeviceAndWindowBudgets) {
+    auto config = GvaInputConfig();
+    g_device_id = 3;
+    config->set("transports/memfabric/gva/device", int64_t{9});
+    config->set("transports/memfabric/gva/hbm_size", uint64_t{1});
+    config->set("transports/memfabric/gva/dram_window", uint64_t{2ULL << 30});
+    ASSERT_TRUE(LoadConfig(config).ok());
+    EXPECT_EQ(GvaConfig().device, 3);
+    EXPECT_EQ(GvaConfig().group, "mooncake-memfabric");
+    EXPECT_EQ(GvaConfig().protocol, "device_rdma");
+    EXPECT_EQ(GvaConfig().hbm_size, GvaConfig().hbm_window);
+    EXPECT_EQ(GvaConfig().dram_size, GvaConfig().dram_window);
+    EXPECT_EQ(GvaConfig().entity, 64);
+}
+
+TEST_F(MemFabricTransportTest,
+       GvaConfigPreservesGroupAndStoreProtocolOverride) {
+    auto config = GvaInputConfig();
+    config->set("transports/memfabric/gva/group", "other-domain");
+    config->set("transports/memfabric/store_te_init", true);
+    setenv("MF_STORE_PROTOCOL", "device_urma", 1);
+    ASSERT_TRUE(LoadConfig(config).ok());
+    EXPECT_EQ(GvaConfig().group, "other-domain");
+    EXPECT_EQ(GvaConfig().protocol, "device_urma");
+    EXPECT_EQ(GvaConfig().dram_size, 0u);
+}
+
+TEST_F(MemFabricTransportTest, GvaConfigRejectsMissingOrUnrepresentableDevice) {
+    auto config = GvaInputConfig();
+    g_get_device_result = 1;
+    EXPECT_FALSE(LoadConfig(config).ok());
+    g_get_device_result = ACL_ERROR_NONE;
+    g_device_id = -1;
+    EXPECT_FALSE(LoadConfig(config).ok());
+    g_device_id = UINT16_MAX + 1;
+    EXPECT_FALSE(LoadConfig(config).ok());
+}
+
 TEST_F(MemFabricTransportTest, GvaInstallFailureCanRetryWithGvaDisabled) {
     setenv("MF_PROTOCOL", "device_sdma", 1);
     auto conf = std::make_shared<Config>();
     conf->set("transports/memfabric/gva/enabled", true);
-    // Missing group/windows is invalid even when compatible HYBM is present.
+    // Missing rank/windows is invalid even when compatible HYBM is present.
     EXPECT_FALSE(transport_->install(name_, metadata_, nullptr, conf).ok());
     EXPECT_FALSE(Installed());
     EXPECT_FALSE(HasGvaContext());

@@ -269,26 +269,54 @@ bool MemFabricSharedMemory::overlaps(uint64_t address, size_t size) const {
 }
 Status MemFabricSharedMemory::publish(void* ptr, size_t size,
                                       std::string& out) {
+    std::vector<std::string> descriptors;
+    CHECK_STATUS(publish({{ptr, size}}, descriptors));
+    out = std::move(descriptors.front());
+    return Status::OK();
+}
+Status MemFabricSharedMemory::publish(
+    const std::vector<std::pair<void*, size_t>>& ranges,
+    std::vector<std::string>& descriptors) {
+    if (ranges.empty()) {
+        descriptors.clear();
+        return Status::OK();
+    }
+    CHECK_STATUS(bindDevice());
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& [base, pool] : pools_)
-        if (pool.slice && pool.address == reinterpret_cast<uint64_t>(ptr) &&
-            pool.length == size) {
-            if (!pool.descriptor.contains("slice_blob")) {
-                CHECK_STATUS(bindDevice());
-                std::vector<uint8_t> blob;
-                const auto ret = api_->exportBlob(entity_, pool.slice, blob);
-                if (ret) return nativeError("export slice", ret);
-                if (!blobValid(Json(blob)))
-                    return Status::InvalidArgument(
-                        "HYBM exported an invalid slice descriptor");
-                pool.descriptor["slice_blob"] = blob;
-            }
-            out = pool.descriptor.dump();
-            pool.published = true;
-            return Status::OK();
+    std::vector<Pool*> selected;
+    selected.reserve(ranges.size());
+    for (const auto& [ptr, size] : ranges) {
+        const auto found = pools_.find(reinterpret_cast<uint64_t>(ptr));
+        if (found == pools_.end() || !found->second.slice ||
+            found->second.length != size)
+            return Status::InvalidArgument(
+                "Only a complete trusted GVA pool can be registered");
+        selected.push_back(&found->second);
+    }
+    std::vector<Json> staged;
+    std::vector<std::string> serialized;
+    staged.reserve(selected.size());
+    serialized.reserve(selected.size());
+    for (const auto* pool : selected) {
+        auto descriptor = pool->descriptor;
+        if (!descriptor.contains("slice_blob")) {
+            std::vector<uint8_t> blob;
+            const auto ret = api_->exportBlob(entity_, pool->slice, blob);
+            if (ret) return nativeError("export slice", ret);
+            if (!blobValid(Json(blob)))
+                return Status::InvalidArgument(
+                    "HYBM exported an invalid slice descriptor");
+            descriptor["slice_blob"] = blob;
         }
-    return Status::InvalidArgument(
-        "Only a complete trusted GVA pool can be registered");
+        serialized.push_back(descriptor.dump());
+        staged.push_back(std::move(descriptor));
+    }
+    for (size_t index = 0; index < selected.size(); ++index) {
+        selected[index]->descriptor.swap(staged[index]);
+        selected[index]->published = true;
+    }
+    descriptors.swap(serialized);
+    return Status::OK();
 }
 Status MemFabricSharedMemory::unpublish(void* ptr) {
     std::lock_guard<std::mutex> lock(mutex_);

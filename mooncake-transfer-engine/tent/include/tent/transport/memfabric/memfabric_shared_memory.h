@@ -8,6 +8,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 #include "tent/common/status.h"
 #include "tent/common/types.h"
@@ -193,6 +194,10 @@ class MemFabricSharedMemory {
     bool describe(void*, size_t, MemoryOptions&) const;
     bool overlaps(uint64_t, size_t) const;
     Status publish(void*, size_t, std::string&);
+    // Publish all complete allocations together; failure leaves publication
+    // state and the caller's descriptors unchanged.
+    Status publish(const std::vector<std::pair<void*, size_t>>& ranges,
+                   std::vector<std::string>& descriptors);
     Status unpublish(void*);
     Status map(const std::string& owner, const std::string& descriptor,
                uint64_t address, size_t size);

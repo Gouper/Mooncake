@@ -27,6 +27,7 @@ struct Options {
     size_t pool = 1ULL << 30;
     unsigned timeout = 180;
     size_t allocations = 1;
+    size_t allocation_size = 0;
 };
 void check(const Status& s, const std::string& operation) {
     if (!s.ok()) throw std::runtime_error(operation + ": " + s.ToString());
@@ -147,22 +148,19 @@ void child(const Options& o, int rank, int fd) {
         config->set("transports/memfabric/enable", true);
         const std::string prefix = "transports/memfabric/gva/";
         config->set(prefix + "enabled", true);
-        config->set(prefix + "group", "public-engine-smoke");
         config->set(prefix + "rank_count", int64_t{2});
         config->set(prefix + "rank", int64_t{rank});
-        config->set(prefix + "device", int64_t{o.devices[rank]});
         config->set(prefix + "entity", int64_t{64});
         config->set(prefix + "hbm_window", uint64_t{o.pool});
-        config->set(prefix + "hbm_size", uint64_t{o.pool});
         config->set(prefix + "dram_window", uint64_t{0});
-        config->set(prefix + "dram_size", uint64_t{0});
         // Deliberately leak on failure: exiting the process is safer than
         // attempting object teardown while failed device work may be in flight.
         auto* engine = new TransferEngine(config);
         if (!engine->available())
             throw std::runtime_error("TransferEngine unavailable");
         barrier(fd, "installed");
-        const auto allocation_size = o.pool / o.allocations;
+        const auto allocation_size =
+            o.allocation_size ? o.allocation_size : o.pool / o.allocations;
         constexpr size_t payload_size = 2ULL << 20;
         std::vector<void*> pools(o.allocations, nullptr);
         auto local_addresses = nlohmann::json::array();
@@ -178,8 +176,6 @@ void child(const Options& o, int rank, int fd) {
                 options.type != MEMFABRIC)
                 throw std::runtime_error(
                     "allocation options disagree with returned GVA");
-            check(engine->registerLocalMemory(pools[index], allocation_size),
-                  "registerLocalMemory");
             const auto own = pattern(payload_size, rank + 2 * index);
             const std::vector<unsigned char> zeros(payload_size, 0);
             aclCheck(aclrtMemcpy(pools[index], allocation_size, own.data(),
@@ -191,6 +187,9 @@ void child(const Options& o, int rank, int fd) {
                      "clear destination");
             local_addresses.push_back(reinterpret_cast<uint64_t>(pools[index]));
         }
+        check(engine->registerLocalMemory(
+                  pools, std::vector<size_t>(pools.size(), allocation_size)),
+              "registerLocalMemory batch");
         const auto local = nlohmann::json{
             {"segment", engine->getSegmentName()},
             {"gvas", local_addresses},
@@ -294,13 +293,16 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--help") {
-                std::cout << "--protocol device_sdma|device_rdma|device_urma "
-                             "--device0 N --device1 N\n"
-                             "--pool-size BYTES (default 1073741824; multiple "
-                             "of 1 GiB) --bind-ip IP\n"
-                             "--allocations 1|2 (default 1) "
-                             "--timeout-sec N (default 180) --hbm-only "
-                             "(currently the only mode)\n";
+                std::cout
+                    << "--protocol device_sdma|device_rdma|device_urma "
+                       "--device0 N --device1 N\n"
+                       "--pool-size BYTES (default 1073741824; multiple "
+                       "of 1 GiB) --bind-ip IP\n"
+                       "--allocations 1|2 (default 1) "
+                       "--allocation-size BYTES (default pool/allocations; "
+                       "at least 6 MiB, multiple of 2 MiB)\n"
+                       "--timeout-sec N (default 180) --hbm-only "
+                       "(currently the only mode)\n";
                 return 0;
             }
             if (arg == "--hbm-only") continue;
@@ -318,6 +320,8 @@ int main(int argc, char** argv) {
                 o.bind_ip = value;
             else if (arg == "--allocations")
                 o.allocations = std::stoull(value);
+            else if (arg == "--allocation-size")
+                o.allocation_size = std::stoull(value);
             else if (arg == "--timeout-sec")
                 o.timeout = std::stoul(value);
             else
@@ -332,6 +336,12 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 "invalid protocol, timeout, pool (must be 1 GiB aligned) or "
                 "devices");
+        if (o.allocation_size && (o.allocation_size < (6ULL << 20) ||
+                                  o.allocation_size % (2ULL << 20) ||
+                                  o.allocation_size > o.pool / o.allocations))
+            throw std::runtime_error(
+                "allocation size must be at least 6 MiB, 2 MiB aligned, and "
+                "fit its share of the pool");
         int sockets[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets))
             throw std::runtime_error("socketpair failed");

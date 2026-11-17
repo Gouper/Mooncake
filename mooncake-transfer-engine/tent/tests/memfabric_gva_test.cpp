@@ -7,6 +7,7 @@ class FakeHybm : public MemFabricGvaBackend {
    public:
     int creates = 0, frees = 0, imports = 0, unmaps = 0, slice_imports = 0;
     int slice_exports = 0;
+    int fail_slice_export_at = 0;
     int initializes = 0, binds = 0, entity_exports = 0;
     bool fail_bind = false;
     bool fail_slice_export = false, empty_slice_export = false;
@@ -75,7 +76,8 @@ class FakeHybm : public MemFabricGvaBackend {
         if (!p && fail_entity_export) return -1;
         if (p) {
             ++slice_exports;
-            if (fail_slice_export) return -1;
+            if (fail_slice_export || slice_exports == fail_slice_export_at)
+                return -1;
             if (empty_slice_export) return 0;
         }
         auto a = reinterpret_cast<uint64_t>(p);
@@ -135,6 +137,62 @@ TEST(MemFabricGva, MissingApiRejectsAllocation) {
     void* p = nullptr;
     EXPECT_FALSE(m.allocate(&p, M, 1, 0).ok());
     EXPECT_EQ(p, nullptr);
+}
+TEST(MemFabricGva, BatchPublishBindsOnceAndPublishesEveryPool) {
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
+    void* first = nullptr;
+    void* second = nullptr;
+    ASSERT_TRUE(memory.allocate(&first, M / 2, 1, 0).ok());
+    ASSERT_TRUE(memory.allocate(&second, M / 2, 1, 0).ok());
+    const auto binds = api->binds;
+    std::vector<std::string> descriptors;
+    ASSERT_TRUE(
+        memory.publish({{first, M / 2}, {second, M / 2}}, descriptors).ok());
+    ASSERT_EQ(descriptors.size(), 2u);
+    EXPECT_EQ(api->binds, binds + 1);
+    EXPECT_EQ(api->slice_exports, 2);
+    EXPECT_EQ(nlohmann::json::parse(descriptors[0]).at("address"),
+              reinterpret_cast<uint64_t>(first));
+    EXPECT_EQ(nlohmann::json::parse(descriptors[1]).at("address"),
+              reinterpret_cast<uint64_t>(second));
+    EXPECT_FALSE(memory.free(first, M / 2).ok());
+    EXPECT_FALSE(memory.free(second, M / 2).ok());
+    ASSERT_TRUE(memory.unpublish(first).ok());
+    ASSERT_TRUE(memory.unpublish(second).ok());
+    EXPECT_TRUE(memory.free(first, M / 2).ok());
+    EXPECT_TRUE(memory.free(second, M / 2).ok());
+}
+TEST(MemFabricGva, BatchPublishValidatesAllRangesBeforeExporting) {
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
+    void* first = nullptr;
+    ASSERT_TRUE(memory.allocate(&first, M, 1, 0).ok());
+    std::vector<std::string> descriptors{"unchanged"};
+    EXPECT_FALSE(
+        memory.publish({{first, M}, {first, M / 2}}, descriptors).ok());
+    EXPECT_EQ(descriptors, std::vector<std::string>{"unchanged"});
+    EXPECT_EQ(api->slice_exports, 0);
+    EXPECT_TRUE(memory.free(first, M).ok());
+}
+TEST(MemFabricGva, BatchPublishExportFailureDoesNotPublishEarlierPool) {
+    auto api = std::make_shared<FakeHybm>();
+    MemFabricSharedMemory memory(config(), "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
+    void* first = nullptr;
+    void* second = nullptr;
+    ASSERT_TRUE(memory.allocate(&first, M / 2, 1, 0).ok());
+    ASSERT_TRUE(memory.allocate(&second, M / 2, 1, 0).ok());
+    api->fail_slice_export_at = 2;
+    std::vector<std::string> descriptors{"unchanged"};
+    EXPECT_FALSE(
+        memory.publish({{first, M / 2}, {second, M / 2}}, descriptors).ok());
+    EXPECT_EQ(api->slice_exports, 2);
+    EXPECT_EQ(descriptors, std::vector<std::string>{"unchanged"});
+    EXPECT_TRUE(memory.free(first, M / 2).ok());
+    EXPECT_TRUE(memory.free(second, M / 2).ok());
 }
 TEST(MemFabricGva, ExplicitlyDisabledDramAllowsHbmOnlyContext) {
     auto api = std::make_shared<FakeHybm>();

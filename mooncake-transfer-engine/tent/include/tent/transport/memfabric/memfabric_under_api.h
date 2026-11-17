@@ -146,7 +146,6 @@ class MemFabricUnderApi {
 // HYBM GVA API: libmf_hybm_core.so.
 struct MemFabricGvaConfig {
     bool enabled = false;
-    bool explicit_copy = false;
     std::string group;
     std::string protocol = "device_sdma";
     uint32_t rank_count = 0, rank = 0;
