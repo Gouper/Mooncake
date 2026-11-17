@@ -12,48 +12,9 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/memfabric/memfabric_library.h"
 namespace mooncake {
 namespace tent {
-struct MemFabricGvaConfig {
-    bool enabled = false;
-    bool explicit_copy = false;
-    std::string group;
-    std::string protocol = "device_sdma", trans_url;
-    uint32_t rank_count = 0, rank = 0;
-    uint16_t device = 0, entity = 64;
-    uint64_t hbm_window = 0, dram_window = 0, hbm_size = 0, dram_size = 0;
-};
-// This adapter uses official HYBM headers in its implementation. No native ABI
-// structures or implementation-dependent handles appear in wire metadata.
-class MemFabricGvaApi {
-   public:
-    virtual ~MemFabricGvaApi() = default;
-    static std::shared_ptr<MemFabricGvaApi> load();
-    virtual bool supportsCopy() const { return true; }
-    virtual int copy(void*, uint64_t, uint64_t, size_t, uint32_t) { return -1; }
-    virtual int wait(void*) { return -1; }
-    virtual int bind(uint16_t) = 0;
-    virtual int initialize(uint16_t) = 0;
-    virtual void uninitialize() = 0;
-    virtual void* create(const MemFabricGvaConfig&) = 0;
-    virtual void destroy(void*) = 0;
-    virtual int reserve(void*) = 0;
-    virtual int unreserve(void*) = 0;
-    virtual void* allocate(void*, uint32_t, uint64_t) = 0;
-    virtual int free(void*, void*) = 0;
-    virtual uint64_t address(void*, void*) = 0;
-    virtual uint64_t size(void*, void*) = 0;
-    virtual uint64_t base(void*, uint32_t) { return 0; }
-    virtual int translate(uint64_t, uint32_t, uint64_t&) = 0;
-    virtual int exportBlob(void*, void*, std::vector<uint8_t>&) = 0;
-    virtual int importBlob(void*, bool, const std::vector<uint8_t>&) = 0;
-    virtual int map(void*) = 0;
-    virtual bool supportsConnect() const { return false; }
-    virtual int connect(void*, uint32_t) { return -1; }
-    virtual int reach(void*, uint32_t, uint32_t&) = 0;
-    virtual int remove(void*, uint32_t) = 0;
-    virtual int unmap(void*, uint32_t) = 0;
-};
 class MemFabricSharedMemory {
    public:
     MemFabricSharedMemory(MemFabricGvaConfig config, std::string owner,
