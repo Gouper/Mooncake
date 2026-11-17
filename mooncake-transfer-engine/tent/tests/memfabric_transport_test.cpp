@@ -386,9 +386,11 @@ class CopyTestHybm : public MemFabricGvaBackend {
     std::condition_variable cv;
     bool blocked = false, entered = false;
     int result = 0, waits = 0, wait_result = 0;
+    int single_copy_calls = 0;
+    std::vector<size_t> batch_sizes;
     std::vector<std::array<uint64_t, 4>> copies;
     std::map<uint64_t, uint64_t> pools;
-    uint32_t rank = 0;
+    uint32_t rank = 0, rank_count = 0;
     std::array<uint64_t, 2> windows{{kSize, kSize}}, cursors{{0, 0}};
     std::set<uint64_t> imported;
     int initialize(uint16_t) override { return 0; }
@@ -399,6 +401,7 @@ class CopyTestHybm : public MemFabricGvaBackend {
     int bind(uint16_t) override { return 0; }
     void* create(const MemFabricGvaConfig& c) override {
         rank = c.rank;
+        rank_count = c.rank_count;
         windows = {{c.hbm_window, c.dram_window}};
         cursors = {{0, 0}};
         network_protocol = c.protocol == "device_rdma"
@@ -467,9 +470,20 @@ class CopyTestHybm : public MemFabricGvaBackend {
     int remove(void*, uint32_t) override { return 0; }
     int unmap(void*, uint32_t peer) override {
         for (auto it = pools.begin(); it != pools.end();) {
+            bool matches = false;
             if (imported.count(it->first))
+                for (uint32_t type : {1u, 2u}) {
+                    const auto start = base(nullptr, type);
+                    const auto window = windows[type - 1];
+                    if (window && it->first >= start &&
+                        it->first - start < window * rank_count &&
+                        (it->first - start) / window == peer)
+                        matches = true;
+                }
+            if (matches) {
+                imported.erase(it->first);
                 it = pools.erase(it);
-            else
+            } else
                 ++it;
         }
         return 0;
@@ -477,10 +491,26 @@ class CopyTestHybm : public MemFabricGvaBackend {
     int copy(void*, uint64_t src, uint64_t dst, size_t size,
              uint32_t direction) override {
         std::unique_lock<std::mutex> lock(mutex);
+        ++single_copy_calls;
         copies.push_back({src, dst, size, direction});
         entered = true;
         cv.notify_all();
         cv.wait(lock, [&] { return !blocked; });
+        return result;
+    }
+    bool batch_available = true, throw_batch = false;
+    bool supportsBatchCopy() const override { return batch_available; }
+    int batchCopy(void*, const std::vector<MemFabricGvaCopy>& requests,
+                  uint32_t direction) override {
+        std::unique_lock<std::mutex> lock(mutex);
+        batch_sizes.push_back(requests.size());
+        for (const auto& request : requests)
+            copies.push_back(
+                {request.source, request.destination, request.size, direction});
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return !blocked; });
+        if (throw_batch) throw std::runtime_error("native batch exception");
         return result;
     }
     int wait(void*) override {
@@ -645,12 +675,13 @@ class MemFabricTransportTest : public ::testing::Test {
     }
 
     Status PrepareGvaCopy(size_t capacity = 256,
-                          const char* protocol = "device_sdma") {
+                          const char* protocol = "device_sdma",
+                          uint32_t remote_type = 2, uint32_t ranks = 2) {
         MemFabricGvaConfig config;
         config.enabled = true;
         config.group = "copy-test";
         config.protocol = protocol;
-        config.rank_count = 2;
+        config.rank_count = ranks;
         config.entity = 64;
         config.hbm_size = config.dram_size = config.hbm_window =
             config.dram_window = CopyTestHybm::kSize;
@@ -692,8 +723,8 @@ class MemFabricTransportTest : public ::testing::Test {
         peer_memory_ = std::make_shared<MemFabricSharedMemory>(
             config, peer_name_, std::make_shared<CopyTestHybm>());
         CHECK_STATUS(peer_memory_->initialize());
-        CHECK_STATUS(
-            peer_memory_->allocate(&copy_dram_, CopyTestHybm::kSize, 2, 0));
+        CHECK_STATUS(peer_memory_->allocate(&copy_dram_, CopyTestHybm::kSize,
+                                            remote_type, 0));
         BufferDesc remote{};
         remote.addr = reinterpret_cast<uint64_t>(copy_dram_);
         remote.length = CopyTestHybm::kSize;
@@ -711,6 +742,36 @@ class MemFabricTransportTest : public ::testing::Test {
             metadata_->segmentManager().openRemote(copy_peer_, peer_name_));
         return transport_->mapRemoteMemory(copy_peer_, copy_dram_,
                                            remote.length);
+    }
+    Status PrepareAdditionalGvaPeer(
+        SegmentID& id, void*& pointer,
+        std::shared_ptr<ControlService>& metadata,
+        std::shared_ptr<MemFabricSharedMemory>& memory) {
+        metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        CHECK_STATUS(metadata->start(port));
+        const auto name = "127.0.0.1:" + std::to_string(port);
+        auto config = transport_->gva_config_;
+        config.rank = 2;
+        memory = std::make_shared<MemFabricSharedMemory>(
+            config, name, std::make_shared<CopyTestHybm>());
+        CHECK_STATUS(memory->initialize());
+        CHECK_STATUS(memory->allocate(&pointer, CopyTestHybm::kSize, 2, 0));
+        BufferDesc buffer{};
+        buffer.addr = reinterpret_cast<uint64_t>(pointer);
+        buffer.length = CopyTestHybm::kSize;
+        buffer.transports = {MEMFABRIC};
+        CHECK_STATUS(memory->publish(pointer, buffer.length,
+                                     buffer.transport_attrs[MEMFABRIC]));
+        CHECK_STATUS(
+            metadata->segmentManager().updateLocal([&](SegmentDesc& segment) {
+                segment.name = name;
+                segment.rpc_server_addr = name;
+                std::get<MemorySegmentDesc>(segment.detail).buffers = {buffer};
+                return Status::OK();
+            }));
+        CHECK_STATUS(metadata_->segmentManager().openRemote(id, name));
+        return transport_->mapRemoteMemory(id, pointer, CopyTestHybm::kSize);
     }
     Request GvaWrite(void* source, uint64_t target, size_t size) {
         auto request = MakeWrite(source, target, size);
@@ -2340,6 +2401,226 @@ TEST_F(MemFabricTransportTest,
     ASSERT_TRUE(transport_->freeLocalMemory(second, CopyTestHybm::kSize).ok());
     EXPECT_EQ(state_->register_mem_calls, 0);
     EXPECT_EQ(state_->init_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest, GvaMultipleRequestsUseOneRealNativeBatch) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    std::vector<Request> requests;
+    for (uint64_t offset : {0u, 64u, 128u})
+        requests.push_back(GvaWrite(
+            reinterpret_cast<void*>(reinterpret_cast<uint64_t>(copy_hbm_) +
+                                    offset),
+            reinterpret_cast<uint64_t>(copy_dram_) + offset, 32));
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, requests).ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, std::vector<size_t>{3});
+    EXPECT_EQ(copy_api_->single_copy_calls, 0);
+    ASSERT_EQ(copy_api_->copies.size(), 3u);
+    for (int index = 0; index < 3; ++index) {
+        TransferStatus status{};
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, index, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, 32u);
+    }
+}
+
+TEST_F(MemFabricTransportTest, GvaSingleRequestIsNativeBatchOfOne) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_, {GvaWrite(copy_hbm_,
+                                  reinterpret_cast<uint64_t>(copy_dram_), 32)})
+            .ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, std::vector<size_t>{1});
+    EXPECT_EQ(copy_api_->single_copy_calls, 0);
+}
+TEST_F(MemFabricTransportTest,
+       GvaSameDirectionReadWriteGroupsPreserveOpcodeOrder) {
+    ASSERT_TRUE(PrepareGvaCopy(256, "device_sdma", 1).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 5).ok());
+    std::vector<Request> requests;
+    for (size_t index = 0; index < 5; ++index) {
+        auto* local = reinterpret_cast<void*>(
+            reinterpret_cast<uint64_t>(copy_hbm_) + index * 64);
+        const auto remote = reinterpret_cast<uint64_t>(copy_dram_) + index * 64;
+        requests.push_back(index == 2 || index == 3
+                               ? GvaRead(local, remote, 32)
+                               : GvaWrite(local, remote, 32));
+    }
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, requests).ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, (std::vector<size_t>{2, 2, 1}));
+    EXPECT_EQ(copy_api_->single_copy_calls, 0);
+    ASSERT_EQ(copy_api_->copies.size(), requests.size());
+    for (size_t index = 0; index < requests.size(); ++index) {
+        EXPECT_EQ(copy_api_->copies[index][3], 9u);
+        EXPECT_EQ(copy_api_->copies[index][0],
+                  index == 2 || index == 3
+                      ? requests[index].target_offset
+                      : reinterpret_cast<uint64_t>(requests[index].source));
+    }
+}
+TEST_F(MemFabricTransportTest,
+       GvaDirectionGroupsAreConsecutiveAndNotReordered) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    const auto remote = reinterpret_cast<uint64_t>(copy_dram_);
+    ASSERT_TRUE(transport_
+                    ->submitTransferTasks(
+                        batch_, {GvaWrite(copy_hbm_, remote, 32),
+                                 GvaWrite(local_dram_, remote + 64, 32),
+                                 GvaWrite(copy_hbm_, remote + 128, 32)})
+                    .ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, (std::vector<size_t>{1, 1, 1}));
+    ASSERT_EQ(copy_api_->copies.size(), 3u);
+    EXPECT_EQ(copy_api_->copies[0][3], 8u);
+    EXPECT_EQ(copy_api_->copies[1][3], 4u);
+    EXPECT_EQ(copy_api_->copies[2][3], 8u);
+}
+TEST_F(MemFabricTransportTest, GvaOverlappingDestinationsSplitNativeBatches) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    const auto local = reinterpret_cast<uint64_t>(copy_hbm_);
+    const auto remote = reinterpret_cast<uint64_t>(copy_dram_);
+    ASSERT_TRUE(transport_
+                    ->submitTransferTasks(
+                        batch_, {GvaWrite(copy_hbm_, remote, 64),
+                                 GvaWrite(reinterpret_cast<void*>(local + 128),
+                                          remote + 32, 64),
+                                 GvaWrite(reinterpret_cast<void*>(local + 256),
+                                          remote + 256, 64)})
+                    .ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, (std::vector<size_t>{1, 2}));
+    EXPECT_EQ(copy_api_->single_copy_calls, 0);
+}
+TEST_F(MemFabricTransportTest,
+       GvaSameDirectionAcrossPeersDoesNotMergeOrReorder) {
+    ASSERT_TRUE(PrepareGvaCopy(256, "device_sdma", 2, 3).ok());
+    SegmentID extra;
+    void* pointer = nullptr;
+    std::shared_ptr<ControlService> metadata;
+    std::shared_ptr<MemFabricSharedMemory> memory;
+    ASSERT_TRUE(
+        PrepareAdditionalGvaPeer(extra, pointer, metadata, memory).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    auto middle = GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(pointer), 32);
+    middle.target_id = extra;
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_,
+                {GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(copy_dram_),
+                          32),
+                 middle,
+                 GvaWrite(copy_hbm_,
+                          reinterpret_cast<uint64_t>(copy_dram_) + 64, 32)})
+            .ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, (std::vector<size_t>{1, 1, 1}));
+    ASSERT_EQ(copy_api_->copies.size(), 3u);
+    EXPECT_EQ(copy_api_->copies[1][1], reinterpret_cast<uint64_t>(pointer));
+    ASSERT_TRUE(transport_->unmapRemoteMemory(extra, pointer).ok());
+    ASSERT_TRUE(memory->unpublish(pointer).ok());
+    ASSERT_TRUE(memory->free(pointer, CopyTestHybm::kSize).ok());
+    ASSERT_TRUE(memory->close().ok());
+}
+TEST_F(MemFabricTransportTest,
+       GvaNativeBatchFailureMarksEveryTaskFailedAndReleasesSdmaPins) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    copy_api_->result = -19;
+    const auto local = reinterpret_cast<uint64_t>(copy_hbm_);
+    const auto remote = reinterpret_cast<uint64_t>(copy_dram_);
+    ASSERT_TRUE(transport_
+                    ->submitTransferTasks(
+                        batch_, {GvaWrite(copy_hbm_, remote, 32),
+                                 GvaWrite(reinterpret_cast<void*>(local + 64),
+                                          remote + 64, 32)})
+                    .ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, std::vector<size_t>{2});
+    EXPECT_EQ(copy_api_->waits, 1);
+    for (int index = 0; index < 2; ++index) {
+        TransferStatus status{};
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, index, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+        EXPECT_EQ(status.transferred_bytes, 0u);
+    }
+    BufferDesc buffer{};
+    buffer.addr = reinterpret_cast<uint64_t>(copy_hbm_);
+    buffer.length = CopyTestHybm::kSize;
+    EXPECT_TRUE(transport_->removeMemoryBuffer(buffer).ok());
+}
+TEST_F(MemFabricTransportTest,
+       MissingGvaNativeBatchSymbolRejectsWithoutPublishingTasksOrPins) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    copy_api_->batch_available = false;
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    EXPECT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_, {GvaWrite(copy_hbm_,
+                                  reinterpret_cast<uint64_t>(copy_dram_), 32)})
+            .IsNotImplemented());
+    EXPECT_EQ(batch_->size(), 0u);
+    EXPECT_TRUE(copy_api_->copies.empty());
+    EXPECT_EQ(copy_api_->single_copy_calls, 0);
+    EXPECT_TRUE(transport_->freeSubBatch(batch_).ok());
+}
+TEST_F(MemFabricTransportTest, EmptyGvaSubmissionDoesNotCallNative) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    EXPECT_TRUE(transport_->submitTransferTasks(batch_, {}).ok());
+    EXPECT_EQ(batch_->size(), 0u);
+    EXPECT_TRUE(copy_api_->batch_sizes.empty());
+}
+
+TEST_F(MemFabricTransportTest,
+       InvalidLaterGvaRequestRollsBackEveryPreparedPin) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char ordinary[32]{};
+    const auto remote = reinterpret_cast<uint64_t>(copy_dram_);
+    EXPECT_FALSE(
+        transport_
+            ->submitTransferTasks(batch_, {GvaWrite(copy_hbm_, remote, 32),
+                                           GvaWrite(ordinary, remote + 64, 32)})
+            .ok());
+    EXPECT_EQ(batch_->size(), 0u);
+    EXPECT_TRUE(copy_api_->batch_sizes.empty());
+    BufferDesc buffer{};
+    buffer.addr = reinterpret_cast<uint64_t>(copy_hbm_);
+    buffer.length = CopyTestHybm::kSize;
+    EXPECT_TRUE(transport_->removeMemoryBuffer(buffer).ok());
+}
+TEST_F(MemFabricTransportTest,
+       ThrowingGvaBatchFailsWholeGroupAndRetainsUnknownResources) {
+    ASSERT_TRUE(PrepareGvaCopy().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    copy_api_->throw_batch = true;
+    const auto local = reinterpret_cast<uint64_t>(copy_hbm_);
+    const auto remote = reinterpret_cast<uint64_t>(copy_dram_);
+    ASSERT_TRUE(transport_
+                    ->submitTransferTasks(
+                        batch_, {GvaWrite(copy_hbm_, remote, 32),
+                                 GvaWrite(reinterpret_cast<void*>(local + 64),
+                                          remote + 64, 32)})
+                    .ok());
+    ASSERT_TRUE(WaitCopiesWithoutPolling());
+    EXPECT_EQ(copy_api_->batch_sizes, std::vector<size_t>{2});
+    for (int index = 0; index < 2; ++index) {
+        TransferStatus status{};
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, index, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    }
+    EXPECT_FALSE(
+        transport_->freeLocalMemory(copy_hbm_, CopyTestHybm::kSize).ok());
 }
 
 }  // namespace tent

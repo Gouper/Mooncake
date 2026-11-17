@@ -12,7 +12,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/thirdparty/nlohmann/json.h"
-#include "tent/transport/memfabric/memfabric_library.h"
+#include "tent/transport/memfabric/memfabric_under_api.h"
 namespace mooncake {
 namespace tent {
 // Optional backend injection for deterministic CPU tests. Production calls the
@@ -22,6 +22,11 @@ class MemFabricGvaBackend {
     virtual ~MemFabricGvaBackend() = default;
     virtual bool supportsCopy() const { return true; }
     virtual int copy(void*, uint64_t, uint64_t, size_t, uint32_t) { return -1; }
+    virtual bool supportsBatchCopy() const { return false; }
+    virtual int batchCopy(void*, const std::vector<MemFabricGvaCopy>&,
+                          uint32_t) {
+        return -1;
+    }
     virtual int wait(void*) { return -1; }
     virtual int bind(uint16_t) = 0;
     virtual int initialize(uint16_t) = 0;
@@ -64,6 +69,15 @@ class MemFabricGvaCalls {
                                          direction)
                         : MemFabricGvaApi::copy(entity, source, destination,
                                                 size, direction);
+    }
+    bool supportsBatchCopy() const {
+        return backend_ ? backend_->supportsBatchCopy()
+                        : MemFabricGvaApi::supportsBatchCopy();
+    }
+    int batchCopy(void* entity, const std::vector<MemFabricGvaCopy>& copies,
+                  uint32_t direction) const {
+        return backend_ ? backend_->batchCopy(entity, copies, direction)
+                        : MemFabricGvaApi::batchCopy(entity, copies, direction);
     }
     int wait(void* entity) const {
         return backend_ ? backend_->wait(entity)
@@ -193,8 +207,12 @@ class MemFabricSharedMemory {
                      uint32_t& direction);
     Status runCopy(uint64_t source, uint64_t destination, size_t size,
                    uint32_t direction);
-    void cancelCopy();
-    void failCopy();
+    bool supportsBatchCopy() const { return api_ && api_->supportsBatchCopy(); }
+    // Each member has already been pinned by beginCopy; settles all those pins.
+    Status runBatchCopy(const std::vector<MemFabricGvaCopy>&,
+                        uint32_t direction);
+    void cancelCopy(size_t count = 1);
+    void failCopy(size_t count = 1);
     Status close();
 
    private:

@@ -240,11 +240,9 @@ struct MemoryOptions {
     std::string shm_path = "";
     size_t shm_offset = 0;
     bool internal = false;
-    // Nonzero requests allocation at this exact global address. For MemFabric
-    // this is a logical GVA token, distinct from the local device VA.
-    // CUDA VMM allocations use the same global and device address.
-    // Participants choose a common global layout. Zero lets the backend choose
-    // the global address. MemFabric device pointers remain local to each rank.
+    // Nonzero requests a CUDA VMM allocation at this exact global VA.
+    // Participants choose a common layout and map each published region at
+    // its owner's address. Zero lets the backend choose the local VA.
     uint64_t global_address = 0;
 };
 

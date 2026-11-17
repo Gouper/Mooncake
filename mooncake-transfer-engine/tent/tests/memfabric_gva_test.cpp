@@ -617,6 +617,17 @@ class NetworkHybm : public FakeHybm {
         ++copy_calls;
         return copy_result;
     }
+    bool batch_available = true, throw_batch = false;
+    std::vector<size_t> batch_sizes;
+    std::vector<uint32_t> batch_directions;
+    bool supportsBatchCopy() const override { return batch_available; }
+    int batchCopy(void*, const std::vector<MemFabricGvaCopy>& copies,
+                  uint32_t direction) override {
+        batch_sizes.push_back(copies.size());
+        batch_directions.push_back(direction);
+        if (throw_batch) throw std::runtime_error("batch call exception");
+        return copy_result;
+    }
     int wait(void*) override {
         ++wait_calls;
         return 0;
@@ -768,6 +779,69 @@ TEST_P(MemFabricNetworkGva,
                               reinterpret_cast<uint64_t>(source), M, direction)
                     .ok());
     EXPECT_EQ(local_api->copy_calls, 2);
+}
+
+TEST_P(MemFabricNetworkGva,
+       NativeBatchSettlesAllPinsWithOneBindingAndNativeCall) {
+    ASSERT_TRUE(prepare().ok());
+    std::vector<MemFabricGvaCopy> copies;
+    uint32_t direction = 0;
+    for (uint64_t offset : {0u, 64u, 128u}) {
+        const auto src = reinterpret_cast<uint64_t>(source) + offset;
+        const auto dst = reinterpret_cast<uint64_t>(target) + offset;
+        ASSERT_TRUE(local->beginCopy(src, dst, 32, direction).ok());
+        copies.push_back({src, dst, 32});
+    }
+    EXPECT_FALSE(local->unpublish(source).ok());
+    EXPECT_FALSE(
+        local->unmap("remote", reinterpret_cast<uint64_t>(target)).ok());
+    const auto binds = local_api->binds;
+    ASSERT_TRUE(local->runBatchCopy(copies, direction).ok());
+    EXPECT_EQ(local_api->binds, binds + 1);
+    EXPECT_EQ(local_api->batch_sizes, std::vector<size_t>{3});
+    EXPECT_EQ(local_api->copy_calls, 0);
+    EXPECT_TRUE(local->unpublish(source).ok());
+    EXPECT_TRUE(
+        local->unmap("remote", reinterpret_cast<uint64_t>(target)).ok());
+}
+TEST_P(MemFabricNetworkGva,
+       MissingBatchSymbolRejectsWithoutSingleCopyFallback) {
+    ASSERT_TRUE(prepare().ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(begin(direction).ok());
+    local_api->batch_available = false;
+    EXPECT_TRUE(local
+                    ->runBatchCopy({{reinterpret_cast<uint64_t>(source),
+                                     reinterpret_cast<uint64_t>(target), 64}},
+                                   direction)
+                    .IsNotImplemented());
+    EXPECT_TRUE(local_api->batch_sizes.empty());
+    EXPECT_EQ(local_api->copy_calls, 0);
+    EXPECT_TRUE(local->unpublish(source).ok());
+}
+TEST_P(MemFabricNetworkGva,
+       FailedNetworkBatchQuarantinesEveryMemberAndSkipsLaterBatch) {
+    ASSERT_TRUE(prepare().ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(begin(direction).ok());
+    ASSERT_TRUE(begin(direction).ok());
+    ASSERT_TRUE(begin(direction).ok());
+    const MemFabricGvaCopy copy{reinterpret_cast<uint64_t>(source),
+                                reinterpret_cast<uint64_t>(target), 64};
+    local_api->copy_result = -17;
+    EXPECT_FALSE(local->runBatchCopy({copy, copy}, direction).ok());
+    EXPECT_EQ(local_api->wait_calls, 0);
+    EXPECT_FALSE(local->unpublish(source).ok());
+    EXPECT_FALSE(
+        local->unmap("remote", reinterpret_cast<uint64_t>(target)).ok());
+    EXPECT_FALSE(local->runBatchCopy({copy}, direction).ok());
+    EXPECT_EQ(local_api->batch_sizes, std::vector<size_t>{2});
+}
+TEST_P(MemFabricNetworkGva, EmptyNativeBatchDoesNotBindOrCallNative) {
+    const auto binds = local_api->binds;
+    EXPECT_TRUE(local->runBatchCopy({}, 9).ok());
+    EXPECT_EQ(local_api->binds, binds);
+    EXPECT_TRUE(local_api->batch_sizes.empty());
 }
 INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
                          ::testing::Values("device_rdma", "device_urma"));
@@ -1141,4 +1215,45 @@ TEST(MemFabricGva, LaterOffsetRemapsAfterPreviousAllocationRankCleanup) {
     ASSERT_TRUE(
         p.local.resolve(reinterpret_cast<uint64_t>(second), M, &resolved).ok());
     EXPECT_EQ(resolved, second);
+}
+
+TEST(MemFabricGva, FailedSdmaBatchDrainsOnceAndReleasesAllRequestPins) {
+    auto c = config();
+    c.hbm_window = c.hbm_size = 4 * M;
+    auto api = std::make_shared<NetworkHybm>();
+    MemFabricSharedMemory memory(c, "owner", api);
+    ASSERT_TRUE(memory.initialize().ok());
+    void *source = nullptr, *destination = nullptr;
+    ASSERT_TRUE(memory.allocate(&source, M, 1, 0).ok());
+    ASSERT_TRUE(memory.allocate(&destination, M, 1, 0).ok());
+    std::string descriptor;
+    ASSERT_TRUE(memory.publish(source, M, descriptor).ok());
+    ASSERT_TRUE(memory.publish(destination, M, descriptor).ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(memory
+                    .beginCopy(reinterpret_cast<uint64_t>(source),
+                               reinterpret_cast<uint64_t>(destination), 64,
+                               direction)
+                    .ok());
+    ASSERT_TRUE(memory
+                    .beginCopy(reinterpret_cast<uint64_t>(source) + 64,
+                               reinterpret_cast<uint64_t>(destination) + 64, 64,
+                               direction)
+                    .ok());
+    api->copy_result = -23;
+    EXPECT_FALSE(
+        memory
+            .runBatchCopy({{reinterpret_cast<uint64_t>(source),
+                            reinterpret_cast<uint64_t>(destination), 64},
+                           {reinterpret_cast<uint64_t>(source) + 64,
+                            reinterpret_cast<uint64_t>(destination) + 64, 64}},
+                          direction)
+            .ok());
+    EXPECT_EQ(api->wait_calls, 1);
+    EXPECT_EQ(api->batch_sizes, std::vector<size_t>{2});
+    EXPECT_EQ(api->copy_calls, 0);
+    ASSERT_TRUE(memory.unpublish(source).ok());
+    ASSERT_TRUE(memory.unpublish(destination).ok());
+    ASSERT_TRUE(memory.free(source, M).ok());
+    ASSERT_TRUE(memory.free(destination, M).ok());
 }

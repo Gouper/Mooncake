@@ -77,35 +77,50 @@ void* offset(void* p, size_t n) {
     return reinterpret_cast<void*>(reinterpret_cast<uint64_t>(p) + n);
 }
 void transfer(TransferEngine& engine, int rank, SegmentID peer,
-              Request::OpCode op, void* local, uint64_t remote, size_t size,
-              unsigned timeout) {
-    const auto batch = engine.allocateBatch(1);
-    Request request{};
-    request.opcode = op;
-    request.source = local;
-    request.target_id = peer;
-    request.target_offset = remote;
-    request.length = size;
-    request.transport_hint = MEMFABRIC;
-    check(engine.submitTransfer(batch, {request}), "submitTransfer");
-    const auto deadline = Clock::now() + std::chrono::seconds(timeout);
-    TransferStatus status{};
-    for (;;) {
-        check(engine.getTransferStatus(batch, 0, status), "getTransferStatus");
-        if (status.s == COMPLETED) break;
-        if (status.s != INITIAL && status.s != PENDING)
-            throw std::runtime_error("transfer terminal status=" +
-                                     std::to_string(status.s));
-        if (Clock::now() >= deadline)
-            throw std::runtime_error("transfer timeout");
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+              Request::OpCode op, const std::vector<void*>& local,
+              const std::vector<uint64_t>& remote, size_t local_offset,
+              size_t remote_offset, size_t size, unsigned timeout) {
+    // Submit all allocations together, with two disjoint pieces per allocation.
+    // Request merging can coalesce adjacent pieces; use two allocations to
+    // retain multiple native entries in the hardware batch.
+    std::vector<Request> requests;
+    for (size_t i = 0; i < local.size(); ++i) {
+        for (size_t piece = 0; piece < 2; ++piece) {
+            Request request{};
+            request.opcode = op;
+            request.source =
+                offset(local[i], local_offset + piece * (size / 2));
+            request.target_id = peer;
+            request.target_offset =
+                remote[i] + remote_offset + piece * (size / 2);
+            request.length = size / 2;
+            request.transport_hint = MEMFABRIC;
+            requests.push_back(request);
+        }
     }
-    if (status.transferred_bytes != size)
-        throw std::runtime_error("incorrect completed bytes");
+    const auto batch = engine.allocateBatch(requests.size());
+    check(engine.submitTransfer(batch, requests), "submitTransfer");
+    const auto deadline = Clock::now() + std::chrono::seconds(timeout);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        TransferStatus status{};
+        for (;;) {
+            check(engine.getTransferStatus(batch, i, status),
+                  "getTransferStatus");
+            if (status.s == COMPLETED) break;
+            if (status.s != INITIAL && status.s != PENDING)
+                throw std::runtime_error("transfer terminal status=" +
+                                         std::to_string(status.s));
+            if (Clock::now() >= deadline)
+                throw std::runtime_error("transfer timeout");
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (status.transferred_bytes != requests[i].length)
+            throw std::runtime_error("incorrect completed bytes");
+    }
     std::cerr << "rank=" << rank
               << " op=" << (op == Request::WRITE ? "WRITE" : "READ")
-              << " status=COMPLETED bytes=" << status.transferred_bytes
-              << std::endl;
+              << " status=COMPLETED batch_requests=" << requests.size()
+              << " bytes=" << size * local.size() << std::endl;
     check(engine.freeBatch(batch), "freeBatch");
 }
 void child(const Options& o, int rank, int fd) {
@@ -216,9 +231,8 @@ void child(const Options& o, int rank, int fd) {
             }
         }
         barrier(fd, "mapped-and-ready");
-        for (size_t index = 0; index < pools.size(); ++index)
-            transfer(*engine, rank, peer, Request::WRITE, pools[index],
-                     peer_gvas[index] + payload_size, payload_size, o.timeout);
+        transfer(*engine, rank, peer, Request::WRITE, pools, peer_gvas, 0,
+                 payload_size, payload_size, o.timeout);
         barrier(fd, "writes-completed");
         std::vector<unsigned char> actual(payload_size);
         for (size_t index = 0; index < pools.size(); ++index) {
@@ -234,10 +248,9 @@ void child(const Options& o, int rank, int fd) {
                       << " WRITE owner checksum=" << hash(actual) << std::endl;
         }
         barrier(fd, "write-bytes-verified");
+        transfer(*engine, rank, peer, Request::READ, pools, peer_gvas,
+                 2 * payload_size, payload_size, payload_size, o.timeout);
         for (size_t index = 0; index < pools.size(); ++index) {
-            transfer(*engine, rank, peer, Request::READ,
-                     offset(pools[index], 2 * payload_size),
-                     peer_gvas[index] + payload_size, payload_size, o.timeout);
             aclCheck(aclrtMemcpy(actual.data(), actual.size(),
                                  offset(pools[index], 2 * payload_size),
                                  payload_size, ACL_MEMCPY_DEVICE_TO_HOST),

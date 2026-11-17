@@ -6,6 +6,7 @@
 #include <cstring>
 #include <chrono>
 #include <limits>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <utility>
@@ -687,6 +688,10 @@ Status MemFabricTransport::submitGvaCopies(
     MemFabricSubBatch* batch, const std::vector<Request>& requests) {
     if (!installed_ || !gva_config_.enabled || !gva_)
         return Status::NotImplemented("GVA copy context unavailable");
+    if (requests.empty()) return Status::OK();
+    if (!gva_->supportsBatchCopy())
+        return Status::NotImplemented(
+            "HYBM native batch copy symbol unavailable");
     if (requests.size() > max_pending_copies_ - std::min(max_pending_copies_,
                                                          gva_pending_->load()))
         return Status::TooManyRequests("GVA copy queue is full");
@@ -773,44 +778,106 @@ Status MemFabricTransport::submitGvaCopies(
         }
         copies.push_back(copy);
     }
+    struct CopyGroup {
+        uint32_t direction;
+        SegmentID target;
+        Request::OpCode opcode;
+        std::vector<MemFabricGvaCopy> copies;
+        std::vector<std::shared_ptr<MemFabricCopyCompletion>> completions;
+    };
+    std::vector<std::shared_ptr<CopyGroup>> groups;
+    const auto original_task_count = batch->task_list.size();
+    const auto original_pending_count = batch->pending_batch_count;
     try {
+        // HYBM can reorder batches by rank pair and execute entries in
+        // parallel. Keep consecutive opcode/peer/direction groups, splitting
+        // dependencies so each native batch contains only mutually independent
+        // operations.
+        std::map<uint64_t, uint64_t> reads, writes;
+        auto overlaps = [](const auto& ranges, uint64_t base, size_t size) {
+            auto it = ranges.lower_bound(base);
+            if (it != ranges.end() && it->first < base + size) return true;
+            return it != ranges.begin() && std::prev(it)->second > base;
+        };
+        auto insert = [](auto& ranges, uint64_t base, size_t size) {
+            uint64_t end = base + size;
+            auto it = ranges.lower_bound(base);
+            if (it != ranges.begin() && std::prev(it)->second >= base) --it;
+            while (it != ranges.end() && it->first <= end) {
+                base = std::min(base, it->first);
+                end = std::max(end, it->second);
+                it = ranges.erase(it);
+            }
+            ranges.emplace(base, end);
+        };
+        groups.reserve(copies.size());
+        for (size_t index = 0; index < copies.size(); ++index) {
+            const auto& copy = copies[index];
+            const auto& request = requests[index];
+            if (groups.empty() || groups.back()->direction != copy.direction ||
+                groups.back()->target != request.target_id ||
+                groups.back()->opcode != request.opcode ||
+                groups.back()->copies.size() == UINT32_MAX ||
+                overlaps(writes, copy.source, copy.size) ||
+                overlaps(writes, copy.destination, copy.size) ||
+                overlaps(reads, copy.destination, copy.size)) {
+                auto group = std::make_shared<CopyGroup>();
+                group->direction = copy.direction;
+                group->target = request.target_id;
+                group->opcode = request.opcode;
+                groups.push_back(std::move(group));
+                reads.clear();
+                writes.clear();
+            }
+            groups.back()->copies.push_back(
+                {copy.source, copy.destination, copy.size});
+            groups.back()->completions.push_back(completions[index]);
+            insert(reads, copy.source, copy.size);
+            insert(writes, copy.destination, copy.size);
+        }
         if (!copy_pool_) copy_pool_ = std::make_unique<ThreadPool>(1);
         batch->task_list.reserve(batch->task_list.size() + requests.size());
+        for (size_t index = 0; index < copies.size(); ++index) {
+            MemFabricTask task;
+            task.request = requests[index];
+            task.length = requests[index].length;
+            task.gva_completion = completions[index];
+            batch->task_list.push_back(task);
+            ++batch->pending_batch_count;
+        }
     } catch (...) {
+        batch->task_list.resize(original_task_count);
+        batch->pending_batch_count = original_pending_count;
         rollback();
         return Status::InternalError("Cannot allocate GVA copy queue");
     }
-    for (size_t i = 0; i < copies.size(); ++i) {
-        auto completion = completions[i];
-        MemFabricTask task;
-        task.request = requests[i];
-        task.length = requests[i].length;
-        task.gva_completion = completion;
-        batch->task_list.push_back(task);
-        ++batch->pending_batch_count;
+    for (const auto& group : groups) {
         auto context = gva_;
         auto pending = gva_pending_;
-        auto copy = copies[i];
-        pending->fetch_add(1);
+        const auto count = group->copies.size();
+        pending->fetch_add(count);
         try {
-            copy_pool_->enqueue([context, pending, completion, copy] {
+            copy_pool_->enqueue([context, pending, group] {
                 auto outcome = TransferStatusEnum::FAILED;
                 try {
-                    auto status =
-                        context->runCopy(copy.source, copy.destination,
-                                         copy.size, copy.direction);
+                    const auto status =
+                        context->runBatchCopy(group->copies, group->direction);
                     if (status.ok()) outcome = TransferStatusEnum::COMPLETED;
                 } catch (...) {
-                    context->failCopy();
+                    context->failCopy(group->copies.size());
                 }
-                completion->status.store(outcome, std::memory_order_release);
-                pending->fetch_sub(1, std::memory_order_release);
+                for (const auto& completion : group->completions)
+                    completion->status.store(outcome,
+                                             std::memory_order_release);
+                pending->fetch_sub(group->copies.size(),
+                                   std::memory_order_release);
             });
         } catch (...) {
-            context->cancelCopy();
-            completion->status.store(TransferStatusEnum::FAILED,
-                                     std::memory_order_release);
-            pending->fetch_sub(1);
+            context->cancelCopy(count);
+            for (const auto& completion : group->completions)
+                completion->status.store(TransferStatusEnum::FAILED,
+                                         std::memory_order_release);
+            pending->fetch_sub(count);
         }
     }
     return Status::OK();

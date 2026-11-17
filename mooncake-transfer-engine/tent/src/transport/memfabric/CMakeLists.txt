@@ -1,8 +1,7 @@
 if(USE_MEMFABRIC)
   add_library(
     tent_xport_memfabric STATIC memfabric_transport.cpp memfabric_under_api.cpp
-                                memfabric_allocator.cpp memfabric_shared_memory.cpp
-                                memfabric_gva_api.cpp)
+                                memfabric_allocator.cpp memfabric_shared_memory.cpp)
   find_path(MEMFABRIC_HYBM_INCLUDE_DIR hybm_big_mem.h
             HINTS ENV MEMFABRIC_HOME PATH_SUFFIXES include include/host)
   if(MEMFABRIC_HYBM_INCLUDE_DIR)

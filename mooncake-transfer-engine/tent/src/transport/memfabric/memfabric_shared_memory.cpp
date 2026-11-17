@@ -38,9 +38,9 @@ MemFabricSharedMemory::MemFabricSharedMemory(MemFabricGvaConfig config,
                                              std::string owner)
     : MemFabricSharedMemory(std::move(config), std::move(owner),
                             MemFabricGvaCalls{}) {}
-MemFabricSharedMemory::MemFabricSharedMemory(
-    MemFabricGvaConfig config, std::string owner,
-    MemFabricGvaCalls api)
+MemFabricSharedMemory::MemFabricSharedMemory(MemFabricGvaConfig config,
+                                             std::string owner,
+                                             MemFabricGvaCalls api)
     : config_(std::move(config)),
       owner_(std::move(owner)),
       api_(std::move(api)) {
@@ -55,8 +55,7 @@ MemFabricSharedMemory::~MemFabricSharedMemory() {
     if (!close().ok()) {
         // Native functions and initialized state must outlive unreleased maps.
         // A failed teardown is deliberately quarantined for process lifetime.
-        static auto* retained =
-            new std::vector<MemFabricGvaCalls>;
+        static auto* retained = new std::vector<MemFabricGvaCalls>;
         static auto* lock = new std::mutex;
         std::lock_guard<std::mutex> guard(*lock);
         retained->push_back(std::move(api_));
@@ -741,14 +740,40 @@ Status MemFabricSharedMemory::runCopy(uint64_t source, uint64_t destination,
     if (!drained) copy_failed_ = true;
     return result == 0 ? Status::OK() : nativeError("synchronous copy", result);
 }
-void MemFabricSharedMemory::failCopy() {
+Status MemFabricSharedMemory::runBatchCopy(
+    const std::vector<MemFabricGvaCopy>& copies, uint32_t direction) {
+    if (copies.empty()) return Status::OK();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (copy_failed_) {
+            pending_copies_ -= std::min(pending_copies_, copies.size());
+            return pending("previous native copy completion remains unknown");
+        }
+    }
+    if (copies.size() > UINT32_MAX || !supportsBatchCopy()) {
+        cancelCopy(copies.size());
+        return Status::NotImplemented("HYBM batch copy capability unavailable");
+    }
+    const auto bound = api_->bind(config_.device);
+    const auto result =
+        bound ? bound : api_->batchCopy(entity_, copies, direction);
+    const bool drained =
+        bound || !result ||
+        (config_.protocol == "device_sdma" && api_->wait(entity_) == 0);
     std::lock_guard<std::mutex> lock(mutex_);
-    if (pending_copies_) --pending_copies_;
+    pending_copies_ -= std::min(pending_copies_, copies.size());
+    if (!drained) copy_failed_ = true;
+    return !result ? Status::OK()
+                   : nativeError("synchronous batch copy", result);
+}
+void MemFabricSharedMemory::failCopy(size_t count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_copies_ -= std::min(pending_copies_, count);
     copy_failed_ = true;
 }
-void MemFabricSharedMemory::cancelCopy() {
+void MemFabricSharedMemory::cancelCopy(size_t count) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (pending_copies_) --pending_copies_;
+    pending_copies_ -= std::min(pending_copies_, count);
 }
 Status MemFabricSharedMemory::close() {
     std::lock_guard<std::mutex> lock(mutex_);
