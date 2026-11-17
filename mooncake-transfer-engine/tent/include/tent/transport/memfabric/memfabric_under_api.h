@@ -109,7 +109,7 @@ class MemFabricUnderApi {
 
    private:
     // Keep allocation functions and their library alive with outstanding
-    // buffers.
+    // buffers. The native-handle alias owns the shared MemFabricLibrary loader.
     struct MemoryApi {
         std::shared_ptr<void> library;
         smemMemAllocFunc allocate = nullptr;

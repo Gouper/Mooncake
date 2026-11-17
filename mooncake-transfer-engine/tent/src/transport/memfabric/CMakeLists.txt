@@ -14,6 +14,7 @@ if(USE_MEMFABRIC)
         static_assert(BM_GVA_NOT_FOUND == -12);
         static_assert(sizeof(&hybm_gva_to_va) > 0);
         static_assert(sizeof(&hybm_get_slice_size) > 0);
+        static_assert(sizeof(&hybm_get_memory_ptr) > 0);
         static_assert(sizeof(&hybm_unmap_rank) > 0);
         static_assert(sizeof(&hybm_remove_imported) > 0);
         static_assert(sizeof(&hybm_entity_reach_types) > 0);

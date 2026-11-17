@@ -389,6 +389,8 @@ class CopyTestHybm : public MemFabricGvaApi {
     std::vector<std::array<uint64_t, 4>> copies;
     std::map<uint64_t, uint64_t> pools;
     uint32_t rank = 0;
+    std::array<uint64_t, 2> windows{{kSize, kSize}}, cursors{{0, 0}};
+    std::set<uint64_t> imported;
     int initialize(uint16_t) override { return 0; }
     void uninitialize() override {}
     uint32_t network_protocol = 0;
@@ -397,6 +399,8 @@ class CopyTestHybm : public MemFabricGvaApi {
     int bind(uint16_t) override { return 0; }
     void* create(const MemFabricGvaConfig& c) override {
         rank = c.rank;
+        windows = {{c.hbm_window, c.dram_window}};
+        cursors = {{0, 0}};
         network_protocol = c.protocol == "device_rdma"
                                ? 4u
                                : (c.protocol == "device_urma" ? 256u : 0u);
@@ -407,7 +411,8 @@ class CopyTestHybm : public MemFabricGvaApi {
     int unreserve(void*) override { return 0; }
     void* allocate(void*, uint32_t type, uint64_t size) override {
         const auto address =
-            0x100000000000000ULL + type * 0x1000000ULL + rank * kSize;
+            base(nullptr, type) + rank * windows[type - 1] + cursors[type - 1];
+        cursors[type - 1] += size;
         pools[address] = size;
         return reinterpret_cast<void*>(address);
     }
@@ -418,15 +423,16 @@ class CopyTestHybm : public MemFabricGvaApi {
     uint64_t address(void*, void* p) override {
         return reinterpret_cast<uint64_t>(p);
     }
-    uint64_t size(void*, void*) override { return kSize; }
+    uint64_t base(void*, uint32_t type) override {
+        return 0x100000000000000ULL + type * 0x1000000ULL;
+    }
+    uint64_t size(void*, void* p) override {
+        return pools.at(reinterpret_cast<uint64_t>(p));
+    }
     int translate(uint64_t p, uint32_t, uint64_t& out) override {
         for (const auto& entry : pools) {
             if (p >= entry.first && p - entry.first < entry.second) {
-                if (network_protocol &&
-                    ((entry.first - 0x100000000000000ULL) % 0x1000000ULL) /
-                            kSize !=
-                        rank)
-                    return -1;
+                if (network_protocol && imported.count(entry.first)) return -1;
                 out = p;
                 return 0;
             }
@@ -435,8 +441,10 @@ class CopyTestHybm : public MemFabricGvaApi {
     }
     int exportBlob(void*, void* pointer, std::vector<uint8_t>& out) override {
         uint64_t address = reinterpret_cast<uint64_t>(pointer);
-        out.resize(sizeof(address));
+        out.resize(2 * sizeof(address));
         std::memcpy(out.data(), &address, sizeof(address));
+        const uint64_t size = pointer ? pools.at(address) : 0;
+        std::memcpy(out.data() + sizeof(address), &size, sizeof(size));
         return 0;
     }
     int importBlob(void*, bool entity,
@@ -444,7 +452,10 @@ class CopyTestHybm : public MemFabricGvaApi {
         if (!entity) {
             uint64_t address;
             std::memcpy(&address, blob.data(), sizeof(address));
-            pools[address] = kSize;
+            uint64_t size;
+            std::memcpy(&size, blob.data() + sizeof(address), sizeof(size));
+            pools[address] = size;
+            imported.insert(address);
         }
         return 0;
     }
@@ -456,8 +467,7 @@ class CopyTestHybm : public MemFabricGvaApi {
     int remove(void*, uint32_t) override { return 0; }
     int unmap(void*, uint32_t peer) override {
         for (auto it = pools.begin(); it != pools.end();) {
-            if (((it->first - 0x100000000000000ULL) % 0x1000000ULL) / kSize ==
-                peer)
+            if (imported.count(it->first))
                 it = pools.erase(it);
             else
                 ++it;
@@ -615,13 +625,13 @@ class MemFabricTransportTest : public ::testing::Test {
     bool GvaEnabled() const { return transport_->gva_config_.enabled; }
     bool HasGvaContext() const { return bool(transport_->gva_); }
 
-    Status PrepareGvaAllocation() {
+    Status PrepareGvaAllocation(uint64_t budget = CopyTestHybm::kSize) {
         MemFabricGvaConfig config;
         config.enabled = true;
         config.group = "allocation-options";
         config.rank_count = 2;
         config.hbm_size = config.dram_size = config.hbm_window =
-            config.dram_window = CopyTestHybm::kSize;
+            config.dram_window = budget;
         transport_->metadata_ = metadata_;
         transport_->local_segment_name_ = name_;
         transport_->installed_ = true;
@@ -2199,14 +2209,6 @@ TEST_F(MemFabricTransportTest,
         transport_->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize)
             .ok());
     EXPECT_TRUE(copy_api_->copies.empty());
-    void* dva = reinterpret_cast<void*>(1);
-    EXPECT_FALSE(
-        transport_
-            ->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize, &dva)
-            .ok());
-    EXPECT_EQ(dva, nullptr);
-    EXPECT_FALSE(transport_->resolveGlobalAddress(copy_dram_, 32, &dva).ok());
-    EXPECT_EQ(dva, nullptr);
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     auto request =
         GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(copy_dram_), 32);
@@ -2233,14 +2235,6 @@ TEST_F(MemFabricTransportTest, UrmaPreparationAllowsCopyWithoutDirectMapping) {
         transport_->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize)
             .ok());
     EXPECT_TRUE(copy_api_->copies.empty());
-    void* dva = reinterpret_cast<void*>(1);
-    EXPECT_FALSE(
-        transport_
-            ->mapRemoteMemory(copy_peer_, copy_dram_, CopyTestHybm::kSize, &dva)
-            .ok());
-    EXPECT_EQ(dva, nullptr);
-    EXPECT_FALSE(transport_->resolveGlobalAddress(copy_dram_, 32, &dva).ok());
-    EXPECT_EQ(dva, nullptr);
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     auto request =
         GvaWrite(copy_hbm_, reinterpret_cast<uint64_t>(copy_dram_), 32);
@@ -2313,6 +2307,40 @@ TEST_F(MemFabricTransportTest, GvaRejectsOrdinaryRegistrationAndFree) {
     EXPECT_EQ(state_->init_calls, 0);
     EXPECT_EQ(state_->create_calls, 0);
     EXPECT_EQ(state_->register_mem_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest,
+       MultipleSameTypeGvaAllocationsRegisterAndFreeIndependently) {
+    ASSERT_TRUE(PrepareGvaAllocation(4 * CopyTestHybm::kSize).ok());
+    MemoryOptions first_options, second_options;
+    first_options.location = second_options.location = "npu:0";
+    void *first = nullptr, *second = nullptr;
+    ASSERT_TRUE(
+        transport_
+            ->allocateLocalMemory(&first, CopyTestHybm::kSize, first_options)
+            .ok());
+    ASSERT_TRUE(
+        transport_
+            ->allocateLocalMemory(&second, CopyTestHybm::kSize, second_options)
+            .ok());
+    EXPECT_NE(first, second);
+    EXPECT_EQ(first_options.global_address, reinterpret_cast<uint64_t>(first));
+    EXPECT_EQ(second_options.global_address,
+              reinterpret_cast<uint64_t>(second));
+    BufferDesc one{}, two{};
+    one.addr = reinterpret_cast<uint64_t>(first);
+    one.length = CopyTestHybm::kSize;
+    two.addr = reinterpret_cast<uint64_t>(second);
+    two.length = CopyTestHybm::kSize;
+    ASSERT_TRUE(transport_->addMemoryBuffer(one, MemoryOptions{}).ok());
+    ASSERT_TRUE(transport_->addMemoryBuffer(two, MemoryOptions{}).ok());
+    ASSERT_TRUE(transport_->removeMemoryBuffer(one).ok());
+    ASSERT_TRUE(transport_->freeLocalMemory(first, CopyTestHybm::kSize).ok());
+    EXPECT_FALSE(transport_->freeLocalMemory(second, CopyTestHybm::kSize).ok());
+    ASSERT_TRUE(transport_->removeMemoryBuffer(two).ok());
+    ASSERT_TRUE(transport_->freeLocalMemory(second, CopyTestHybm::kSize).ok());
+    EXPECT_EQ(state_->register_mem_calls, 0);
+    EXPECT_EQ(state_->init_calls, 0);
 }
 
 }  // namespace tent

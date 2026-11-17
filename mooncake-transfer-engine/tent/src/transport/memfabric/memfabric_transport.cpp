@@ -103,10 +103,7 @@ Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
     else
         return Status::InvalidArgument(
             "GVA location must be cpu or the configured npu device");
-    CHECK_STATUS(gva_->allocate(addr, size, type, options.global_address));
-    if (!gva_->describe(*addr, size, options))
-        return Status::InternalError("Allocated GVA pool has no descriptor");
-    return Status::OK();
+    return gva_->allocate(addr, size, type, options);
 }
 Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
@@ -118,28 +115,6 @@ Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
 }
 Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
                                            size_t size) {
-    void* ignored = nullptr;
-    return prepareGva(id, addr, size, &ignored, false);
-}
-Status MemFabricTransport::resolveGlobalAddress(void* gva, size_t size,
-                                                void** device_address) {
-    if (!device_address)
-        return Status::InvalidArgument("Null device address output");
-    *device_address = nullptr;
-    std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (!gva_config_.enabled || !gva_ || stopping_)
-        return Status::NotImplemented("MemFabric GVA unavailable");
-    return gva_->resolve(reinterpret_cast<uint64_t>(gva), size, device_address);
-}
-Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
-                                           size_t size, void** device_address) {
-    return prepareGva(id, addr, size, device_address, true);
-}
-Status MemFabricTransport::prepareGva(SegmentID id, void* addr, size_t size,
-                                      void** device_address, bool direct) {
-    if (!device_address)
-        return Status::InvalidArgument("Null device address output");
-    *device_address = nullptr;
     std::shared_ptr<MemFabricSharedMemory> context;
     std::shared_ptr<ControlService> metadata;
     {
@@ -177,13 +152,8 @@ Status MemFabricTransport::prepareGva(SegmentID id, void* addr, size_t size,
         std::lock_guard<std::mutex> lock(inflight_mu_);
         gva_remote_[{id, reinterpret_cast<uint64_t>(addr)}] = segment->name;
     }
-    if (!direct)
-        return context->prepare(segment->name, bundle.dump(),
-                                reinterpret_cast<uint64_t>(addr), size);
-    CHECK_STATUS(context->map(segment->name, bundle.dump(),
-                              reinterpret_cast<uint64_t>(addr), size));
-    return context->resolve(reinterpret_cast<uint64_t>(addr), size,
-                            device_address);
+    return context->prepare(segment->name, bundle.dump(),
+                            reinterpret_cast<uint64_t>(addr), size);
 }
 Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     std::shared_ptr<MemFabricSharedMemory> context;
@@ -242,7 +212,8 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
         const auto rank = conf->get(prefix + "rank", int64_t{-1});
         const auto device = conf->get(prefix + "device", int64_t{-1});
         const auto entity = conf->get(prefix + "entity", int64_t{64});
-        if (ranks < 1 || ranks > UINT32_MAX || rank < 0 || rank >= ranks ||
+        // Keep conversions safe; HYBM validates rank topology and sizes.
+        if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX ||
             device < 0 || device > UINT16_MAX || entity < 64 || entity >= 128)
             return Status::InvalidArgument(
                 "Invalid MemFabric GVA configuration");

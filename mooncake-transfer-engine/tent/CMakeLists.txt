@@ -64,3 +64,25 @@ if(BUILD_UNIT_TESTS)
   include(${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_plugin_context_tests.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_pointer_tests.cmake)
 endif()
+
+# Explicit opt-in hardware integration smoke; never registered with CTest.
+option(BUILD_MEMFABRIC_GVA_ENGINE_SMOKE
+       "Build two-process public TransferEngine MemFabric GVA hardware smoke" OFF)
+if(BUILD_MEMFABRIC_GVA_ENGINE_SMOKE)
+  if(NOT USE_MEMFABRIC OR BUILD_UNIT_TESTS)
+    message(FATAL_ERROR "Engine smoke requires USE_MEMFABRIC=ON and BUILD_UNIT_TESTS=OFF (real ACL)")
+  endif()
+  find_path(MEMFABRIC_ENGINE_ACL_INCLUDE_DIR acl/acl.h
+            HINTS ENV ASCEND_HOME_PATH PATH_SUFFIXES include)
+  find_library(MEMFABRIC_ENGINE_ACL_LIBRARY ascendcl
+               HINTS ENV ASCEND_HOME_PATH PATH_SUFFIXES lib64)
+  if(NOT MEMFABRIC_ENGINE_ACL_INCLUDE_DIR OR NOT MEMFABRIC_ENGINE_ACL_LIBRARY)
+    message(FATAL_ERROR "Engine smoke requires real ACL headers/library")
+  endif()
+  add_executable(tent_memfabric_gva_engine_smoke
+                 tests/memfabric_gva_engine_smoke.cpp)
+  target_include_directories(tent_memfabric_gva_engine_smoke PRIVATE
+                             ${MEMFABRIC_ENGINE_ACL_INCLUDE_DIR})
+  target_link_libraries(tent_memfabric_gva_engine_smoke PRIVATE
+                        tent_link_group ${MEMFABRIC_ENGINE_ACL_LIBRARY} pthread)
+endif()

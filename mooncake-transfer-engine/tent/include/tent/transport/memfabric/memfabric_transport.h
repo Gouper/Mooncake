@@ -87,8 +87,6 @@ class MemFabricTransport : public Transport {
     bool warmupMemory(void* address, size_t size) override;
     bool supportsGlobalAddressing() const override;
     Status mapRemoteMemory(SegmentID, void*, size_t) override;
-    virtual Status mapRemoteMemory(SegmentID, void*, size_t, void**);
-    virtual Status resolveGlobalAddress(void*, size_t, void**);
     Status unmapRemoteMemory(SegmentID, void*) override;
     const char* getName() const override { return "memfabric"; }
     bool supportNotification() const override { return false; }
@@ -99,7 +97,6 @@ class MemFabricTransport : public Transport {
     std::shared_ptr<std::atomic<size_t>> gva_pending_ =
         std::make_shared<std::atomic<size_t>>(0);
     size_t max_pending_copies_ = 256;
-    Status prepareGva(SegmentID, void*, size_t, void**, bool);
     Status loadConfig(const std::shared_ptr<Config>& conf);
     // Called with inflight_mu_ held; also serializes registration and teardown.
     Status initializeLocked();

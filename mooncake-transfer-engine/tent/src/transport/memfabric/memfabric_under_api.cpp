@@ -1,6 +1,6 @@
 #include "tent/transport/memfabric/memfabric_under_api.h"
 
-#include <dlfcn.h>
+#include "tent/transport/memfabric/memfabric_library.h"
 
 #include <glog/logging.h>
 
@@ -32,14 +32,14 @@ smemTransBatchStatusQueryFunc MemFabricUnderApi::pSmemTransBatchStatusQuery =
     nullptr;
 smemSetLogLevelFunc MemFabricUnderApi::pSmemSetLogLevel = nullptr;
 
-#define DL_LOAD_SYM(field, name)                                           \
-    do {                                                                   \
-        field = (decltype(field))dlsym(gLibHandle, name);                  \
-        if (!field) {                                                      \
-            LOG(ERROR) << "Failed to dlsym " << name << ": " << dlerror(); \
-            ResetSymbols();                                                \
-            return false;                                                  \
-        }                                                                  \
+#define DL_LOAD_SYM(field, name)                                              \
+    do {                                                                      \
+        field = MemFabricLibrary::resolve<decltype(field)>(gLibHandle, name); \
+        if (!field) {                                                         \
+            LOG(ERROR) << "Failed to dlsym " << name << ": " << dlerror();    \
+            ResetSymbols();                                                   \
+            return false;                                                     \
+        }                                                                     \
     } while (0)
 
 bool MemFabricUnderApi::LoadLibrary() {
@@ -53,14 +53,15 @@ bool MemFabricUnderApi::LoadLibraryLocked() {
     auto api = gMemoryApiWeak.lock();
     if (!api) {
         auto loaded = std::make_shared<MemoryApi>();
-        void* library = dlopen("libmf_smem.so", RTLD_NOW | RTLD_GLOBAL);
+        std::string error;
+        auto library = MemFabricLibrary::load("libmf_smem.so",
+                                              RTLD_NOW | RTLD_GLOBAL, &error);
         if (!library) {
-            LOG(ERROR) << "Failed to dlopen libmf_smem.so: " << dlerror();
+            LOG(ERROR) << "Failed to load libmf_smem.so: " << error;
             return false;
         }
-        loaded->library = std::shared_ptr<void>(
-            library, [](void* handle) { (void)dlclose(handle); });
-        gLibHandle = library;
+        loaded->library = std::shared_ptr<void>(library, library->handle());
+        gLibHandle = library->handle();
         DL_LOAD_SYM(loaded->allocate, "smem_mem_alloc");
         DL_LOAD_SYM(loaded->free, "smem_mem_free");
         api = std::move(loaded);

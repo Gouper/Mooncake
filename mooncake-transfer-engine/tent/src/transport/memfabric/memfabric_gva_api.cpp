@@ -3,7 +3,7 @@
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
 #ifdef TENT_WITH_HYBM_GVA
 #include <acl/acl.h>
-#include <dlfcn.h>
+#include "tent/transport/memfabric/memfabric_library.h"
 #include <cstring>
 #include <glog/logging.h>
 #include <hybm_big_mem.h>
@@ -15,14 +15,11 @@ namespace tent {
 namespace {
 class NativeHybm final : public MemFabricGvaApi {
    public:
-    ~NativeHybm() override {
-        if (library_) dlclose(library_);
-    }
     bool loadSymbols() {
-        library_ = dlopen("libmf_hybm_core.so", RTLD_NOW | RTLD_LOCAL);
+        library_ = MemFabricLibrary::load("libmf_hybm_core.so");
         if (!library_) return false;
-#define LOAD(name)                                                         \
-    name##_ = reinterpret_cast<decltype(name##_)>(dlsym(library_, #name)); \
+#define LOAD(name)                                        \
+    name##_ = library_->symbol<decltype(name##_)>(#name); \
     if (!name##_) return false
         LOAD(hybm_init);
         LOAD(hybm_uninit);
@@ -33,6 +30,7 @@ class NativeHybm final : public MemFabricGvaApi {
         LOAD(hybm_alloc_local_memory);
         LOAD(hybm_free_local_memory);
         LOAD(hybm_get_slice_va);
+        LOAD(hybm_get_memory_ptr);
         LOAD(hybm_get_slice_size);
         LOAD(hybm_gva_to_va);
         LOAD(hybm_export);
@@ -42,13 +40,12 @@ class NativeHybm final : public MemFabricGvaApi {
         LOAD(hybm_entity_reach_types);
         LOAD(hybm_remove_imported);
         LOAD(hybm_unmap_rank);
-        hybm_data_copy_ = reinterpret_cast<decltype(hybm_data_copy_)>(
-            dlsym(library_, "hybm_data_copy"));
+        hybm_data_copy_ =
+            library_->symbol<decltype(hybm_data_copy_)>("hybm_data_copy");
         hybm_transport_connect_ =
-            reinterpret_cast<decltype(hybm_transport_connect_)>(
-                dlsym(library_, "hybm_transport_connect"));
-        hybm_wait_ = reinterpret_cast<decltype(hybm_wait_)>(
-            dlsym(library_, "hybm_wait"));
+            library_->symbol<decltype(hybm_transport_connect_)>(
+                "hybm_transport_connect");
+        hybm_wait_ = library_->symbol<decltype(hybm_wait_)>("hybm_wait");
 #undef LOAD
         return true;
     }
@@ -133,6 +130,10 @@ class NativeHybm final : public MemFabricGvaApi {
     uint64_t size(void* entity_handle, void* slice) override {
         return hybm_get_slice_size_(entity_handle, slice);
     }
+    uint64_t base(void* entity_handle, uint32_t memory_type) override {
+        return reinterpret_cast<uint64_t>(hybm_get_memory_ptr_(
+            entity_handle, static_cast<hybm_mem_type>(memory_type)));
+    }
     int translate(uint64_t address, uint32_t memory_type,
                   uint64_t& out) override {
         return hybm_gva_to_va_(address, static_cast<hybm_mem_type>(memory_type),
@@ -186,7 +187,7 @@ class NativeHybm final : public MemFabricGvaApi {
     }
 
    private:
-    void* library_ = nullptr;
+    std::shared_ptr<MemFabricLibrary> library_;
 #define FN(name) decltype(&name) name##_ = nullptr
     FN(hybm_data_copy);
     FN(hybm_wait);
@@ -200,6 +201,7 @@ class NativeHybm final : public MemFabricGvaApi {
     FN(hybm_alloc_local_memory);
     FN(hybm_free_local_memory);
     FN(hybm_get_slice_va);
+    FN(hybm_get_memory_ptr);
     FN(hybm_get_slice_size);
     FN(hybm_gva_to_va);
     FN(hybm_export);

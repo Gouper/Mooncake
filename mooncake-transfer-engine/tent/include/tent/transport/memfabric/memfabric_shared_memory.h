@@ -43,6 +43,7 @@ class MemFabricGvaApi {
     virtual int free(void*, void*) = 0;
     virtual uint64_t address(void*, void*) = 0;
     virtual uint64_t size(void*, void*) = 0;
+    virtual uint64_t base(void*, uint32_t) { return 0; }
     virtual int translate(uint64_t, uint32_t, uint64_t&) = 0;
     virtual int exportBlob(void*, void*, std::vector<uint8_t>&) = 0;
     virtual int importBlob(void*, bool, const std::vector<uint8_t>&) = 0;
@@ -62,6 +63,7 @@ class MemFabricSharedMemory {
     // Initialize the entity and reserve windows before allocation or mapping.
     Status initialize();
     Status allocate(void**, size_t, uint32_t memory_type, uint64_t requested);
+    Status allocate(void**, size_t, uint32_t memory_type, MemoryOptions&);
     Status free(void*, size_t);
     bool describe(void*, size_t, MemoryOptions&) const;
     bool overlaps(uint64_t, size_t) const;
@@ -89,16 +91,23 @@ class MemFabricSharedMemory {
     struct Pool {
         void* slice = nullptr;
         uint64_t address = 0, length = 0, host_address = 0, device_address = 0;
+        uint32_t memory_type = 0;
         bool published = false;
         Json descriptor;
     };
-    struct Peer {
+    struct RemotePool {
+        Json descriptor;
+        bool active = false, imported = false, mapped = false,
+             copy_ready = false;
+    };
+    // Native imports grouped by rank, not a peer discovery/connection list.
+    // owner/generation identify the publication; pools retain per-allocation
+    // import, active-map and copy-ready state that HYBM cannot query for TENT.
+    struct ImportedRank {
         std::string owner, generation;
         Json entity_blob;
-        std::array<Json, 2> descriptors;
-        std::array<bool, 2> active{{false, false}};
-        std::array<bool, 2> imported{{false, false}};
-        bool cleaned = false, mapped = false, copy_ready = false;
+        std::map<uint64_t, RemotePool> pools;
+        bool cleaned = false;
     };
     Status mapOrPrepare(const std::string&, const std::string&, uint64_t,
                         size_t, bool);
@@ -110,8 +119,8 @@ class MemFabricSharedMemory {
     Status validateDescriptor(const Json&, const std::string&) const;
     Status recordPeer(const Json&, const std::string&);
     Status importPeer(const Json&, const std::string&);
-    Status verifyPeerMapping(const Peer&);
-    Status cleanupPeer(uint32_t, Peer&);
+    Status verifyPeerMapping(uint32_t, const RemotePool&);
+    Status cleanupPeer(uint32_t, ImportedRank&);
     Json makeIdentity() const;
     mutable std::mutex mutex_;
     MemFabricGvaConfig config_;
@@ -120,10 +129,14 @@ class MemFabricSharedMemory {
     std::shared_ptr<MemFabricGvaApi> api_;
     void* entity_ = nullptr;
     bool initialized_ = false;
-    std::array<Pool, 2> pools_;
+    std::map<uint64_t, Pool> pools_;
+    std::array<uint64_t, 2> window_bases_{{0, 0}};
     std::array<uint64_t, 2> consumed_{{0, 0}};
     std::vector<void*> rollback_;  // failed frees stay owned for retry
-    std::map<uint32_t, Peer> peers_;
+    // Retain failed imports for retry/cleanup. Native rank cleanup waits until
+    // its last active allocation exits, including logically unmapped
+    // companions.
+    std::map<uint32_t, ImportedRank> imported_ranks_;
     Json entity_blob_;
     uint64_t pool_generation_ = 0;
     size_t pending_copies_ = 0;

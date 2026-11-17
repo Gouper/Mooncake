@@ -11,6 +11,8 @@ class FakeHybm : public MemFabricGvaApi {
     bool fail_bind = false;
     bool fail_slice_export = false, empty_slice_export = false;
     uint32_t rank = 0;
+    std::array<uint64_t, 2> windows{{M, M}}, cursors{{0, 0}};
+    std::map<uint64_t, uint64_t> sizes;
     bool mismatch = false, fail_unmap = false, stale = false,
          fail_import = false, reachable = true;
     bool fail_entity_export = false, fail_entity_import = false;
@@ -28,14 +30,24 @@ class FakeHybm : public MemFabricGvaApi {
     }
     void* create(const MemFabricGvaConfig& c) override {
         rank = c.rank;
+        windows = {{c.hbm_window, c.dram_window}};
+        cursors = {{0, 0}};
         ++creates;
+        if (c.protocol != "device_sdma" && c.protocol != "device_rdma" &&
+            c.protocol != "device_urma")
+            return nullptr;
         return this;
     }
     void destroy(void*) override {}
     int reserve(void*) override { return 0; }
     int unreserve(void*) override { return 0; }
-    void* allocate(void*, uint32_t t, uint64_t) override {
-        auto p = 0x10000000ULL + t * 0x1000000 + rank * M;
+    uint64_t base(void*, uint32_t type) override {
+        return 0x10000000ULL + type * 0x1000000;
+    }
+    void* allocate(void*, uint32_t t, uint64_t bytes) override {
+        auto p = base(nullptr, t) + rank * windows[t - 1] + cursors[t - 1];
+        cursors[t - 1] += bytes;
+        sizes[p] = bytes;
         addresses[p] = mismatch ? p + 0x100000000ULL : p;
         return reinterpret_cast<void*>(p);
     }
@@ -47,12 +59,14 @@ class FakeHybm : public MemFabricGvaApi {
     uint64_t address(void*, void* p) override {
         return reinterpret_cast<uint64_t>(p);
     }
-    uint64_t size(void*, void*) override { return M; }
+    uint64_t size(void*, void* p) override {
+        return sizes.at(reinterpret_cast<uint64_t>(p));
+    }
     int translate(uint64_t p, uint32_t, uint64_t& out) override {
         auto it = addresses.upper_bound(p);
         if (it == addresses.begin()) return -12;
         --it;
-        if (p - it->first >= M) return -12;
+        if (p - it->first >= sizes.at(it->first)) return -12;
         out = it->second + (p - it->first);
         return 0;
     }
@@ -65,8 +79,10 @@ class FakeHybm : public MemFabricGvaApi {
             if (empty_slice_export) return 0;
         }
         auto a = reinterpret_cast<uint64_t>(p);
-        b.resize(8);
+        b.resize(16);
         std::memcpy(b.data(), &a, 8);
+        const auto size = p ? sizes.at(a) : 0;
+        std::memcpy(b.data() + 8, &size, 8);
         return 0;
     }
     int importBlob(void*, bool entity, const std::vector<uint8_t>& b) override {
@@ -77,6 +93,7 @@ class FakeHybm : public MemFabricGvaApi {
             if (fail_import) return -1;
             uint64_t p;
             std::memcpy(&p, b.data(), 8);
+            std::memcpy(&sizes[p], b.data() + 8, 8);
             addresses[p] = mismatch ? p + 0x100000000ULL : p;
             imported.insert(p);
         }
@@ -131,16 +148,19 @@ TEST(MemFabricGva, ExplicitlyDisabledDramAllowsHbmOnlyContext) {
     EXPECT_FALSE(memory.allocate(&dram, M, 2, 0).ok());
     EXPECT_TRUE(memory.free(address, M).ok());
 }
-TEST(MemFabricGva, DisabledTypeMustHaveZeroWindowAndZeroLocalSize) {
+TEST(MemFabricGva, ZeroLocalBudgetKeepsWindowAvailableForPeerImports) {
     auto api = std::make_shared<FakeHybm>();
     auto options = config();
     options.dram_size = 0;
     MemFabricSharedMemory memory(options, "owner", api);
-    EXPECT_FALSE(memory.initialize().ok());
+    ASSERT_TRUE(memory.initialize().ok());
     void* address = nullptr;
-    EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
-    EXPECT_EQ(api->creates, 0);
+    EXPECT_TRUE(memory.allocate(&address, M, 1, 0).ok());
+    EXPECT_TRUE(memory.free(address, M).ok());
+    EXPECT_FALSE(memory.allocate(&address, M, 2, 0).ok());
+    EXPECT_EQ(api->creates, 1);
 }
+
 TEST(MemFabricGva, NonIdentityDeviceAddressAndWrongFixedRequestAreRejected) {
     auto a = std::make_shared<FakeHybm>();
     MemFabricSharedMemory m(config(), "owner", a);
@@ -177,7 +197,7 @@ TEST(MemFabricGva, PublicationPreventsFreeAndDescriptorIsVersioned) {
     ASSERT_TRUE(m.allocate(&p, M, 1, 0).ok());
     std::string desc;
     ASSERT_TRUE(m.publish(p, M, desc).ok());
-    EXPECT_NE(desc.find("\"version\":3"), std::string::npos);
+    EXPECT_NE(desc.find("\"version\":4"), std::string::npos);
     EXPECT_FALSE(m.free(p, M).ok());
     EXPECT_TRUE(m.unpublish(p).ok());
     EXPECT_TRUE(m.free(p, M).ok());
@@ -250,16 +270,16 @@ TEST(MemFabricGva, DualPoolMapIsIdempotentAndRankUnmapIsDeferred) {
     EXPECT_TRUE(p.unmapH().ok());
     EXPECT_EQ(p.aa->unmaps, 1);
 }
-TEST(MemFabricGva, NativeCleanupFailureRetainsLocalResourcesUntilRetry) {
+TEST(MemFabricGva, PeerCleanupFailureDoesNotBlockIndependentLocalFree) {
     Pair p;
     ASSERT_TRUE(p.mapH().ok());
     p.aa->fail_unmap = true;
     EXPECT_TRUE(p.unmapH().IsTooManyRequests());
-    EXPECT_FALSE(p.a.free(p.ah, M).ok());
+    EXPECT_TRUE(p.a.free(p.ah, M).ok());
     p.aa->fail_unmap = false;
     EXPECT_TRUE(p.unmapH().ok());
-    EXPECT_TRUE(p.a.free(p.ah, M).ok());
 }
+
 TEST(MemFabricGva, RegistryRemainingAfterUnmapIsPending) {
     Pair p;
     ASSERT_TRUE(p.mapH().ok());
@@ -764,7 +784,7 @@ TEST(MemFabricGva, UnsupportedNetworkProtocolRejectsAllocation) {
     void* address = nullptr;
     EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(address, nullptr);
-    EXPECT_EQ(api->creates, 0);
+    EXPECT_EQ(api->creates, 1);
 }
 
 TEST(MemFabricGva, ExistingContextOnlyRebindsDeviceAndRetriesBindFailure) {
@@ -861,4 +881,266 @@ TEST(MemFabricGva, ResolveRejectsChangedNonIdentityTranslation) {
     void* output = reinterpret_cast<void*>(1);
     EXPECT_FALSE(p.a.resolve(address, 64, &output).ok());
     EXPECT_EQ(output, nullptr);
+}
+
+namespace {
+struct MultiAllocations {
+    std::shared_ptr<FakeHybm> local_api = std::make_shared<FakeHybm>();
+    std::shared_ptr<FakeHybm> remote_api = std::make_shared<FakeHybm>();
+    static MemFabricGvaConfig settings(uint32_t rank) {
+        auto c = config(rank);
+        c.hbm_window = c.dram_window = c.hbm_size = c.dram_size = 4 * M;
+        return c;
+    }
+    MemFabricSharedMemory local{settings(0), "local", local_api};
+    MemFabricSharedMemory remote{settings(1), "remote", remote_api};
+    std::vector<std::pair<void*, size_t>> local_allocations, remote_allocations;
+    std::vector<std::string> descriptors;
+    MultiAllocations() {
+        EXPECT_TRUE(local.initialize().ok());
+        EXPECT_TRUE(remote.initialize().ok());
+    }
+    void* add(MemFabricSharedMemory& memory, uint32_t type, size_t bytes = M) {
+        void* p = nullptr;
+        EXPECT_TRUE(memory.allocate(&p, bytes, type, 0).ok());
+        auto& allocations =
+            &memory == &local ? local_allocations : remote_allocations;
+        allocations.emplace_back(p, bytes);
+        return p;
+    }
+    void publishRemote(void* p, size_t bytes = M) {
+        std::string descriptor;
+        EXPECT_TRUE(remote.publish(p, bytes, descriptor).ok());
+        descriptors.push_back(descriptor);
+    }
+    std::string bundle() const {
+        auto array = nlohmann::json::array();
+        for (const auto& text : descriptors)
+            array.push_back(nlohmann::json::parse(text));
+        return array.dump();
+    }
+    ~MultiAllocations() {
+        local_api->fail_unmap = false;
+        for (auto [p, bytes] : remote_allocations)
+            local.unmap("remote", reinterpret_cast<uint64_t>(p));
+        for (auto [p, bytes] : local_allocations) {
+            local.unpublish(p);
+            local.free(p, bytes);
+        }
+        for (auto [p, bytes] : remote_allocations) {
+            remote.unpublish(p);
+            remote.free(p, bytes);
+        }
+    }
+};
+}  // namespace
+TEST(MemFabricGva,
+     MultipleSameTypeAllocationsReturnOptionsAndConsumeNativeCapacity) {
+    MultiAllocations p;
+    void *first = nullptr, *second = nullptr, *third = nullptr;
+    MemoryOptions options;
+    ASSERT_TRUE(p.local.allocate(&first, M, 1, options).ok());
+    EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(first));
+    EXPECT_EQ(options.type, MEMFABRIC);
+    EXPECT_EQ(options.location, "npu:0");
+    options.global_address = 0;
+    ASSERT_TRUE(p.local.allocate(&second, M, 1, options).ok());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(second),
+              reinterpret_cast<uint64_t>(first) + M);
+    std::string descriptor;
+    ASSERT_TRUE(p.local.publish(first, M, descriptor).ok());
+    EXPECT_FALSE(p.local.free(first, M).ok());
+    ASSERT_TRUE(p.local.free(second, M).ok());
+    ASSERT_TRUE(p.local.allocate(&third, 2 * M, 1, 0).ok());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(third),
+              reinterpret_cast<uint64_t>(first) + 2 * M);
+    ASSERT_TRUE(p.local.free(third, 2 * M).ok());
+    void* exhausted = nullptr;
+    EXPECT_FALSE(p.local.allocate(&exhausted, M, 1, 0).ok());
+    ASSERT_TRUE(p.local.unpublish(first).ok());
+    ASSERT_TRUE(p.local.free(first, M).ok());
+    EXPECT_FALSE(p.local.allocate(&exhausted, M, 1, 0).ok());
+    auto dram = p.add(p.local, 2);
+    EXPECT_NE(dram, first);
+}
+TEST(MemFabricGva, SameTypeSlicesAndBothMediaMapCopyAndUnmapIndependently) {
+    MultiAllocations p;
+    auto source = p.add(p.local, 1);
+    std::string local;
+    ASSERT_TRUE(p.local.publish(source, M, local).ok());
+    std::vector<void*> allocations{p.add(p.remote, 1), p.add(p.remote, 1),
+                                   p.add(p.remote, 2), p.add(p.remote, 2)};
+    for (auto allocation : allocations) p.publishRemote(allocation);
+    const auto second = reinterpret_cast<uint64_t>(allocations[1]);
+    ASSERT_TRUE(p.local.map("remote", p.bundle(), second, M).ok());
+    void* address = nullptr;
+    EXPECT_FALSE(
+        p.local.resolve(reinterpret_cast<uint64_t>(allocations[0]), M, &address)
+            .ok());
+    for (auto allocation : allocations)
+        ASSERT_TRUE(p.local
+                        .map("remote", p.bundle(),
+                             reinterpret_cast<uint64_t>(allocation), M)
+                        .ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(p.local
+                    .beginCopy(reinterpret_cast<uint64_t>(source), second, 64,
+                               direction)
+                    .ok());
+    EXPECT_EQ(direction, 9u);
+    p.local.cancelCopy();
+    EXPECT_TRUE(p.local.unmap("remote", second).IsTooManyRequests());
+    EXPECT_FALSE(p.local.resolve(second, 64, &address).ok());
+    ASSERT_TRUE(
+        p.local
+            .resolve(reinterpret_cast<uint64_t>(allocations[0]), 64, &address)
+            .ok());
+    auto independent = p.add(p.local, 1);
+    ASSERT_TRUE(p.local.free(independent, M).ok());
+    for (size_t i : {0u, 2u})
+        EXPECT_TRUE(
+            p.local.unmap("remote", reinterpret_cast<uint64_t>(allocations[i]))
+                .IsTooManyRequests());
+    ASSERT_TRUE(
+        p.local.unmap("remote", reinterpret_cast<uint64_t>(allocations[3]))
+            .ok());
+    EXPECT_EQ(p.local_api->unmaps, 1);
+}
+TEST(MemFabricGva,
+     NewAllocationPublicationExtendsLivePeerWithoutInvalidatingOldSlice) {
+    MultiAllocations p;
+    const auto first = p.add(p.remote, 1);
+    p.publishRemote(first);
+    ASSERT_TRUE(
+        p.local.map("remote", p.bundle(), reinterpret_cast<uint64_t>(first), M)
+            .ok());
+    const auto second = p.add(p.remote, 1);
+    p.publishRemote(second);
+    ASSERT_TRUE(
+        p.local.map("remote", p.bundle(), reinterpret_cast<uint64_t>(second), M)
+            .ok());
+    void* address = nullptr;
+    ASSERT_TRUE(
+        p.local.resolve(reinterpret_cast<uint64_t>(first), M, &address).ok());
+    EXPECT_EQ(address, first);
+    EXPECT_EQ(p.local_api->slice_imports, 2);
+    const auto descriptor = nlohmann::json::parse(p.descriptors[1]);
+    EXPECT_EQ(descriptor.at("offset").get<uint64_t>(), M);
+    EXPECT_EQ(descriptor.at("window_base").get<uint64_t>(),
+              p.remote_api->base(nullptr, 1));
+}
+TEST(
+    MemFabricGva,
+    BundleRejectsDuplicateOverlapOffsetOverflowAndChangedIdentityBeforeImport) {
+    MultiAllocations p;
+    const auto first = p.add(p.remote, 1);
+    const auto second = p.add(p.remote, 1);
+    p.publishRemote(first);
+    p.publishRemote(second);
+    auto descriptors = nlohmann::json::parse(p.bundle());
+    const auto original = descriptors;
+    descriptors.push_back(descriptors[0]);
+    EXPECT_FALSE(p.local
+                     .map("remote", descriptors.dump(),
+                          reinterpret_cast<uint64_t>(first), M)
+                     .ok());
+    descriptors = original;
+    descriptors[1]["address"] = reinterpret_cast<uint64_t>(first) + M / 2;
+    descriptors[1]["offset"] = M / 2;
+    EXPECT_FALSE(p.local
+                     .map("remote", descriptors.dump(),
+                          reinterpret_cast<uint64_t>(first), M)
+                     .ok());
+    descriptors = original;
+    descriptors[1]["offset"] = UINT64_MAX;
+    EXPECT_FALSE(p.local
+                     .map("remote", descriptors.dump(),
+                          reinterpret_cast<uint64_t>(first), M)
+                     .ok());
+    descriptors = original;
+    descriptors[1]["size"] = 1.5;
+    EXPECT_FALSE(p.local
+                     .map("remote", descriptors.dump(),
+                          reinterpret_cast<uint64_t>(first), M)
+                     .ok());
+    descriptors = original;
+    descriptors[1]["entity_blob"] = {1u};
+    EXPECT_FALSE(p.local
+                     .map("remote", descriptors.dump(),
+                          reinterpret_cast<uint64_t>(first), M)
+                     .ok());
+    EXPECT_EQ(p.local_api->imports, 0);
+}
+TEST(MemFabricGva, FailedFixedAddressConsumesOnlyItsActualBumpExtent) {
+    MultiAllocations p;
+    void* address = nullptr;
+    EXPECT_FALSE(p.local.allocate(&address, M, 1, 1).ok());
+    ASSERT_TRUE(p.local.allocate(&address, M, 1, 0).ok());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(address),
+              p.local_api->base(nullptr, 1) + M);
+    ASSERT_TRUE(p.local.free(address, M).ok());
+}
+TEST(MemFabricGva, NativeErrorIncludesReturnCode) {
+    auto api = std::make_shared<FakeHybm>();
+    api->fail_bind = true;
+    MemFabricSharedMemory memory(config(), "owner", api);
+    EXPECT_NE(memory.initialize().ToString().find("ret=-1"), std::string::npos);
+}
+
+TEST(MemFabricGva,
+     DifferentAllocationOrdersMapUsingNativeWindowBaseAndActualOffset) {
+    MultiAllocations p;
+    p.add(p.local, 2);
+    p.add(p.local, 1);
+    auto source = p.add(p.local, 1);
+    std::string descriptor;
+    ASSERT_TRUE(p.local.publish(source, M, descriptor).ok());
+    p.add(p.remote, 1);
+    p.add(p.remote, 1);
+    auto target = p.add(p.remote, 1);
+    p.publishRemote(target);
+    ASSERT_TRUE(
+        p.local.map("remote", p.bundle(), reinterpret_cast<uint64_t>(target), M)
+            .ok());
+    uint32_t direction = 0;
+    ASSERT_TRUE(p.local
+                    .beginCopy(reinterpret_cast<uint64_t>(source),
+                               reinterpret_cast<uint64_t>(target), M, direction)
+                    .ok());
+    p.local.cancelCopy();
+    auto invalid = nlohmann::json::parse(p.bundle());
+    invalid[0]["offset"] = M;
+    EXPECT_FALSE(p.local
+                     .map("remote", invalid.dump(),
+                          reinterpret_cast<uint64_t>(target), M)
+                     .ok());
+    void* resolved = nullptr;
+    ASSERT_TRUE(
+        p.local.resolve(reinterpret_cast<uint64_t>(target), M, &resolved).ok());
+    EXPECT_EQ(resolved, target);
+}
+TEST(MemFabricGva, LaterOffsetRemapsAfterPreviousAllocationRankCleanup) {
+    MultiAllocations p;
+    auto first = p.add(p.remote, 1);
+    p.publishRemote(first);
+    ASSERT_TRUE(
+        p.local.map("remote", p.bundle(), reinterpret_cast<uint64_t>(first), M)
+            .ok());
+    ASSERT_TRUE(
+        p.local.unmap("remote", reinterpret_cast<uint64_t>(first)).ok());
+    ASSERT_TRUE(p.remote.unpublish(first).ok());
+    ASSERT_TRUE(p.remote.free(first, M).ok());
+    auto second = p.add(p.remote, 1);
+    p.descriptors.clear();
+    p.publishRemote(second);
+    ASSERT_TRUE(
+        p.local.map("remote", p.bundle(), reinterpret_cast<uint64_t>(second), M)
+            .ok());
+    EXPECT_EQ(
+        nlohmann::json::parse(p.descriptors[0]).at("offset").get<uint64_t>(),
+        M);
+    void* resolved = nullptr;
+    ASSERT_TRUE(
+        p.local.resolve(reinterpret_cast<uint64_t>(second), M, &resolved).ok());
+    EXPECT_EQ(resolved, second);
 }
