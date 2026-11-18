@@ -93,7 +93,7 @@ MemFabricTransport::~MemFabricTransport() { (void)uninstall(); }
 
 bool MemFabricTransport::supportsGlobalAddressing() const {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    return gva_config_.enabled && gva_ && gva_->available();
+    return static_cast<bool>(gva_);
 }
 bool MemFabricTransport::warmupMemory(void*, size_t) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
@@ -107,7 +107,6 @@ Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
         return Status::InternalError("MemFabric unavailable");
     if (!gva_config_.enabled)
         return Transport::allocateLocalMemory(addr, size, options);
-    if (!gva_) return Status::InternalError("GVA context unavailable");
     uint32_t type = 0;
     if (options.location == "cpu" || options.location.rfind("cpu:", 0) == 0)
         type = 2;
@@ -133,7 +132,7 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
     std::shared_ptr<ControlService> metadata;
     {
         std::lock_guard<std::mutex> lock(inflight_mu_);
-        if (!gva_config_.enabled || !gva_ || stopping_)
+        if (!gva_ || stopping_)
             return Status::NotImplemented("MemFabric GVA unavailable");
         context = gva_;
         metadata = metadata_;
@@ -175,7 +174,7 @@ Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     {
         std::lock_guard<std::mutex> lock(inflight_mu_);
         auto it = gva_remote_.find({id, reinterpret_cast<uint64_t>(addr)});
-        if (!gva_config_.enabled || !gva_ || it == gva_remote_.end())
+        if (!gva_ || it == gva_remote_.end())
             return Status::InvalidArgument("Unknown MemFabric GVA mapping");
         context = gva_;
         peer = it->second;
@@ -710,7 +709,7 @@ Status MemFabricTransport::submitTransferTasks(
 
 Status MemFabricTransport::submitGvaCopies(
     MemFabricSubBatch* batch, const std::vector<Request>& requests) {
-    if (!installed_ || !gva_config_.enabled || !gva_)
+    if (!gva_)
         return Status::NotImplemented("GVA copy context unavailable");
     if (requests.empty()) return Status::OK();
     if (!gva_->supportsBatchCopy())
@@ -1006,25 +1005,19 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
     if (desc_list.empty()) return Status::OK();
     std::lock_guard<std::mutex> lock(inflight_mu_);
     if (gva_config_.enabled) {
-        if (!installed_ || stopping_ || !gva_)
+        if (stopping_ || !gva_)
             return Status::InternalError("GVA context unavailable");
-        for (auto& desc : desc_list) {
-            MemoryOptions trusted;
-            if (!gva_->describe(reinterpret_cast<void*>(desc.addr), desc.length,
-                                trusted))
-                return Status::InvalidArgument(
-                    "Register the complete GVA pool");
-            desc.location = trusted.location;
-        }
         std::vector<std::pair<void*, size_t>> ranges;
         ranges.reserve(desc_list.size());
         for (const auto& desc : desc_list)
             ranges.emplace_back(reinterpret_cast<void*>(desc.addr),
                                 desc.length);
+        const auto location = "npu:" + std::to_string(gva_config_.device);
         std::vector<std::string> descriptors;
         CHECK_STATUS(gva_->publish(ranges, descriptors));
         for (size_t index = 0; index < desc_list.size(); ++index) {
             auto& desc = desc_list[index];
+            desc.location = location;
             desc.transport_attrs[MEMFABRIC] = std::move(descriptors[index]);
             if (std::find(desc.transports.begin(), desc.transports.end(),
                           MEMFABRIC) == desc.transports.end())
@@ -1115,11 +1108,8 @@ Status MemFabricTransport::removeMemoryBuffer(BufferDesc& desc) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     if (gva_config_.enabled) {
         if (!gva_) return Status::InternalError("GVA context unavailable");
-        MemoryOptions trusted;
-        if (!gva_->describe(reinterpret_cast<void*>(desc.addr), desc.length,
-                            trusted))
-            return Status::InvalidArgument("Unregister the complete GVA pool");
-        return gva_->unpublish(reinterpret_cast<void*>(desc.addr));
+        return gva_->unpublish(reinterpret_cast<void*>(desc.addr),
+                               desc.length);
     }
     if (!handle_) return Status::OK();
     if (config_.data_op_type == SMEMB_DATA_OP_SDMA &&

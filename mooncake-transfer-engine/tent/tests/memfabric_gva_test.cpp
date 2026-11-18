@@ -131,6 +131,68 @@ MemFabricGvaConfig config(uint32_t rank = 0) {
     c.hbm_window = c.dram_window = c.hbm_size = c.dram_size = M;
     return c;
 }
+class HostAddressHybm : public FakeHybm {
+   public:
+    int host_error = 0;
+    uint64_t host_offset = 0;
+    bool discontinuous_host = false;
+    int translate(uint64_t address, uint32_t type, uint64_t& out) override {
+        const auto ret = FakeHybm::translate(address, type, out);
+        if (ret) return ret;
+        if (type == 2) {
+            if (host_error) return host_error;
+            out += host_offset;
+            if (discontinuous_host && address % M == M - 1) ++out;
+        } else {
+            out += 0x100000000ULL;
+        }
+        return 0;
+    }
+};
+TEST(MemFabricGva, NetworkDramAllocationUsesHostIdentityWithDeviceAlias) {
+    for (const auto* protocol : {"device_rdma", "device_urma"}) {
+        auto api = std::make_shared<HostAddressHybm>();
+        auto c = config();
+        c.protocol = protocol;
+        MemFabricSharedMemory memory(c, "owner", api);
+        ASSERT_TRUE(memory.initialize().ok());
+        void* address = nullptr;
+        ASSERT_TRUE(memory.allocate(&address, M, 2, 0).ok());
+        uint64_t device = 0;
+        ASSERT_EQ(
+            api->translate(reinterpret_cast<uint64_t>(address), 1, device), 0);
+        EXPECT_NE(device, reinterpret_cast<uint64_t>(address));
+        EXPECT_TRUE(memory.free(address, M).ok());
+    }
+}
+TEST(MemFabricGva, NetworkDramAllocationRejectsInvalidHostMapping) {
+    for (int failure = 0; failure < 3; ++failure) {
+        auto api = std::make_shared<HostAddressHybm>();
+        api->host_error = failure == 0 ? -1 : 0;
+        api->host_offset = failure == 1 ? 64 : 0;
+        api->discontinuous_host = failure == 2;
+        auto c = config();
+        c.protocol = "device_rdma";
+        MemFabricSharedMemory memory(c, "owner", api);
+        ASSERT_TRUE(memory.initialize().ok());
+        void* address = nullptr;
+        EXPECT_FALSE(memory.allocate(&address, M, 2, 0).ok());
+        EXPECT_EQ(address, nullptr);
+        EXPECT_EQ(api->frees, 1);
+    }
+}
+TEST(MemFabricGva, DeviceIdentityStillRequiredForHbmAndSdmaDram) {
+    for (uint32_t type : {1u, 2u}) {
+        auto api = std::make_shared<HostAddressHybm>();
+        auto c = config();
+        if (type == 1) c.protocol = "device_rdma";
+        MemFabricSharedMemory memory(c, "owner", api);
+        ASSERT_TRUE(memory.initialize().ok());
+        void* address = nullptr;
+        EXPECT_FALSE(memory.allocate(&address, M, type, 0).ok());
+        EXPECT_EQ(api->frees, 1);
+    }
+}
 TEST(MemFabricGva, MissingApiRejectsAllocation) {
     MemFabricSharedMemory m(config(), "owner", nullptr);
     EXPECT_FALSE(m.initialize().ok());
@@ -242,9 +304,9 @@ TEST(MemFabricGva, BothPoolsShareEntityAndFailedSecondPreservesFirst) {
     a->mismatch = true;
     EXPECT_FALSE(m.allocate(&q, M, 2, 0).ok());
     EXPECT_EQ(a->creates, 1);
-    MemoryOptions o;
-    EXPECT_TRUE(m.describe(p, M, o));
-    EXPECT_EQ(o.global_address, reinterpret_cast<uint64_t>(p));
+    void* resolved = nullptr;
+    EXPECT_TRUE(m.resolve(reinterpret_cast<uint64_t>(p), M, &resolved).ok());
+    EXPECT_EQ(resolved, p);
     EXPECT_TRUE(m.free(p, M).ok());
 }
 TEST(MemFabricGva, PublicationPreventsFreeAndDescriptorIsVersioned) {
@@ -653,8 +715,7 @@ TEST(MemFabricGva, CopyTargetRejectsChangedGenerationAtReusedLogicalAddress) {
 namespace {
 class NetworkHybm : public FakeHybm {
    public:
-    uint32_t protocol_bit = 4;
-    int connect_calls = 0, copy_calls = 0, wait_calls = 0;
+    int connect_calls = 0, copy_calls = 0, wait_calls = 0, reach_calls = 0;
     int connect_result = 0, copy_result = 0;
     int translate(uint64_t address, uint32_t type, uint64_t& out) override {
         for (auto base : imported)
@@ -668,9 +729,12 @@ class NetworkHybm : public FakeHybm {
         return connect_result;
     }
     int reach(void*, uint32_t, uint32_t& result) override {
-        result = protocol_bit;
+        ++reach_calls;
+        result = 0;
         return 0;
     }
+    bool copy_available = true;
+    bool supportsCopy() const override { return copy_available; }
     int copy(void*, uint64_t, uint64_t, size_t, uint32_t) override {
         ++copy_calls;
         return copy_result;
@@ -700,9 +764,6 @@ class MemFabricNetworkGva : public ::testing::TestWithParam<const char*> {
         remote_config.rank = 1;
         local_api = std::make_shared<NetworkHybm>();
         remote_api = std::make_shared<NetworkHybm>();
-        local_api->protocol_bit =
-            std::string(GetParam()) == "device_urma" ? 256 : 4;
-        remote_api->protocol_bit = local_api->protocol_bit;
         local = std::make_unique<MemFabricSharedMemory>(local_config, "local",
                                                         local_api);
         remote = std::make_unique<MemFabricSharedMemory>(remote_config,
@@ -746,6 +807,7 @@ TEST_P(MemFabricNetworkGva, NetworkCopyDoesNotRequireRemoteDeviceAddress) {
     EXPECT_FALSE(begin(direction).ok());
     ASSERT_TRUE(prepare().ok());
     EXPECT_GE(local_api->connect_calls, 1);
+    EXPECT_EQ(local_api->reach_calls, 0);
     void* device_address = reinterpret_cast<void*>(1);
     EXPECT_FALSE(
         local->resolve(reinterpret_cast<uint64_t>(target), M, &device_address)
@@ -777,12 +839,6 @@ TEST_P(MemFabricNetworkGva, FailedConnectCannotAuthorizeCopyAndCanRetry) {
     ASSERT_TRUE(prepare().ok());
     ASSERT_TRUE(begin(direction).ok());
     local->cancelCopy();
-}
-TEST_P(MemFabricNetworkGva, WrongReachabilityProtocolCannotAuthorizeCopy) {
-    local_api->protocol_bit = 1;
-    EXPECT_FALSE(prepare().ok());
-    uint32_t direction = 0;
-    EXPECT_FALSE(begin(direction).ok());
 }
 TEST_P(MemFabricNetworkGva, FailedNetworkCopyQuarantinesDespiteWaitSuccess) {
     ASSERT_TRUE(prepare().ok());
@@ -841,6 +897,7 @@ TEST_P(MemFabricNetworkGva,
 
 TEST_P(MemFabricNetworkGva,
        NativeBatchSettlesAllPinsWithOneBindingAndNativeCall) {
+    local_api->copy_available = false;
     ASSERT_TRUE(prepare().ok());
     std::vector<MemFabricGvaCopy> copies;
     uint32_t direction = 0;

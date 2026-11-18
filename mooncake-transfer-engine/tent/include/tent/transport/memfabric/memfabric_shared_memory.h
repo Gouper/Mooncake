@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -191,14 +192,13 @@ class MemFabricSharedMemory {
     Status allocate(void**, size_t, uint32_t memory_type, uint64_t requested);
     Status allocate(void**, size_t, uint32_t memory_type, MemoryOptions&);
     Status free(void*, size_t);
-    bool describe(void*, size_t, MemoryOptions&) const;
     bool overlaps(uint64_t, size_t) const;
     Status publish(void*, size_t, std::string&);
     // Publish all complete allocations together; failure leaves publication
     // state and the caller's descriptors unchanged.
     Status publish(const std::vector<std::pair<void*, size_t>>& ranges,
                    std::vector<std::string>& descriptors);
-    Status unpublish(void*);
+    Status unpublish(void*, std::optional<size_t> size = std::nullopt);
     Status map(const std::string& owner, const std::string& descriptor,
                uint64_t address, size_t size);
     Status prepare(const std::string& owner, const std::string& descriptor,
@@ -224,7 +224,7 @@ class MemFabricSharedMemory {
     using Json = nlohmann::json;
     struct Pool {
         void* slice = nullptr;
-        uint64_t address = 0, length = 0, host_address = 0, device_address = 0;
+        uint64_t length = 0;
         uint32_t memory_type = 0;
         bool published = false;
         Json descriptor;
@@ -251,8 +251,8 @@ class MemFabricSharedMemory {
     Status initializeContext();
     Status bindDevice();
     Status validateDescriptor(const Json&, const std::string&) const;
-    Status recordPeer(const Json&, const std::string&);
-    Status importPeer(const Json&, const std::string&);
+    RemotePool& recordPool(ImportedRank&, const Json&);
+    Status importPeer(ImportedRank&, const Json&);
     Status verifyPeerMapping(uint32_t, const RemotePool&);
     Status cleanupPeer(uint32_t, ImportedRank&);
     Json makeIdentity() const;
