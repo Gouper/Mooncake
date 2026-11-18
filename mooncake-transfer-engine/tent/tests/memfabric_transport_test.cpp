@@ -2345,7 +2345,8 @@ TEST_F(MemFabricTransportTest, GvaConfigUsesApplicationDeviceAndWindowBudgets) {
     EXPECT_EQ(GvaConfig().protocol, "device_rdma");
     EXPECT_EQ(GvaConfig().hbm_size, GvaConfig().hbm_window);
     EXPECT_EQ(GvaConfig().dram_size, GvaConfig().dram_window);
-    EXPECT_EQ(GvaConfig().entity, 64);
+    EXPECT_GE(GvaConfig().entity, 64);
+    EXPECT_LT(GvaConfig().entity, 511);
 }
 
 TEST_F(MemFabricTransportTest,

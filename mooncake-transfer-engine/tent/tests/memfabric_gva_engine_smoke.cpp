@@ -150,7 +150,6 @@ void child(const Options& o, int rank, int fd) {
         config->set(prefix + "enabled", true);
         config->set(prefix + "rank_count", int64_t{2});
         config->set(prefix + "rank", int64_t{rank});
-        config->set(prefix + "entity", int64_t{64});
         config->set(prefix + "hbm_window", uint64_t{o.pool});
         config->set(prefix + "dram_window", uint64_t{0});
         // Deliberately leak on failure: exiting the process is safer than

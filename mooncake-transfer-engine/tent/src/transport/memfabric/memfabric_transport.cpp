@@ -1,6 +1,7 @@
 #include "tent/transport/memfabric/memfabric_transport.h"
 
 #include <acl/acl.h>
+#include <atomic>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,14 @@ namespace mooncake {
 namespace tent {
 
 namespace {
+
+// Entity id is a per-process engine/meta index (not a network port): HYBM
+// dedups entities by id inside the process, so ids must be unique within a
+// process, while peers may share the same id. Lower ids are reserved
+// internally; HYBM caps valid ids below 511 (HYBM_ENTITY_NUM_MAX).
+constexpr uint16_t kFirstGvaEntityId = 64;
+constexpr uint16_t kMaxGvaEntityId = 511;
+std::atomic<uint16_t> g_next_gva_entity{kFirstGvaEntityId};
 
 // Must match SMEM Trans's NPU page alignment. All native registration
 // boundaries are multiples of this size, including ranges on remote peers.
@@ -217,17 +226,21 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
             device > UINT16_MAX)
             return Status::InvalidArgument(
                 "MemFabric GVA requires an application-bound device");
-        const auto entity = conf->get(prefix + "entity", int64_t{64});
         // Keep conversions safe; HYBM validates rank topology and sizes.
-        if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX ||
-            entity < 64 || entity >= 128)
+        if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX)
             return Status::InvalidArgument(
                 "Invalid MemFabric GVA configuration");
         gva_config_.rank_count = ranks;
         gva_config_.rank = rank;
         gva_config_.device = static_cast<uint16_t>(device);
-        gva_config_.entity =
-            entity;  // 底层hybm端口号会自动生成，一个进程里面entity全局变量+1，不要再这个地方配置。
+        // Entity id is auto-assigned per process; it is not a configuration
+        // knob and not a network port. See g_next_gva_entity above.
+        const auto entity =
+            g_next_gva_entity.fetch_add(1, std::memory_order_relaxed);
+        if (entity >= kMaxGvaEntityId)
+            return Status::InvalidArgument(
+                "MemFabric GVA entity id exhausted" LOC_MARK);
+        gva_config_.entity = entity;
         gva_config_.hbm_window = conf->get(prefix + "hbm_window", uint64_t{0});
         gva_config_.dram_window =
             conf->get(prefix + "dram_window", uint64_t{0});
