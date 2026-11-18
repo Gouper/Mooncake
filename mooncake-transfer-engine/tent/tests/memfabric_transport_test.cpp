@@ -669,7 +669,7 @@ class MemFabricTransportTest : public ::testing::Test {
         config->set("transports/memfabric/gva/rank_count", int64_t{2});
         config->set("transports/memfabric/gva/rank", int64_t{0});
         config->set("transports/memfabric/gva/hbm_window",
-                    uint64_t{1ULL << 30});
+                    uint64_t{1});
         return config;
     }
 
@@ -2338,7 +2338,7 @@ TEST_F(MemFabricTransportTest, GvaConfigUsesApplicationDeviceAndWindowBudgets) {
     g_device_id = 3;
     config->set("transports/memfabric/gva/device", int64_t{9});
     config->set("transports/memfabric/gva/hbm_size", uint64_t{1});
-    config->set("transports/memfabric/gva/dram_window", uint64_t{2ULL << 30});
+    config->set("transports/memfabric/gva/dram_window", uint64_t{2});
     ASSERT_TRUE(LoadConfig(config).ok());
     EXPECT_EQ(GvaConfig().device, 3);
     EXPECT_EQ(GvaConfig().group, "mooncake-memfabric");
@@ -2402,7 +2402,7 @@ TEST_F(MemFabricTransportTest, GvaInstallDoesNotRequireTransEndpoint) {
     conf->set(prefix + "rank", int64_t{0});
     conf->set(prefix + "device", int64_t{0});
     conf->set(prefix + "hbm_size", uint64_t{2ULL << 20});
-    conf->set(prefix + "hbm_window", uint64_t{2ULL << 20});
+    conf->set(prefix + "hbm_window", uint64_t{1});
     const auto status = transport_->install(name_, metadata_, nullptr, conf);
     // Without HYBM symbols installation can fail, but it must reach the GVA
     // backend instead of rejecting the trans RPC endpoint.

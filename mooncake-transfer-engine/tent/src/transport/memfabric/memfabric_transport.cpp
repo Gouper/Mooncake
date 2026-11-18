@@ -32,6 +32,10 @@ std::atomic<uint16_t> g_next_gva_entity{kFirstGvaEntityId};
 // boundaries are multiples of this size, including ranges on remote peers.
 constexpr uint64_t kRegistrationAlignment = 2ULL * 1024 * 1024;
 
+// `hbm_window` / `dram_window` configuration values are expressed in GiB and
+// converted to bytes for the HYBM sizing options.
+constexpr uint64_t kGvaWindowUnit = 1ULL << 30;
+
 Status alignedBufferRange(const BufferDesc& desc, uint64_t& begin,
                           uint64_t& end) {
     constexpr auto mask = kRegistrationAlignment - 1;
@@ -241,9 +245,10 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
             return Status::InvalidArgument(
                 "MemFabric GVA entity id exhausted" LOC_MARK);
         gva_config_.entity = entity;
-        gva_config_.hbm_window = conf->get(prefix + "hbm_window", uint64_t{0});
+        gva_config_.hbm_window =
+            conf->get(prefix + "hbm_window", uint64_t{0}) * kGvaWindowUnit;
         gva_config_.dram_window =
-            conf->get(prefix + "dram_window", uint64_t{0});
+            conf->get(prefix + "dram_window", uint64_t{0}) * kGvaWindowUnit;
         gva_config_.hbm_size = gva_config_.hbm_window;
         gva_config_.dram_size = gva_config_.dram_window;
         return Status::OK();

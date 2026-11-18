@@ -150,7 +150,9 @@ void child(const Options& o, int rank, int fd) {
         config->set(prefix + "enabled", true);
         config->set(prefix + "rank_count", int64_t{2});
         config->set(prefix + "rank", int64_t{rank});
-        config->set(prefix + "hbm_window", uint64_t{o.pool});
+        // hbm_window / dram_window are expressed in GiB, while the pool
+        // budget (o.pool) is byte-granular for allocation sizing.
+        config->set(prefix + "hbm_window", uint64_t{o.pool >> 30});
         config->set(prefix + "dram_window", uint64_t{0});
         // Deliberately leak on failure: exiting the process is safer than
         // attempting object teardown while failed device work may be in flight.
