@@ -289,22 +289,7 @@ class NativeHybm final {
     }
     int bind(uint16_t device) { return aclrtSetDevice(device); }
     // HYBM itself reference-counts init/uninit, also used by smem_trans_init.
-    int initialize(uint16_t device) {
-        const auto result = hybm_init_(device, 0);
-        if (result) return result;
-        // Older libraries expose the same symbols but collapse registry misses
-        // and arbitrary conversion failures into BM_ERROR. Refuse allocation
-        // rather than discover at teardown that absence cannot be certified.
-        uint64_t ignored = 0;
-        if (hybm_gva_to_va_(UINT64_MAX, HYBM_MEM_TYPE_DEVICE, &ignored) !=
-            BM_GVA_NOT_FOUND) {
-            LOG(ERROR) << "HYBM GVA requires the BM_GVA_NOT_FOUND registry "
-                          "contract; the loaded library is incompatible";
-            hybm_uninit_();
-            return BM_NOT_SUPPORTED;
-        }
-        return 0;
-    }
+    int initialize(uint16_t device) { return hybm_init_(device, 0); }
     void uninitialize() { hybm_uninit_(); }
     void* create(const MemFabricGvaConfig& config) {
         hybm_options options{};

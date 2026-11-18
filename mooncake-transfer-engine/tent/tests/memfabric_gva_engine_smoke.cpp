@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Opt-in real-ACL, public TransferEngine two-process integration smoke.
 #include <acl/acl.h>
+#include <glog/logging.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -126,6 +127,8 @@ void transfer(TransferEngine& engine, int rank, SegmentID peer,
 }
 void child(const Options& o, int rank, int fd) {
     try {
+        FLAGS_logtostderr = true;
+        google::InitGoogleLogging("tent_memfabric_gva_engine_smoke");
         alarm(o.timeout);
         timeval socket_timeout{static_cast<long>(o.timeout), 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &socket_timeout,
