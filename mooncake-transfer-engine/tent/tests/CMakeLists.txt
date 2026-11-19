@@ -903,8 +903,11 @@ add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 if(USE_MEMFABRIC)
   add_executable(tent_memfabric_gva_test memfabric_gva_test.cpp)
   target_sources(tent_memfabric_gva_test PRIVATE memfabric_test_acl_stubs.cpp)
-  target_link_libraries(
-    tent_memfabric_gva_test PRIVATE gtest gtest_main tent_link_group)
+  target_link_libraries(tent_memfabric_gva_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_memfabric_gva_test PRIVATE asio_shared)
+  endif()
   target_include_directories(
     tent_memfabric_gva_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
                                     ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
@@ -917,12 +920,11 @@ if(USE_MEMFABRIC)
                                           ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
   add_test(NAME tent_memfabric_transport_test
            COMMAND tent_memfabric_transport_test)
-  # The engine-level GVA registration cases link the full engine, including the
-  # Ascend platform, so supply host-only ACL entry points for this configuration.
-  target_sources(
-    tent_local_memory_lifecycle_test PRIVATE memfabric_test_acl_stubs.cpp)
-  target_include_directories(
-    tent_local_memory_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
+  # The lifecycle test needs ACL stubs for the Ascend platform in host builds.
+  target_sources(tent_local_memory_lifecycle_test
+                 PRIVATE memfabric_test_acl_stubs.cpp)
+  target_include_directories(tent_local_memory_lifecycle_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
 endif()
 
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)

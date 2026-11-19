@@ -1,5 +1,33 @@
 #include <gtest/gtest.h>
+
+#include <utility>
+
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
+
+#if defined(__linux__)
+#include <sys/mman.h>
+
+#include <algorithm>
+
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
+#include "tent/transport/memfabric/memfabric_transport.h"
+
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static tent::TransferEngineImpl* impl(tent::TransferEngine& engine) {
+        return engine.impl_.get();
+    }
+    static std::vector<tent::BufferDesc> localBuffers(
+        tent::TransferEngineImpl& engine) {
+        const auto local = engine.metadata_->segmentManager().getLocal();
+        return std::get<tent::MemorySegmentDesc>(local->detail).buffers;
+    }
+};
+}  // namespace mooncake
+#endif
+
 using namespace mooncake::tent;
 namespace {
 constexpr uint64_t M = 2ULL << 20;
@@ -195,12 +223,27 @@ TEST(MemFabricGva, DeviceIdentityStillRequiredForHbmAndSdmaDram) {
         EXPECT_EQ(api->frees, 1);
     }
 }
-TEST(MemFabricGva, MissingApiRejectsAllocation) {
-    MemFabricSharedMemory m(config(), "owner", nullptr);
-    EXPECT_FALSE(m.initialize().ok());
-    void* p = nullptr;
-    EXPECT_FALSE(m.allocate(&p, M, 1, 0).ok());
-    EXPECT_EQ(p, nullptr);
+TEST(MemFabricGva, InitializationFailureRejectsAllocation) {
+    {
+        SCOPED_TRACE("missing backend");
+        MemFabricSharedMemory memory(config(), "owner", nullptr);
+        EXPECT_FALSE(memory.initialize().ok());
+        void* address = nullptr;
+        EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
+        EXPECT_EQ(address, nullptr);
+    }
+    {
+        SCOPED_TRACE("unsupported protocol");
+        auto options = config();
+        options.protocol = "unknown_protocol";
+        auto api = std::make_shared<FakeHybm>();
+        MemFabricSharedMemory memory(options, "owner", api);
+        EXPECT_FALSE(memory.initialize().ok());
+        void* address = nullptr;
+        EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
+        EXPECT_EQ(address, nullptr);
+        EXPECT_EQ(api->creates, 1);
+    }
 }
 TEST(MemFabricGva, BatchPublishBindsOnceAndPublishesEveryPool) {
     auto api = std::make_shared<FakeHybm>();
@@ -235,10 +278,18 @@ TEST(MemFabricGva, BatchPublishValidatesAllRangesBeforeExporting) {
     void* first = nullptr;
     ASSERT_TRUE(memory.allocate(&first, M, 1, 0).ok());
     std::vector<std::string> descriptors{"unchanged"};
-    EXPECT_FALSE(
-        memory.publish({{first, M}, {first, M / 2}}, descriptors).ok());
-    EXPECT_EQ(descriptors, std::vector<std::string>{"unchanged"});
-    EXPECT_EQ(api->slice_exports, 0);
+    const std::pair<void*, size_t> invalid_ranges[] = {
+        {first, M / 2},
+        {reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(first) + 1),
+         M - 1},
+        {first, M + 1},
+    };
+    for (const auto& range : invalid_ranges) {
+        EXPECT_TRUE(memory.publish({{first, M}, range}, descriptors)
+                        .IsInvalidArgument());
+        EXPECT_EQ(descriptors, std::vector<std::string>{"unchanged"});
+        EXPECT_EQ(api->slice_exports, 0);
+    }
     EXPECT_TRUE(memory.free(first, M).ok());
 }
 TEST(MemFabricGva, BatchPublishExportFailureDoesNotPublishEarlierPool) {
@@ -325,13 +376,6 @@ TEST(MemFabricGva, PublicationPreventsFreeAndDescriptorIsVersioned) {
     EXPECT_TRUE(m.free(p, M).ok());
 }
 
-TEST(MemFabricGva, MalformedDescriptorDoesNotImport) {
-    auto api = std::make_shared<FakeHybm>();
-    MemFabricSharedMemory memory(config(), "owner", api);
-    ASSERT_TRUE(memory.initialize().ok());
-    EXPECT_FALSE(memory.map("peer", "{}", 0x11000000, M).ok());
-    EXPECT_EQ(api->imports, 0);
-}
 struct Pair {
     std::shared_ptr<FakeHybm> aa = std::make_shared<FakeHybm>(),
                               bb = std::make_shared<FakeHybm>();
@@ -493,11 +537,6 @@ TEST(MemFabricGva, RegistryRemainingAfterUnmapIsPending) {
     p.aa->stale = false;
     EXPECT_TRUE(p.unmapH().ok());
 }
-TEST(MemFabricGva, CopyReachabilityDoesNotAuthorizeDirectMap) {
-    Pair p;
-    p.aa->reachable = false;
-    EXPECT_FALSE(p.mapH().ok());
-}
 TEST(MemFabricGva, PeerBecomingReadyCanRetryWithoutReimportingSlices) {
     Pair p;
     p.aa->reachable = false;
@@ -549,17 +588,10 @@ TEST(MemFabricGva, EntityExportFailureCanBeRetriedOnTheSameEntity) {
     EXPECT_EQ(api->creates, 1);
     EXPECT_TRUE(memory.free(address, M).ok());
 }
-TEST(MemFabricGva, FailedFixedAddressDoesNotKeepConsumingNativeCapacity) {
-    auto api = std::make_shared<FakeHybm>();
-    MemFabricSharedMemory memory(config(), "owner", api);
-    ASSERT_TRUE(memory.initialize().ok());
-    void* address = nullptr;
-    EXPECT_FALSE(memory.allocate(&address, M, 1, 42).ok());
-    EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
-    EXPECT_EQ(api->frees, 1);
-}
-TEST(MemFabricGva, MalformedIdentityAndBinaryDataNeverReachNativeImport) {
+TEST(MemFabricGva, MalformedDescriptorsNeverReachNativeImport) {
     Pair p;
+    EXPECT_FALSE(
+        p.a.map("b", "{}", reinterpret_cast<uint64_t>(p.bh), M).ok());
     auto descriptor = nlohmann::json::parse(p.h);
     descriptor["slice_blob"] = {256u};
     EXPECT_FALSE(
@@ -693,16 +725,38 @@ TEST(MemFabricGva, RemoteResolutionPreservesSameAddressAndRequiresActiveMap) {
     EXPECT_FALSE(p.a.resolve(gva, M, &remote_dva).ok());
     EXPECT_EQ(remote_dva, nullptr);
 }
-TEST(MemFabricGva, FailedMappingNeverExposesAnImportedDeviceAddress) {
-    Pair p;
-    p.aa->reachable = false;
-    EXPECT_FALSE(p.mapH().ok());
-    void* dva = nullptr;
-    EXPECT_FALSE(p.a.resolve(reinterpret_cast<uint64_t>(p.bh), M, &dva).ok());
-    EXPECT_EQ(dva, nullptr);
-    p.aa->reachable = true;
-    ASSERT_TRUE(p.mapH().ok());
-    EXPECT_TRUE(p.a.resolve(reinterpret_cast<uint64_t>(p.bh), M, &dva).ok());
+TEST(MemFabricGva, FailedMappingNeverExposesAddressOrAuthorizesCopy) {
+    {
+        SCOPED_TRACE("unreachable peer");
+        Pair p;
+        p.aa->reachable = false;
+        EXPECT_FALSE(p.mapH().ok());
+        void* dva = nullptr;
+        EXPECT_FALSE(
+            p.a.resolve(reinterpret_cast<uint64_t>(p.bh), M, &dva).ok());
+        EXPECT_EQ(dva, nullptr);
+        p.aa->reachable = true;
+        ASSERT_TRUE(p.mapH().ok());
+        EXPECT_TRUE(
+            p.a.resolve(reinterpret_cast<uint64_t>(p.bh), M, &dva).ok());
+    }
+    {
+        SCOPED_TRACE("non-identity peer address");
+        Pair p;
+        p.aa->mismatch = true;
+        EXPECT_FALSE(p.mapH().ok());
+        void* address = nullptr;
+        EXPECT_FALSE(
+            p.a.resolve(reinterpret_cast<uint64_t>(p.bh), 64, &address).ok());
+        EXPECT_EQ(address, nullptr);
+        std::string descriptor;
+        ASSERT_TRUE(p.a.publish(p.ah, M, descriptor).ok());
+        uint32_t direction = 0;
+        EXPECT_FALSE(
+            p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah),
+                          reinterpret_cast<uint64_t>(p.bh), 64, direction)
+                .ok());
+    }
 }
 TEST(MemFabricGva, LogicalUnmapRevokesResolutionBeforeRankCleanup) {
     Pair p;
@@ -896,12 +950,15 @@ TEST_P(MemFabricNetworkGva, MissingConnectSymbolFailsBeforeImport) {
     EXPECT_EQ(local_api->imports, 0);
     EXPECT_EQ(local_api->connect_calls, 0);
 }
-TEST_P(MemFabricNetworkGva, NetworkCopyDoesNotRequireRemoteDeviceAddress) {
+TEST_P(MemFabricNetworkGva,
+       NetworkPrepareNeedsNoDeviceAddressAndKeepsNativeCopy) {
     uint32_t direction = 0;
     EXPECT_FALSE(begin(direction).ok());
     ASSERT_TRUE(prepare().ok());
+    ASSERT_TRUE(prepare().ok());
     EXPECT_GE(local_api->connect_calls, 1);
     EXPECT_EQ(local_api->reach_calls, 0);
+    EXPECT_EQ(local_api->copy_calls, 0);
     void* device_address = reinterpret_cast<void*>(1);
     EXPECT_FALSE(
         local->resolve(reinterpret_cast<uint64_t>(target), M, &device_address)
@@ -919,11 +976,20 @@ TEST_P(MemFabricNetworkGva, NetworkCopyDoesNotRequireRemoteDeviceAddress) {
                               reinterpret_cast<uint64_t>(target), M, direction)
                     .ok());
     EXPECT_EQ(local_api->copy_calls, 1);
-    const auto copies = local_api->copy_calls;
+    ASSERT_TRUE(local
+                    ->beginCopy(reinterpret_cast<uint64_t>(target),
+                                reinterpret_cast<uint64_t>(source), M,
+                                direction)
+                    .ok());
+    ASSERT_TRUE(local
+                    ->runCopy(reinterpret_cast<uint64_t>(target),
+                              reinterpret_cast<uint64_t>(source), M, direction)
+                    .ok());
+    EXPECT_EQ(local_api->copy_calls, 2);
     EXPECT_FALSE(
         local->map("remote", remote_desc, reinterpret_cast<uint64_t>(target), M)
             .ok());
-    EXPECT_EQ(local_api->copy_calls, copies);
+    EXPECT_EQ(local_api->copy_calls, 2);
     EXPECT_FALSE(
         local->resolve(reinterpret_cast<uint64_t>(target), M, &device_address)
             .ok());
@@ -962,39 +1028,6 @@ TEST_P(MemFabricNetworkGva, GenerationChangeInvalidatesPreparedCopyTarget) {
                                           reinterpret_cast<uint64_t>(target),
                                           descriptor.dump())
                      .ok());
-}
-
-TEST_P(MemFabricNetworkGva,
-       NativePreparationDoesNotCopyOrRequireRemoteDeviceAddress) {
-    ASSERT_TRUE(local
-                    ->prepare("remote", remote_desc,
-                              reinterpret_cast<uint64_t>(target), M)
-                    .ok());
-    ASSERT_TRUE(local
-                    ->prepare("remote", remote_desc,
-                              reinterpret_cast<uint64_t>(target), M)
-                    .ok());
-    EXPECT_EQ(local_api->copy_calls, 0);
-    void* pointer = reinterpret_cast<void*>(1);
-    EXPECT_FALSE(
-        local->resolve(reinterpret_cast<uint64_t>(target), M, &pointer).ok());
-    EXPECT_EQ(pointer, nullptr);
-    uint32_t direction = 0;
-    ASSERT_TRUE(begin(direction).ok());
-    ASSERT_TRUE(local
-                    ->runCopy(reinterpret_cast<uint64_t>(source),
-                              reinterpret_cast<uint64_t>(target), M, direction)
-                    .ok());
-    ASSERT_TRUE(local
-                    ->beginCopy(reinterpret_cast<uint64_t>(target),
-                                reinterpret_cast<uint64_t>(source), M,
-                                direction)
-                    .ok());
-    ASSERT_TRUE(local
-                    ->runCopy(reinterpret_cast<uint64_t>(target),
-                              reinterpret_cast<uint64_t>(source), M, direction)
-                    .ok());
-    EXPECT_EQ(local_api->copy_calls, 2);
 }
 
 TEST_P(MemFabricNetworkGva,
@@ -1063,18 +1096,6 @@ TEST_P(MemFabricNetworkGva, EmptyNativeBatchDoesNotBindOrCallNative) {
 INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
                          ::testing::Values("device_rdma", "device_urma"));
 }  // namespace
-
-TEST(MemFabricGva, UnsupportedNetworkProtocolRejectsAllocation) {
-    auto options = config();
-    options.protocol = "unknown_protocol";
-    auto api = std::make_shared<FakeHybm>();
-    MemFabricSharedMemory memory(options, "owner", api);
-    EXPECT_FALSE(memory.initialize().ok());
-    void* address = nullptr;
-    EXPECT_FALSE(memory.allocate(&address, M, 1, 0).ok());
-    EXPECT_EQ(address, nullptr);
-    EXPECT_EQ(api->creates, 1);
-}
 
 TEST(MemFabricGva, ExistingContextOnlyRebindsDeviceAndRetriesBindFailure) {
     auto api = std::make_shared<FakeHybm>();
@@ -1147,21 +1168,6 @@ TEST(MemFabricGva, MapOnlyContextRequiresExplicitInitialization) {
     ASSERT_TRUE(receiver.close().ok());
 }
 
-TEST(MemFabricGva, NonIdentityPeerMapCannotAuthorizeAccessOrCopy) {
-    Pair p;
-    p.aa->mismatch = true;
-    EXPECT_FALSE(p.mapH().ok());
-    void* address = nullptr;
-    EXPECT_FALSE(
-        p.a.resolve(reinterpret_cast<uint64_t>(p.bh), 64, &address).ok());
-    EXPECT_EQ(address, nullptr);
-    std::string descriptor;
-    ASSERT_TRUE(p.a.publish(p.ah, M, descriptor).ok());
-    uint32_t direction = 0;
-    EXPECT_FALSE(p.a.beginCopy(reinterpret_cast<uint64_t>(p.ah),
-                               reinterpret_cast<uint64_t>(p.bh), 64, direction)
-                     .ok());
-}
 TEST(MemFabricGva, ResolveRejectsChangedNonIdentityTranslation) {
     Pair p;
     ASSERT_TRUE(p.mapH().ok());
@@ -1368,6 +1374,7 @@ TEST(MemFabricGva, FailedFixedAddressConsumesOnlyItsActualBumpExtent) {
     MultiAllocations p;
     void* address = nullptr;
     EXPECT_FALSE(p.local.allocate(&address, M, 1, 1).ok());
+    EXPECT_EQ(p.local_api->frees, 1);
     ASSERT_TRUE(p.local.allocate(&address, M, 1, 0).ok());
     EXPECT_EQ(reinterpret_cast<uint64_t>(address),
               p.local_api->base(nullptr, 1) + M);
@@ -1478,3 +1485,216 @@ TEST(MemFabricGva, FailedSdmaBatchDrainsOnceAndReleasesAllRequestPins) {
     ASSERT_TRUE(memory.free(source, M).ok());
     ASSERT_TRUE(memory.free(destination, M).ok());
 }
+
+#if defined(__linux__)
+namespace {
+
+std::shared_ptr<Config> makeConfig() {
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("metadata_servers", "");
+    config->set("rpc_server_hostname", "127.0.0.1");
+    config->set("rpc_server_port", "0");
+    config->set("log_level", "warning");
+
+    for (const char* transport :
+         {"memfabric", "tcp", "shm", "rdma", "io_uring", "nvlink", "mnnvl",
+          "gds", "ascend_direct", "mlu"}) {
+        config->set(std::string("transports/") + transport + "/enable", false);
+    }
+    return config;
+}
+
+// A logical GVA is not dereferenceable. PROT_NONE makes an accidental host
+// probe fail deterministically instead of quietly accepting a CPU-accessible
+// fake.
+class DeviceAddressMemFabricTransport : public MemFabricTransport {
+   public:
+    ~DeviceAddressMemFabricTransport() override {
+        if (pool) munmap(pool, pool_size);
+    }
+
+    Status allocateLocalMemory(void** address, size_t size,
+                               MemoryOptions& options) override {
+        pool =
+            mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pool == MAP_FAILED) {
+            pool = nullptr;
+            return Status::InternalError("mmap failed");
+        }
+        pool_size = size;
+        *address = pool;
+        options.type = MEMFABRIC;
+        options.location = "npu:0";
+        options.global_address = reinterpret_cast<uint64_t>(pool);
+        return Status::OK();
+    }
+
+    Status freeLocalMemory(void* address, size_t size) override {
+        ++free_calls;
+        if (address != pool || size != pool_size) {
+            return Status::InvalidArgument("unknown allocation");
+        }
+        munmap(pool, pool_size);
+        pool = nullptr;
+        return Status::OK();
+    }
+
+    bool supportsGlobalAddressing() const override { return true; }
+
+    bool warmupMemory(void* address, size_t size) override {
+        ++warmup_calls;
+        const auto base = reinterpret_cast<uint64_t>(pool);
+        const auto start = reinterpret_cast<uint64_t>(address);
+        return pool && size &&
+               (start >= base ? start - base < pool_size : base - start < size);
+    }
+
+    Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        if (desc.addr == reinterpret_cast<uint64_t>(pool)) {
+            desc.location = "npu:0";
+        }
+        desc.transports.push_back(MEMFABRIC);
+        return Status::OK();
+    }
+
+    Status addMemoryBuffer(std::vector<BufferDesc>& descs,
+                           const MemoryOptions& options) override {
+        if (fail_registration) {
+            return Status::InternalError("injected GVA export failure");
+        }
+        for (auto& desc : descs) CHECK_STATUS(addMemoryBuffer(desc, options));
+        return Status::OK();
+    }
+
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        desc.transports.erase(std::remove(desc.transports.begin(),
+                                          desc.transports.end(), MEMFABRIC),
+                              desc.transports.end());
+        return Status::OK();
+    }
+
+    Status mapRemoteMemory(SegmentID, void*, size_t) override {
+        ++map_calls;
+        return Status::OK();
+    }
+
+    Status unmapRemoteMemory(SegmentID, void*) override {
+        ++unmap_calls;
+        return Status::OK();
+    }
+
+    void* pool = nullptr;
+    size_t pool_size = 0;
+    int warmup_calls = 0, free_calls = 0, map_calls = 0, unmap_calls = 0;
+    bool fail_registration = false;
+};
+
+class RegistrationObserver : public Transport {
+   public:
+    bool warmupMemory(void*, size_t) override {
+        ++warmup_calls;
+        return false;
+    }
+    Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        registered.push_back(desc.addr);
+        desc.transports.push_back(TCP);
+        return Status::OK();
+    }
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        desc.transports.erase(
+            std::remove(desc.transports.begin(), desc.transports.end(), TCP),
+            desc.transports.end());
+        return Status::OK();
+    }
+    int warmup_calls = 0;
+    std::vector<uint64_t> registered;
+};
+
+class MemFabricEngineRegistration : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        frontend = std::make_unique<TransferEngine>(makeConfig());
+        engine = mooncake::TransferEngineImplTestPeer::impl(*frontend);
+        ASSERT_TRUE(engine->available());
+        memfabric = std::make_shared<DeviceAddressMemFabricTransport>();
+        engine->swapTransportForTest(MEMFABRIC, memfabric);
+        options.type = MEMFABRIC;
+        options.location = "cpu:0";
+        ASSERT_TRUE(engine->allocateLocalMemory(&pool, kSize, options).ok());
+        EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(pool));
+        options = MemoryOptions{};
+    }
+
+    static constexpr size_t kSize = 4096;
+    std::unique_ptr<TransferEngine> frontend;
+    TransferEngineImpl* engine = nullptr;
+    std::shared_ptr<DeviceAddressMemFabricTransport> memfabric;
+    MemoryOptions options;
+    void* pool = nullptr;
+};
+
+TEST_F(MemFabricEngineRegistration, DefaultRegistrationSkipsGvaPrefault) {
+    auto status = engine->registerLocalMemory(pool, kSize);
+    ASSERT_TRUE(status.ok()) << status;
+    const auto buffers =
+        mooncake::TransferEngineImplTestPeer::localBuffers(*engine);
+    ASSERT_EQ(buffers.size(), 1u);
+    EXPECT_EQ(buffers[0].location, "npu:0");
+    EXPECT_EQ(buffers[0].transports, std::vector<TransportType>{MEMFABRIC});
+    EXPECT_EQ(memfabric->warmup_calls, 1);
+}
+
+TEST_F(MemFabricEngineRegistration, ExternalBufferStillUsesProbe) {
+    auto tcp = std::make_shared<RegistrationObserver>();
+    engine->swapTransportForTest(TCP, tcp);
+    std::vector<char> ordinary(kSize);
+    MemoryOptions options;
+    options.location = "npu:0";
+    auto status =
+        engine->registerLocalMemory({ordinary.data()}, {kSize}, options);
+    ASSERT_TRUE(status.ok()) << status;
+    const auto buffers =
+        mooncake::TransferEngineImplTestPeer::localBuffers(*engine);
+    ASSERT_EQ(buffers.size(), 1u);
+    // NUMA probing may return the wildcard when move_pages is unavailable.
+    EXPECT_TRUE(buffers[0].location == kWildcardLocation ||
+                buffers[0].location.substr(0, 4) == "cpu:");
+    EXPECT_GT(tcp->warmup_calls, 0);
+    EXPECT_EQ(
+        tcp->registered,
+        std::vector<uint64_t>{reinterpret_cast<uint64_t>(ordinary.data())});
+    EXPECT_TRUE(engine->unregisterLocalMemory(ordinary.data()).ok());
+}
+
+TEST_F(MemFabricEngineRegistration, ExportFailureDoesNotPublish) {
+    memfabric->fail_registration = true;
+    EXPECT_FALSE(engine->registerLocalMemory({pool}, {kSize}, options).ok());
+    EXPECT_TRUE(
+        mooncake::TransferEngineImplTestPeer::localBuffers(*engine).empty());
+}
+
+TEST_F(MemFabricEngineRegistration, ZeroRequestCannotFreePublishedPool) {
+    ASSERT_TRUE(engine->registerLocalMemory({pool}, {kSize}, options).ok());
+    EXPECT_TRUE(engine->freeLocalMemory(pool).IsInvalidArgument());
+    EXPECT_EQ(memfabric->free_calls, 0);
+    ASSERT_TRUE(engine->unregisterLocalMemory(pool).ok());
+    EXPECT_TRUE(engine->freeLocalMemory(pool).ok());
+    EXPECT_EQ(memfabric->free_calls, 1);
+}
+
+TEST_F(MemFabricEngineRegistration,
+       ExplicitMappingValidatesRangeBeforeDispatch) {
+    EXPECT_TRUE(
+        frontend->mapRemoteMemory(1, pool, 0, MEMFABRIC).IsInvalidArgument());
+    EXPECT_TRUE(frontend->mapRemoteMemory(1, nullptr, kSize, MEMFABRIC)
+                    .IsInvalidArgument());
+    EXPECT_EQ(memfabric->map_calls, 0);
+    ASSERT_TRUE(frontend->mapRemoteMemory(1, pool, kSize, MEMFABRIC).ok());
+    EXPECT_EQ(memfabric->map_calls, 1);
+    EXPECT_TRUE(frontend->unmapRemoteMemory(1, pool, MEMFABRIC).ok());
+    EXPECT_EQ(memfabric->unmap_calls, 1);
+}
+
+}  // namespace
+#endif
