@@ -38,10 +38,9 @@ __real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
 extern "C" mooncake::tent::Status
 __wrap__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
     mooncake::tent::SegmentManager* manager) {
-    if (fail_next_segment_sync.exchange(false)) {
+    if (fail_next_segment_sync.exchange(false))
         return mooncake::tent::Status::MetadataError(
             "injected registry write failure");
-    }
     return __real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
         manager);
 }
@@ -94,9 +93,8 @@ class FailOnceRemoveTransport : public Transport {
     }
     Status removeMemoryBuffer(BufferDesc& desc) override {
         ++remove_calls;
-        if (std::exchange(fail, false)) {
+        if (std::exchange(fail, false))
             return Status::InternalError("injected drain failure");
-        }
         desc.transports.erase(
             std::remove(desc.transports.begin(), desc.transports.end(), type),
             desc.transports.end());
@@ -371,13 +369,12 @@ TEST(LocalMemoryLifecycle,
         EXPECT_TRUE(buffers.empty())
             << "Registration survives after its stage allocation was freed";
         // Clean up the stale test registration without touching freed memory.
-        for (const auto& buffer : buffers) {
+        for (const auto& buffer : buffers)
             EXPECT_TRUE(
                 engine
                     .unregisterLocalMemory(reinterpret_cast<void*>(buffer.addr),
                                            buffer.length)
                     .ok());
-        }
     }
 }
 
