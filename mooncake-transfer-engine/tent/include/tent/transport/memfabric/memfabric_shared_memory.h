@@ -94,20 +94,22 @@ class MemFabricGvaCalls {
                         : MemFabricGvaApi::initialize(device);
     }
     void uninitialize() const {
-        if (backend_)
+        if (backend_) {
             backend_->uninitialize();
-        else
+        } else {
             MemFabricGvaApi::uninitialize();
+        }
     }
     void* create(const MemFabricGvaConfig& config) const {
         return backend_ ? backend_->create(config)
                         : MemFabricGvaApi::create(config);
     }
     void destroy(void* entity) const {
-        if (backend_)
+        if (backend_) {
             backend_->destroy(entity);
-        else
+        } else {
             MemFabricGvaApi::destroy(entity);
+        }
     }
     int reserve(void* entity) const {
         return backend_ ? backend_->reserve(entity)

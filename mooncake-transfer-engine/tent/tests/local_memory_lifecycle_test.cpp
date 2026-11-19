@@ -44,9 +44,10 @@ __real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
 extern "C" mooncake::tent::Status
 __wrap__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
     mooncake::tent::SegmentManager* manager) {
-    if (fail_next_segment_sync.exchange(false))
+    if (fail_next_segment_sync.exchange(false)) {
         return mooncake::tent::Status::MetadataError(
             "injected registry write failure");
+    }
     return __real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
         manager);
 }
@@ -102,8 +103,9 @@ class FailOnceRemoveTransport : public Transport {
     }
     Status removeMemoryBuffer(BufferDesc& desc) override {
         ++remove_calls;
-        if (std::exchange(fail, false))
+        if (std::exchange(fail, false)) {
             return Status::InternalError("injected drain failure");
+        }
         desc.transports.erase(
             std::remove(desc.transports.begin(), desc.transports.end(), type),
             desc.transports.end());
@@ -378,12 +380,13 @@ TEST(LocalMemoryLifecycle,
         EXPECT_TRUE(buffers.empty())
             << "Registration survives after its stage allocation was freed";
         // Clean up the stale test registration without touching freed memory.
-        for (const auto& buffer : buffers)
+        for (const auto& buffer : buffers) {
             EXPECT_TRUE(
                 engine
                     .unregisterLocalMemory(reinterpret_cast<void*>(buffer.addr),
                                            buffer.length)
                     .ok());
+        }
     }
 }
 
@@ -477,8 +480,9 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
 
     Status freeLocalMemory(void* address, size_t size) override {
         ++free_calls;
-        if (address != pool || size != pool_size)
+        if (address != pool || size != pool_size) {
             return Status::InvalidArgument("unknown allocation");
+        }
         munmap(pool, pool_size);
         pool = nullptr;
         return Status::OK();
@@ -498,8 +502,9 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
         const auto base = reinterpret_cast<uint64_t>(pool);
         if (pool && (desc.addr >= base ? desc.addr - base < pool_size
                                        : base - desc.addr < desc.length)) {
-            if (desc.addr != base || desc.length != pool_size)
+            if (desc.addr != base || desc.length != pool_size) {
                 return Status::InvalidArgument("Register complete GVA pool");
+            }
             desc.location = "npu:0";
         }
         desc.transports.push_back(MEMFABRIC);
@@ -508,8 +513,9 @@ class DeviceAddressMemFabricTransport : public MemFabricTransport {
 
     Status addMemoryBuffer(std::vector<BufferDesc>& descs,
                            const MemoryOptions& options) override {
-        if (fail_registration)
+        if (fail_registration) {
             return Status::InternalError("injected GVA export failure");
+        }
         for (auto& desc : descs) CHECK_STATUS(addMemoryBuffer(desc, options));
         return Status::OK();
     }

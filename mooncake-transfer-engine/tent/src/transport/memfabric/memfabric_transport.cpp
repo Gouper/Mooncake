@@ -33,13 +33,15 @@ Status alignedBufferRange(const BufferDesc& desc, uint64_t& begin,
                           uint64_t& end) {
     constexpr auto mask = kRegistrationAlignment - 1;
     constexpr auto max = std::numeric_limits<uint64_t>::max();
-    if (desc.addr == 0 || desc.length == 0 || desc.length > max - desc.addr)
+    if (desc.addr == 0 || desc.length == 0 || desc.length > max - desc.addr) {
         return Status::InvalidArgument(
             "invalid MemFabric buffer range" LOC_MARK);
+    }
     end = desc.addr + desc.length;
-    if (end > max - mask)
+    if (end > max - mask) {
         return Status::InvalidArgument(
             "MemFabric alignment overflows" LOC_MARK);
+    }
     begin = desc.addr & ~mask;
     end = (end + mask) & ~mask;
     return Status::OK();
@@ -75,10 +77,11 @@ std::atomic<int> MemFabricTransport::g_init_ref_{0};
 std::mutex MemFabricTransport::g_init_mutex_;
 
 MemFabricSubBatch::~MemFabricSubBatch() {
-    if (pending_batch_count > 0)
+    if (pending_batch_count > 0) {
         LOG(WARNING) << "~MemFabricSubBatch: " << pending_batch_count
                      << " batch(es) still PENDING out of " << task_list.size()
                      << " tasks";
+    }
 }
 
 MemFabricTransport::MemFabricTransport() = default;
@@ -96,19 +99,24 @@ bool MemFabricTransport::warmupMemory(void*, size_t) {
 Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (!installed_ || stopping_)
+    if (!installed_ || stopping_) {
         return Status::InternalError("MemFabric unavailable");
-    if (!gva_config_.enabled)
+    }
+    if (!gva_config_.enabled) {
         return Transport::allocateLocalMemory(addr, size, options);
+    }
     uint32_t type = 0;
-    if (options.location == "cpu" || options.location.rfind("cpu:", 0) == 0)
+    if (options.location == "cpu" ||
+        options.location.rfind("cpu:", 0) == 0) {
         type = kGvaMemoryTypeHost;
-    else if (options.location == "npu" || options.location == "*" ||
-             options.location == "npu:" + std::to_string(gva_config_.device))
+    } else if (options.location == "npu" || options.location == "*" ||
+               options.location ==
+                   "npu:" + std::to_string(gva_config_.device)) {
         type = kGvaMemoryTypeDevice;
-    else
+    } else {
         return Status::InvalidArgument(
             "GVA location must be cpu or the configured npu device");
+    }
     return gva_->allocate(addr, size, type, options);
 }
 Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
@@ -125,30 +133,36 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
     std::shared_ptr<ControlService> metadata;
     {
         std::lock_guard<std::mutex> lock(inflight_mu_);
-        if (!gva_ || stopping_)
+        if (!gva_ || stopping_) {
             return Status::NotImplemented("MemFabric GVA unavailable");
+        }
         context = gva_;
         metadata = metadata_;
     }
     SegmentDescRef segment;
     CHECK_STATUS(metadata->segmentManager().getRemoteCached(segment, id));
     auto* buffer = segment->findBuffer(reinterpret_cast<uint64_t>(addr), size);
-    if (!buffer || buffer->addr != reinterpret_cast<uint64_t>(addr))
+    if (!buffer || buffer->addr != reinterpret_cast<uint64_t>(addr)) {
         return Status::InvalidArgument("GVA map requires published pool base");
+    }
     auto attribute = buffer->transport_attrs.find(MEMFABRIC);
-    if (attribute == buffer->transport_attrs.end() || attribute->second.empty())
+    if (attribute == buffer->transport_attrs.end() ||
+        attribute->second.empty()) {
         return Status::InvalidArgument("Missing MemFabric GVA descriptor");
+    }
     nlohmann::json bundle = nlohmann::json::array();
     for (const auto& candidate : segment->getMemory().buffers) {
         auto attr = candidate.transport_attrs.find(MEMFABRIC);
-        if (attr == candidate.transport_attrs.end() || attr->second.empty())
+        if (attr == candidate.transport_attrs.end() || attr->second.empty()) {
             continue;
+        }
         try {
             auto descriptor = nlohmann::json::parse(attr->second);
             if (descriptor.at("address").get<uint64_t>() != candidate.addr ||
-                descriptor.at("size").get<uint64_t>() != candidate.length)
+                descriptor.at("size").get<uint64_t>() != candidate.length) {
                 return Status::InvalidArgument(
                     "GVA descriptor disagrees with published buffer");
+            }
             bundle.push_back(std::move(descriptor));
         } catch (const nlohmann::json::exception&) {
             return Status::InvalidArgument("Malformed MemFabric GVA metadata");
@@ -167,8 +181,9 @@ Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     {
         std::lock_guard<std::mutex> lock(inflight_mu_);
         auto it = gva_remote_.find({id, reinterpret_cast<uint64_t>(addr)});
-        if (!gva_ || it == gva_remote_.end())
+        if (!gva_ || it == gva_remote_.end()) {
             return Status::InvalidArgument("Unknown MemFabric GVA mapping");
+        }
         context = gva_;
         peer = it->second;
     }
@@ -202,16 +217,18 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
     if (conf && conf->get("transports/memfabric/gva/enabled", false)) {
         auto limit = conf->get("transports/memfabric/gva/max_pending_copies",
                                int64_t{256});
-        if (limit < 1 || limit > 1048576)
+        if (limit < 1 || limit > 1048576) {
             return Status::InvalidArgument("Invalid GVA copy queue capacity");
+        }
         max_pending_copies_ = static_cast<size_t>(limit);
         const std::string prefix = "transports/memfabric/gva/";
         gva_config_.enabled = true;
         gva_config_.protocol = protocol;
         if (protocol != "device_sdma" && protocol != "device_rdma" &&
-            protocol != "device_urma")
+            protocol != "device_urma") {
             return Status::InvalidArgument(
                 "Unsupported MemFabric GVA protocol");
+        }
         gva_config_.group = conf->get(prefix + "group", "mooncake-memfabric");
         const auto ranks = conf->get(prefix + "rank_count", int64_t{0});
         const auto rank = conf->get(prefix + "rank", int64_t{-1});
@@ -219,21 +236,24 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
         // retain it for registration and copy threads to bind explicitly.
         int device = -1;
         if (aclrtGetDevice(&device) != ACL_ERROR_NONE || device < 0 ||
-            device > UINT16_MAX)
+            device > UINT16_MAX) {
             return Status::InvalidArgument(
                 "MemFabric GVA requires an application-bound device");
+        }
         // Keep conversions safe; HYBM validates rank topology and sizes.
-        if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX)
+        if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX) {
             return Status::InvalidArgument(
                 "Invalid MemFabric GVA configuration");
+        }
         gva_config_.rank_count = ranks;
         gva_config_.rank = rank;
         gva_config_.device = static_cast<uint16_t>(device);
         const auto hbm = conf->get(prefix + "hbm_window", uint64_t{0});
         const auto dram = conf->get(prefix + "dram_window", uint64_t{0});
-        if (hbm >= kGvaWindowLimitGiB || dram >= kGvaWindowLimitGiB)
+        if (hbm >= kGvaWindowLimitGiB || dram >= kGvaWindowLimitGiB) {
             return Status::InvalidArgument(
                 "MemFabric GVA windows must be less than 1048576 GiB");
+        }
         gva_config_.hbm_window = hbm * kGvaWindowUnit;
         gva_config_.dram_window = dram * kGvaWindowUnit;
         gva_config_.hbm_size = gva_config_.hbm_window;
@@ -258,8 +278,9 @@ Status MemFabricTransport::install(std::string& local_segment_name,
                                    std::shared_ptr<Topology> local_topology,
                                    std::shared_ptr<Config> conf) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (installed_)
+    if (installed_) {
         return Status::InvalidArgument("MemFabric already installed" LOC_MARK);
+    }
     LOG(INFO) << "install: segment_name=" << local_segment_name;
 
     local_segment_name_ = local_segment_name;
@@ -334,17 +355,20 @@ Status MemFabricTransport::install(std::string& local_segment_name,
 
 Status MemFabricTransport::bindDevice() const {
     if (config_.device_id < 0 ||
-        aclrtSetDevice(config_.device_id) != ACL_ERROR_NONE)
+        aclrtSetDevice(config_.device_id) != ACL_ERROR_NONE) {
         return Status::InternalError(
             "Unable to bind MemFabric device" LOC_MARK);
+    }
     return Status::OK();
 }
 
 Status MemFabricTransport::initializeLocked() {
-    if (gva_config_.enabled)
+    if (gva_config_.enabled) {
         return Status::InvalidArgument("trans is unavailable in GVA mode");
-    if (!installed_ || stopping_)
+    }
+    if (!installed_ || stopping_) {
         return Status::InternalError("MemFabric is not available" LOC_MARK);
+    }
     if (handle_) return bindDevice();
 
     // Registration runs on the caller's device-bound thread, unlike the
@@ -506,9 +530,10 @@ Status MemFabricTransport::resolveDestUrl(const Request& request,
 Status MemFabricTransport::allocateSubBatch(SubBatchRef& batch,
                                             size_t max_size) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (stopping_)
+    if (stopping_) {
         return Status::InternalError(
             "MemFabric transport is stopping" LOC_MARK);
+    }
     auto mf_batch = std::make_unique<MemFabricSubBatch>();
     mf_batch->task_list.reserve(max_size);
     mf_batch->capacity = max_size;
@@ -537,8 +562,9 @@ Status MemFabricTransport::freeSubBatch(SubBatchRef& batch) {
         for (size_t i = 0; i < mf_batch->task_list.size(); ++i) {
             if (std::chrono::steady_clock::now() >= deadline) break;
             if (mf_batch->task_list[i].status_word !=
-                TransferStatusEnum::PENDING)
+                TransferStatusEnum::PENDING) {
                 continue;
+            }
             TransferStatus status{};
             // Query errors leave the task pending; retry until the deadline.
             (void)getTransferStatusLocked(batch, static_cast<int>(i), status);
@@ -557,9 +583,10 @@ Status MemFabricTransport::freeSubBatch(SubBatchRef& batch) {
 Status MemFabricTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (stopping_)
+    if (stopping_) {
         return Status::InternalError(
             "MemFabric transport is stopping" LOC_MARK);
+    }
     auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch);
     if (!mf_batch) {
         LOG(ERROR) << "Invalid sub-batch type in submitTransferTasks";
@@ -567,9 +594,10 @@ Status MemFabricTransport::submitTransferTasks(
     }
 
     if (gva_config_.enabled) return submitGvaCopies(mf_batch, request_list);
-    if (!handle_)
+    if (!handle_) {
         return Status::InternalError(
             "Register memory before transfer" LOC_MARK);
+    }
     CHECK_STATUS(bindDevice());
 
     uint64_t total_slice_count = 0;
@@ -580,9 +608,10 @@ Status MemFabricTransport::submitTransferTasks(
         const auto max = std::numeric_limits<uint64_t>::max();
         if (source == 0 || request.target_offset == 0 || request.length == 0 ||
             request.length > max - source ||
-            request.length > max - request.target_offset)
+            request.length > max - request.target_offset) {
             return Status::InvalidArgument(
                 "invalid MemFabric transfer range" LOC_MARK);
+        }
         // Count internal boundaries at both endpoints. Equal page offsets
         // share every boundary and must only be counted once.
         const auto local_boundaries =
@@ -598,9 +627,10 @@ Status MemFabricTransport::submitTransferTasks(
                      request.target_offset % kRegistrationAlignment
                  ? 0
                  : remote_boundaries);
-        if (slices > std::numeric_limits<uint32_t>::max() - total_slice_count)
+        if (slices > std::numeric_limits<uint32_t>::max() - total_slice_count) {
             return Status::InvalidArgument(
                 "too many native transfer slices" LOC_MARK);
+        }
         total_slice_count += slices;
         slice_counts.push_back(static_cast<size_t>(slices));
     }
@@ -697,30 +727,34 @@ Status MemFabricTransport::submitTransferTasks(
 
 Status MemFabricTransport::submitGvaCopies(
     MemFabricSubBatch* batch, const std::vector<Request>& requests) {
-    if (!gva_)
-        return Status::NotImplemented("GVA copy context unavailable");
+    if (!gva_) return Status::NotImplemented("GVA copy context unavailable");
     if (requests.empty()) return Status::OK();
-    if (!gva_->supportsBatchCopy())
+    if (!gva_->supportsBatchCopy()) {
         return Status::NotImplemented(
             "HYBM native batch copy symbol unavailable");
-    if (requests.size() > max_pending_copies_ - std::min(max_pending_copies_,
-                                                         gva_pending_->load()))
+    }
+    if (requests.size() > max_pending_copies_ -
+                          std::min(max_pending_copies_,
+                                   gva_pending_->load())) {
         return Status::TooManyRequests("GVA copy queue is full");
+    }
     struct Copy {
         uint64_t source, destination;
         size_t size;
         uint32_t direction;
     };
     if (requests.size() >
-        batch->capacity - std::min(batch->capacity, batch->task_list.size()))
+        batch->capacity - std::min(batch->capacity, batch->task_list.size())) {
         return Status::TooManyRequests("GVA sub-batch capacity exceeded");
+    }
     std::vector<Copy> copies;
     std::vector<std::shared_ptr<MemFabricCopyCompletion>> completions;
     try {
         copies.reserve(requests.size());
         completions.reserve(requests.size());
-        for (size_t i = 0; i < requests.size(); ++i)
+        for (size_t i = 0; i < requests.size(); ++i) {
             completions.push_back(std::make_shared<MemFabricCopyCompletion>());
+        }
     } catch (...) {
         return Status::InternalError("Cannot allocate GVA copy tasks");
     }
@@ -758,20 +792,23 @@ Status MemFabricTransport::submitGvaCopies(
             request.target_id, [&](SegmentDesc* segment) -> Status {
                 auto* buffer =
                     segment->findBuffer(request.target_offset, request.length);
-                if (!buffer)
+                if (!buffer) {
                     return Status::InvalidArgument(
                         "Remote GVA copy range is not registered");
+                }
                 auto attr = buffer->transport_attrs.find(MEMFABRIC);
                 if (attr == buffer->transport_attrs.end() ||
-                    attr->second.empty())
+                    attr->second.empty()) {
                     return Status::InvalidArgument(
                         "Remote copy endpoint must be a GVA pool");
+                }
                 auto mapping =
                     gva_remote_.find({request.target_id, buffer->addr});
                 if (mapping == gva_remote_.end() ||
-                    mapping->second != segment->name)
+                    mapping->second != segment->name) {
                     return Status::InvalidArgument(
                         "Map remote GVA pool before copy");
+                }
                 return gva_->validateCopyTarget(segment->name, buffer->addr,
                                                 attr->second);
             });
@@ -780,8 +817,9 @@ Status MemFabricTransport::submitGvaCopies(
             return status;
         }
         Copy copy{local, request.target_offset, request.length, 0};
-        if (request.opcode == Request::READ)
+        if (request.opcode == Request::READ) {
             std::swap(copy.source, copy.destination);
+        }
         status = gva_->beginCopy(copy.source, copy.destination, copy.size,
                                  copy.direction);
         if (!status.ok()) {
@@ -878,17 +916,19 @@ Status MemFabricTransport::submitGvaCopies(
                 } catch (...) {
                     context->failCopy(group->copies.size());
                 }
-                for (const auto& completion : group->completions)
+                for (const auto& completion : group->completions) {
                     completion->status.store(outcome,
                                              std::memory_order_release);
+                }
                 pending->fetch_sub(group->copies.size(),
                                    std::memory_order_release);
             });
         } catch (...) {
             context->cancelCopy(count);
-            for (const auto& completion : group->completions)
+            for (const auto& completion : group->completions) {
                 completion->status.store(TransferStatusEnum::FAILED,
                                          std::memory_order_release);
+            }
             pending->fetch_sub(count);
         }
     }
@@ -922,20 +962,23 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
             task.gva_completion->status.load(std::memory_order_acquire);
         if (task.status_word != TransferStatusEnum::PENDING) {
             if (mf_batch->pending_batch_count) --mf_batch->pending_batch_count;
-            if (task.status_word == TransferStatusEnum::COMPLETED)
+            if (task.status_word == TransferStatusEnum::COMPLETED) {
                 task.transferred_bytes = task.length;
+            }
         }
         status = TransferStatus{task.status_word, task.transferred_bytes};
         return Status::OK();
     }
-    if (gva_config_.enabled)
+    if (gva_config_.enabled) {
         return Status::InternalError("GVA task has no copy completion");
+    }
     auto cache_it = mf_batch->batch_status_cache.find(task.batch_id);
     if (cache_it != mf_batch->batch_status_cache.end() &&
         cache_it->second != TransferStatusEnum::PENDING) {
         task.status_word = cache_it->second;
-        if (task.status_word == TransferStatusEnum::COMPLETED)
+        if (task.status_word == TransferStatusEnum::COMPLETED) {
             task.transferred_bytes = task.length;
+        }
         status = TransferStatus{task.status_word, task.transferred_bytes};
         return Status::OK();
     }
@@ -971,8 +1014,9 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
             if (!t.gva_completion && t.batch_id == task.batch_id &&
                 t.status_word == TransferStatusEnum::PENDING) {
                 t.status_word = batch_status;
-                if (t.status_word == TransferStatusEnum::COMPLETED)
+                if (t.status_word == TransferStatusEnum::COMPLETED) {
                     t.transferred_bytes = t.length;
+                }
             }
         }
     }
@@ -994,13 +1038,15 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
     if (desc_list.empty()) return Status::OK();
     std::lock_guard<std::mutex> lock(inflight_mu_);
     if (gva_config_.enabled) {
-        if (stopping_ || !gva_)
+        if (stopping_ || !gva_) {
             return Status::InternalError("GVA context unavailable");
+        }
         std::vector<std::pair<void*, size_t>> ranges;
         ranges.reserve(desc_list.size());
-        for (const auto& desc : desc_list)
+        for (const auto& desc : desc_list) {
             ranges.emplace_back(reinterpret_cast<void*>(desc.addr),
                                 desc.length);
+        }
         const auto location = "npu:" + std::to_string(gva_config_.device);
         std::vector<std::string> descriptors;
         CHECK_STATUS(gva_->publish(ranges, descriptors));
@@ -1009,13 +1055,15 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
             desc.location = location;
             desc.transport_attrs[MEMFABRIC] = std::move(descriptors[index]);
             if (std::find(desc.transports.begin(), desc.transports.end(),
-                          MEMFABRIC) == desc.transports.end())
+                          MEMFABRIC) == desc.transports.end()) {
                 desc.transports.push_back(MEMFABRIC);
+            }
         }
         return Status::OK();
     }
-    if (options.global_address)
+    if (options.global_address) {
         return Status::InvalidArgument("Unknown MemFabric GVA allocation");
+    }
     CHECK_STATUS(initializeLocked());
 
     const bool local_sdma = config_.data_op_type == SMEMB_DATA_OP_SDMA &&
@@ -1023,17 +1071,19 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
     if (local_sdma) {
         for (auto& desc : desc_list) {
             if (std::find(desc.transports.begin(), desc.transports.end(),
-                          MEMFABRIC) == desc.transports.end())
+                          MEMFABRIC) == desc.transports.end()) {
                 desc.transports.push_back(MEMFABRIC);
+            }
             desc.transport_attrs[MEMFABRIC] = "";
         }
         return Status::OK();
     }
 
     std::vector<std::pair<uint64_t, uint64_t>> ranges(desc_list.size());
-    for (size_t i = 0; i < desc_list.size(); ++i)
+    for (size_t i = 0; i < desc_list.size(); ++i) {
         CHECK_STATUS(alignedBufferRange(desc_list[i], ranges[i].first,
                                         ranges[i].second));
+    }
 
     // Restore native batch coalescing before subtracting existing MRs.
     // Do not merge merely adjacent ranges: they may be separate allocations.
@@ -1086,8 +1136,9 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
     }
     for (auto& desc : desc_list) {
         if (std::find(desc.transports.begin(), desc.transports.end(),
-                      MEMFABRIC) == desc.transports.end())
+                      MEMFABRIC) == desc.transports.end()) {
             desc.transports.push_back(MEMFABRIC);
+        }
         desc.transport_attrs[MEMFABRIC] = "";
     }
     return Status::OK();
@@ -1102,8 +1153,9 @@ Status MemFabricTransport::removeMemoryBuffer(BufferDesc& desc) {
     }
     if (!handle_) return Status::OK();
     if (config_.data_op_type == SMEMB_DATA_OP_SDMA &&
-        desc.permission == kLocalReadWrite)
+        desc.permission == kLocalReadWrite) {
         return Status::OK();
+    }
     CHECK_STATUS(bindDevice());
 
     // SMEM's deregistration currently retains the native MR until destruction;
@@ -1138,8 +1190,9 @@ Status MemFabricTransport::quiesce() {
             for (size_t i = 0; i < batch->task_list.size(); ++i) {
                 if (std::chrono::steady_clock::now() >= deadline) break;
                 if (batch->task_list[i].status_word !=
-                    TransferStatusEnum::PENDING)
+                    TransferStatusEnum::PENDING) {
                     continue;
+                }
                 TransferStatus status{};
                 // Query errors leave the task pending; retry until the
                 // deadline.
@@ -1148,8 +1201,9 @@ Status MemFabricTransport::quiesce() {
             }
         }
         if (inflight_.load(std::memory_order_acquire) == 0 &&
-            gva_pending_->load(std::memory_order_acquire) == 0)
+            gva_pending_->load(std::memory_order_acquire) == 0) {
             break;
+        }
         // Release the lock between polls so normal status queries and batch
         // release can proceed. Submission remains blocked by stopping_.
         inflight_cv_.wait_until(

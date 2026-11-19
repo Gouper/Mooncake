@@ -248,14 +248,16 @@ int32_t mockSmemTransRegisterMem(smem_trans_t, void* addr, size_t size,
     std::lock_guard<std::mutex> lock(g_state->mu);
     ++g_state->register_mem_calls;
     if (g_state->register_mem_ret != 0 ||
-        g_state->register_mem_calls == g_state->fail_register_call)
+        g_state->register_mem_calls == g_state->fail_register_call) {
         return -9;
+    }
     const auto begin = reinterpret_cast<uint64_t>(addr);
     for (size_t i = 0; i < g_state->registered_addrs.size(); ++i) {
         const auto old =
             reinterpret_cast<uint64_t>(g_state->registered_addrs[i]);
-        if (begin < old + g_state->registered_sizes[i] && old < begin + size)
+        if (begin < old + g_state->registered_sizes[i] && old < begin + size) {
             return -9;  // Native partial overlap must never be submitted.
+        }
     }
     g_state->registered_addrs.push_back(addr);
     g_state->registered_sizes.push_back(size);
@@ -280,10 +282,11 @@ int32_t mockSmemTransDeregisterMem(smem_trans_t, void*) {
 
 void CopyData(const MockMemFabricState::Copy& copy) {
     for (size_t i = 0; i < copy.sizes.size(); ++i) {
-        if (copy.opcode == SMEM_TRANS_OP_WRITE)
+        if (copy.opcode == SMEM_TRANS_OP_WRITE) {
             std::memcpy(copy.destinations[i], copy.sources[i], copy.sizes[i]);
-        else
+        } else {
             std::memcpy(copy.sources[i], copy.destinations[i], copy.sizes[i]);
+        }
     }
 }
 
@@ -314,10 +317,11 @@ int32_t mockSmemTransBatchCopy(smem_trans_t, smem_trans_batch_params_t* params,
                                params->destList + params->batchSize),
             std::vector<size_t>(params->sizeList,
                                 params->sizeList + params->batchSize)};
-        if (g_state->defer_copy)
+        if (g_state->defer_copy) {
             g_state->copies.emplace(*batchId, std::move(copy));
-        else
+        } else {
             CopyData(copy);
+        }
     }
     return SM_OK;
 }
@@ -473,15 +477,17 @@ class CopyTestHybm : public MemFabricGvaBackend {
     int unmap(void*, uint32_t peer) override {
         for (auto it = pools.begin(); it != pools.end();) {
             bool matches = false;
-            if (imported.count(it->first))
+            if (imported.count(it->first)) {
                 for (uint32_t type : {1u, 2u}) {
                     const auto start = base(nullptr, type);
                     const auto window = windows[type - 1];
                     if (window && it->first >= start &&
                         it->first - start < window * rank_count &&
-                        (it->first - start) / window == peer)
+                        (it->first - start) / window == peer) {
                         matches = true;
+                    }
                 }
+            }
             if (matches) {
                 imported.erase(it->first);
                 it = pools.erase(it);
@@ -506,9 +512,10 @@ class CopyTestHybm : public MemFabricGvaBackend {
                   uint32_t direction) override {
         std::unique_lock<std::mutex> lock(mutex);
         batch_sizes.push_back(requests.size());
-        for (const auto& request : requests)
+        for (const auto& request : requests) {
             copies.push_back(
                 {request.source, request.destination, request.size, direction});
+        }
         entered = true;
         cv.notify_all();
         cv.wait(lock, [&] { return !blocked; });
@@ -994,8 +1001,9 @@ TEST_F(MemFabricTransportTest, FirstLocalSdmaBatchSkipsNativeRegistration) {
     EXPECT_EQ(state_->init_calls, 1);
     EXPECT_EQ(state_->register_mem_calls, 0);
     EXPECT_EQ(state_->batch_register_mem_calls, 0);
-    for (const auto& buffer : buffers)
+    for (const auto& buffer : buffers) {
         EXPECT_EQ(buffer.transports, (std::vector<TransportType>{MEMFABRIC}));
+    }
 }
 
 TEST_F(MemFabricTransportTest, InstallSucceeds) {
@@ -2352,8 +2360,9 @@ TEST_F(MemFabricTransportTest, WindowCapIsExclusiveAndCheckedBeforeConversion) {
 
 TEST_F(MemFabricTransportTest, RepeatedGvaConfigReadsDoNotConsumeEntityIds) {
     auto config = GvaInputConfig();
-    for (int cycle = 0; cycle < 448; ++cycle)
+    for (int cycle = 0; cycle < 448; ++cycle) {
         ASSERT_TRUE(LoadConfig(config).ok()) << cycle;
+    }
 }
 
 TEST_F(MemFabricTransportTest, GvaConfigUsesApplicationDeviceAndWindowBudgets) {
@@ -2485,11 +2494,12 @@ TEST_F(MemFabricTransportTest, GvaMultipleRequestsUseOneRealNativeBatch) {
     ASSERT_TRUE(PrepareGvaCopy().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
     std::vector<Request> requests;
-    for (uint64_t offset : {0u, 64u, 128u})
+    for (uint64_t offset : {0u, 64u, 128u}) {
         requests.push_back(GvaWrite(
             reinterpret_cast<void*>(reinterpret_cast<uint64_t>(copy_hbm_) +
                                     offset),
             reinterpret_cast<uint64_t>(copy_dram_) + offset, 32));
+    }
     ASSERT_TRUE(transport_->submitTransferTasks(batch_, requests).ok());
     ASSERT_TRUE(WaitCopiesWithoutPolling());
     EXPECT_EQ(copy_api_->batch_sizes, std::vector<size_t>{3});

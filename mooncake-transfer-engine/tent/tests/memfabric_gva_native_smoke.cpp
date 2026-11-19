@@ -60,19 +60,22 @@ bool receiveFrame(int fd, std::string& frame) {
     return bytes(fd, frame.data(), size, false);
 }
 void require(const Status& status, const char* operation) {
-    if (!status.ok())
+    if (!status.ok()) {
         throw std::runtime_error(std::string(operation) + ": " +
                                  std::string(status.message()));
+    }
 }
 void aclCheck(aclError status, const char* operation) {
-    if (status != ACL_SUCCESS)
+    if (status != ACL_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": ACL error " +
                                  std::to_string(status));
+    }
 }
 void barrier(int fd, const char* phase) {
     std::string peer;
-    if (!sendFrame(fd, phase) || !receiveFrame(fd, peer) || peer != phase)
+    if (!sendFrame(fd, phase) || !receiveFrame(fd, peer) || peer != phase) {
         throw std::runtime_error(std::string("Peer barrier failed: ") + phase);
+    }
 }
 int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             bool hbm_only) {
@@ -84,8 +87,9 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
         aclCheck(aclInit(nullptr), "aclInit");
         aclCheck(aclrtSetDevice(device), "aclrtSetDevice");
         const auto loaded = MemFabricGvaApi::LoadLibrary();
-        if (!loaded)
+        if (!loaded) {
             throw std::runtime_error("Compatible HYBM symbols unavailable");
+        }
         MemFabricGvaConfig config;
         config.enabled = true;
         config.protocol = protocol;
@@ -108,25 +112,28 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             auto deviceAddress = [&](uint64_t gva, size_t size) {
                 void* dva = nullptr;
                 require(memory.resolve(gva, size, &dva), "resolve GVA");
-                if (!dva || reinterpret_cast<uint64_t>(dva) != gva)
+                if (!dva || reinterpret_cast<uint64_t>(dva) != gva) {
                     throw std::runtime_error(
                         "GVA must equal the directly accessible NPU address");
+                }
                 if (size > 32) {
                     void* offset = nullptr;
                     require(memory.resolve(gva + 32, size - 32, &offset),
                             "resolve GVA offset");
                     if (reinterpret_cast<uint64_t>(offset) !=
-                        reinterpret_cast<uint64_t>(dva) + 32)
+                        reinterpret_cast<uint64_t>(dva) + 32) {
                         throw std::runtime_error(
                             "GVA offset translation mismatch");
+                    }
                 }
                 return dva;
             };
             void *hbm = nullptr, *dram = nullptr;
             require(memory.allocate(&hbm, kHbmSize, 1, 0), "allocate HBM");
-            if (!hbm_only)
+            if (!hbm_only) {
                 require(memory.allocate(&dram, kDramSize, 2, 0),
                         "allocate DRAM");
+            }
             std::cerr << "rank=" << rank << " device=" << device
                       << " HBM=" << hbm << " DRAM=" << dram << std::endl;
             void* hbm_dva =
@@ -139,9 +146,10 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                       << " DVA=" << hbm_dva << std::endl;
             std::string hbm_desc, dram_desc;
             require(memory.publish(hbm, kHbmSize, hbm_desc), "publish HBM");
-            if (!hbm_only)
+            if (!hbm_only) {
                 require(memory.publish(dram, kDramSize, dram_desc),
                         "publish DRAM");
+            }
             std::vector<unsigned char> host(
                 kSize, static_cast<unsigned char>(rank + 1));
             if (copy || kernel_path) {
@@ -160,8 +168,9 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                 Json{{"hbm", hbm_desc}, {"dram", dram_desc}}.dump();
             std::string remote_raw;
             if (!sendFrame(sync, publication) ||
-                !receiveFrame(sync, remote_raw))
+                !receiveFrame(sync, remote_raw)) {
                 throw std::runtime_error("Pool exchange failed");
+            }
             const auto remote = Json::parse(remote_raw);
             const auto remote_hbm = remote.at("hbm").get<std::string>();
             const auto remote_dram = remote.at("dram").get<std::string>();
@@ -186,15 +195,17 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                 }
                 return status;
             };
-            if (!hbm_only)
+            if (!hbm_only) {
                 require(mapPool(dram_address, kDramSize), "map DRAM first");
+            }
             require(mapPool(hbm_address, kHbmSize), "map HBM");
             require(mapPool(hbm_address, kHbmSize), "idempotent map");
-            if (!network)
+            if (!network) {
                 std::cerr << "rank=" << rank << " remote HBM GVA="
                           << reinterpret_cast<void*>(hbm_address)
                           << " DVA=" << deviceAddress(hbm_address, kSize)
                           << std::endl;
+            }
             barrier(sync, "mapped");
             std::vector<uint64_t> addresses{hbm_address};
             if (!hbm_only) addresses.push_back(dram_address);
@@ -205,10 +216,12 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                                          deviceAddress(address, kSize), kSize,
                                          ACL_MEMCPY_DEVICE_TO_HOST),
                              "copy from remote DVA");
-                    for (auto value : host)
+                    for (auto value : host) {
                         if (value !=
-                            2 - rank + (address == dram_address ? 0x10 : 0))
+                            2 - rank + (address == dram_address ? 0x10 : 0)) {
                             throw std::runtime_error("Remote data mismatch");
+                        }
+                    }
                 }
                 std::cerr << "rank=" << rank << " PASS ACL remote HBM"
                           << (hbm_only ? "" : " and DRAM")
@@ -216,14 +229,16 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             }
             if (kernel_path) {
                 void* library = dlopen(kernel_path, RTLD_NOW | RTLD_LOCAL);
-                if (!library)
+                if (!library) {
                     throw std::runtime_error(
                         std::string("Kernel plugin load failed: ") + dlerror());
+                }
                 using Kernel = int (*)(void*, void*, void*);
                 auto kernel =
                     reinterpret_cast<Kernel>(dlsym(library, "gva_kernel_copy"));
-                if (!kernel)
+                if (!kernel) {
                     throw std::runtime_error("Missing gva_kernel_copy symbol");
+                }
                 void* output = nullptr;
                 aclrtStream stream = nullptr;
                 aclCheck(aclrtMalloc(&output, 32, ACL_MEM_MALLOC_HUGE_FIRST),
@@ -246,11 +261,13 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                         aclrtMemcpy(actual.data(), actual.size(), output,
                                     actual.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                         "read kernel output");
-                    for (auto value : actual)
+                    for (auto value : actual) {
                         if (value !=
-                            2 - rank + (address == dram_address ? 0x10 : 0))
+                            2 - rank + (address == dram_address ? 0x10 : 0)) {
                             throw std::runtime_error(
                                 "AI core remote GVA data mismatch");
+                        }
+                    }
                 }
                 std::cerr << "rank=" << rank << " PASS AscendC remote HBM"
                           << (hbm_only ? "" : " and DRAM")
@@ -281,11 +298,13 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                                                actual.size()),
                                  actual.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                              "read peer kernel write result");
-                    for (auto value : actual)
+                    for (auto value : actual) {
                         if (value !=
-                            0x40 + (1 - rank) + (pool == dram ? 0x10 : 0))
+                            0x40 + (1 - rank) + (pool == dram ? 0x10 : 0)) {
                             throw std::runtime_error(
                                 "AI core remote GVA write data mismatch");
+                        }
+                    }
                 }
                 std::cerr << "rank=" << rank << " PASS AscendC remote HBM"
                           << (hbm_only ? "" : " and DRAM")
@@ -300,8 +319,9 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                 ThreadPool copy_worker(1);
                 std::vector<uint64_t> local_addresses{
                     reinterpret_cast<uint64_t>(hbm)};
-                if (!hbm_only)
+                if (!hbm_only) {
                     local_addresses.push_back(reinterpret_cast<uint64_t>(dram));
+                }
                 for (size_t i = 0; i < local_addresses.size(); ++i) {
                     std::fill(
                         host.begin(), host.end(),
@@ -325,8 +345,9 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                         });
                     require(completion.get(), "worker HYBM copy");
                 };
-                for (size_t i = 0; i < addresses.size(); ++i)
+                for (size_t i = 0; i < addresses.size(); ++i) {
                     nativeCopy(local_addresses[i], addresses[i] + kSize);
+                }
                 barrier(sync, "hybm-writes-done");
                 auto checkDestination = [&](size_t i, size_t offset) {
                     std::fill(host.begin(), host.end(), 0);
@@ -336,16 +357,21 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
                             deviceAddress(local_addresses[i] + offset, kSize),
                             kSize, ACL_MEMCPY_DEVICE_TO_HOST),
                         "verify HYBM copy destination");
-                    for (auto value : host)
-                        if (value != 0x60 + (1 - rank) + i * 0x10)
+                    for (auto value : host) {
+                        if (value != 0x60 + (1 - rank) + i * 0x10) {
                             throw std::runtime_error("HYBM copy data mismatch");
+                        }
+                    }
                 };
-                for (size_t i = 0; i < addresses.size(); ++i)
+                for (size_t i = 0; i < addresses.size(); ++i) {
                     checkDestination(i, kSize);
-                for (size_t i = 0; i < addresses.size(); ++i)
+                }
+                for (size_t i = 0; i < addresses.size(); ++i) {
                     nativeCopy(addresses[i], local_addresses[i] + 2 * kSize);
-                for (size_t i = 0; i < addresses.size(); ++i)
+                }
+                for (size_t i = 0; i < addresses.size(); ++i) {
                     checkDestination(i, 2 * kSize);
+                }
                 barrier(sync, "hybm-reads-done");
                 std::cerr
                     << "rank=" << rank
@@ -354,23 +380,27 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             }
             barrier(sync, "readers-stopped");
             if (!hbm_only &&
-                !memory.unmap(peer, dram_address).IsTooManyRequests())
+                !memory.unmap(peer, dram_address).IsTooManyRequests()) {
                 throw std::runtime_error(
                     "First pool unmap must defer rank cleanup");
+            }
             Status cleanup = Status::TooManyRequests("pending");
             for (int attempt = 0; attempt < 100 && cleanup.IsTooManyRequests();
                  ++attempt) {
                 cleanup = memory.unmap(peer, hbm_address);
-                if (cleanup.IsTooManyRequests())
+                if (cleanup.IsTooManyRequests()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
             }
             require(cleanup, "rank cleanup");
-            if (!hbm_only)
+            if (!hbm_only) {
                 require(memory.unmap(peer, dram_address), "idempotent cleanup");
+            }
             void* stale_dva = nullptr;
             if (memory.resolve(hbm_address, kSize, &stale_dva).ok() ||
-                stale_dva)
+                stale_dva) {
                 throw std::runtime_error("Unmapped GVA still resolves");
+            }
             barrier(sync, "released");
             require(memory.unpublish(hbm), "unpublish HBM");
             if (!hbm_only) require(memory.unpublish(dram), "unpublish DRAM");
@@ -386,9 +416,10 @@ int runRank(unsigned rank, unsigned device, int sync, bool copy, bool mismatch,
             require(memory.initialize(), "initialize GVA context");
             void* address = nullptr;
             auto status = memory.allocate(&address, kHbmSize, 1, 1);
-            if (!status.IsInvalidArgument() || address)
+            if (!status.IsInvalidArgument() || address) {
                 throw std::runtime_error(
                     "Strict address mismatch was not rejected");
+            }
             require(memory.close(), "close mismatch context");
         }
         aclCheck(aclFinalize(), "aclFinalize");
@@ -410,28 +441,32 @@ int main(int argc, char** argv) {
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
-            if (arg == "--copy")
+            if (arg == "--copy") {
                 copy = true;
-            else if (arg == "--hbm-only")
+            } else if (arg == "--hbm-only") {
                 hbm_only = true;
-            else if (arg == "--mismatch")
+            } else if (arg == "--mismatch") {
                 mismatch = true;
-            else if (arg == "--device0" && i + 1 < argc)
+            } else if (arg == "--device0" && i + 1 < argc) {
                 device0 = std::stoul(argv[++i]);
-            else if (arg == "--device1" && i + 1 < argc)
+            } else if (arg == "--device1" && i + 1 < argc) {
                 device1 = std::stoul(argv[++i]);
-            else
+            } else {
                 throw std::runtime_error(
                     "Usage: smoke [--device0 0] [--device1 1] [--hbm-only] "
                     "[--copy] [--mismatch]");
+            }
         }
-        if (device0 == device1 || device0 > UINT16_MAX || device1 > UINT16_MAX)
+        if (device0 == device1 || device0 > UINT16_MAX ||
+            device1 > UINT16_MAX) {
             throw std::runtime_error("Use two distinct valid NPU device IDs");
+        }
         signal(SIGPIPE, SIG_IGN);
         int channels[1][2];
         for (auto& channel : channels) {
-            if (socketpair(AF_UNIX, SOCK_STREAM, 0, channel))
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
                 throw std::runtime_error("socketpair failed");
+            }
             timeval timeout{30, 0};
             for (int fd : channel) {
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
@@ -452,14 +487,14 @@ int main(int argc, char** argv) {
             }
             children[rank] = pid;
         }
-        for (auto& channel : channels)
-            for (int fd : channel) close(fd);
+        for (auto& channel : channels) for (int fd : channel) close(fd);
         bool passed = true;
         for (auto pid : children) {
             int status = 0;
             if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
-                WEXITSTATUS(status))
+                WEXITSTATUS(status)) {
                 passed = false;
+            }
         }
         return passed ? 0 : 1;
     } catch (const std::exception& error) {

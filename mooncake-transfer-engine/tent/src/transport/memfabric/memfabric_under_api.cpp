@@ -231,8 +231,9 @@ class NativeHybm final {
     int batchCopy(void* entity, const std::vector<MemFabricGvaCopy>& copies,
                   uint32_t direction) {
         if (!supportsBatchCopy() || copies.empty() ||
-            copies.size() > UINT32_MAX)
+            copies.size() > UINT32_MAX) {
             return -1;
+        }
         auto buffers = std::make_shared<BatchBuffers>();
         buffers->entity = entity;
         buffers->sources.reserve(copies.size());
@@ -260,10 +261,11 @@ class NativeHybm final {
             nullptr, 0);
         {
             std::lock_guard<std::mutex> lock(batch_mutex_);
-            if (!ret)
+            if (!ret) {
                 pending_batches_.erase(retained);
-            else
+            } else {
                 buffers->failed = true;
+            }
         }
         return ret;
     }
@@ -271,9 +273,11 @@ class NativeHybm final {
         std::vector<std::shared_ptr<BatchBuffers>> failed;
         {
             std::lock_guard<std::mutex> lock(batch_mutex_);
-            for (const auto& batch : pending_batches_)
-                if (batch->failed && batch->entity == entity)
+            for (const auto& batch : pending_batches_) {
+                if (batch->failed && batch->entity == entity) {
                     failed.push_back(batch);
+                }
+            }
         }
         const auto ret = hybm_wait_ ? hybm_wait_(entity) : -1;
         if (!ret) {
@@ -361,11 +365,12 @@ class NativeHybm final {
             hybm_export_(entity_handle, slice,
                          slice ? 0 : HYBM_FLAG_EXPORT_ENTITY, &exchange_info);
         if (result == 0 && exchange_info.desc && exchange_info.descLen &&
-            exchange_info.descLen <= (1U << 20))
+            exchange_info.descLen <= (1U << 20)) {
             blob.assign(exchange_info.desc,
                         exchange_info.desc + exchange_info.descLen);
-        else if (result == 0)
+        } else if (result == 0) {
             result = -1;
+        }
         hybm_export_info_free_(&exchange_info);
         return result;
     }

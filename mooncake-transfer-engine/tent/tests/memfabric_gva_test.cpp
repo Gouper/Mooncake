@@ -35,8 +35,9 @@ class FakeHybm : public MemFabricGvaBackend {
         cursors = {{0, 0}};
         ++creates;
         if (c.protocol != "device_sdma" && c.protocol != "device_rdma" &&
-            c.protocol != "device_urma")
+            c.protocol != "device_urma") {
             return nullptr;
+        }
         return this;
     }
     void destroy(void*) override {}
@@ -76,8 +77,9 @@ class FakeHybm : public MemFabricGvaBackend {
         if (!p && fail_entity_export) return -1;
         if (p) {
             ++slice_exports;
-            if (fail_slice_export || slice_exports == fail_slice_export_at)
+            if (fail_slice_export || slice_exports == fail_slice_export_at) {
                 return -1;
+            }
             if (empty_slice_export) return 0;
         }
         auto a = reinterpret_cast<uint64_t>(p);
@@ -809,8 +811,9 @@ class NetworkHybm : public FakeHybm {
     int connect_calls = 0, copy_calls = 0, wait_calls = 0, reach_calls = 0;
     int connect_result = 0, copy_result = 0;
     int translate(uint64_t address, uint32_t type, uint64_t& out) override {
-        for (auto base : imported)
+        for (auto base : imported) {
             if (address >= base && address - base < M) return -1;
+        }
         return FakeHybm::translate(address, type, out);
     }
     bool connect_available = true;
@@ -1201,14 +1204,16 @@ struct MultiAllocations {
     }
     std::string bundle() const {
         auto array = nlohmann::json::array();
-        for (const auto& text : descriptors)
+        for (const auto& text : descriptors) {
             array.push_back(nlohmann::json::parse(text));
+        }
         return array.dump();
     }
     ~MultiAllocations() {
         local_api->fail_unmap = false;
-        for (auto [p, bytes] : remote_allocations)
+        for (auto [p, bytes] : remote_allocations) {
             local.unmap("remote", reinterpret_cast<uint64_t>(p));
+        }
         for (auto [p, bytes] : local_allocations) {
             local.unpublish(p);
             local.free(p, bytes);
@@ -1263,11 +1268,12 @@ TEST(MemFabricGva, SameTypeSlicesAndBothMediaMapCopyAndUnmapIndependently) {
     EXPECT_FALSE(
         p.local.resolve(reinterpret_cast<uint64_t>(allocations[0]), M, &address)
             .ok());
-    for (auto allocation : allocations)
+    for (auto allocation : allocations) {
         ASSERT_TRUE(p.local
                         .map("remote", p.bundle(),
                              reinterpret_cast<uint64_t>(allocation), M)
                         .ok());
+    }
     uint32_t direction = 0;
     ASSERT_TRUE(p.local
                     .beginCopy(reinterpret_cast<uint64_t>(source), second, 64,
@@ -1283,10 +1289,11 @@ TEST(MemFabricGva, SameTypeSlicesAndBothMediaMapCopyAndUnmapIndependently) {
             .ok());
     auto independent = p.add(p.local, 1);
     ASSERT_TRUE(p.local.free(independent, M).ok());
-    for (size_t i : {0u, 2u})
+    for (size_t i : {0u, 2u}) {
         EXPECT_TRUE(
             p.local.unmap("remote", reinterpret_cast<uint64_t>(allocations[i]))
                 .IsTooManyRequests());
+    }
     ASSERT_TRUE(
         p.local.unmap("remote", reinterpret_cast<uint64_t>(allocations[3]))
             .ok());

@@ -34,9 +34,10 @@ void check(const Status& s, const std::string& operation) {
     if (!s.ok()) throw std::runtime_error(operation + ": " + s.ToString());
 }
 void aclCheck(aclError s, const char* operation) {
-    if (s != ACL_ERROR_NONE)
+    if (s != ACL_ERROR_NONE) {
         throw std::runtime_error(std::string(operation) +
                                  ": ACL=" + std::to_string(s));
+    }
 }
 void io(int fd, void* data, size_t size, bool sending) {
     auto* p = static_cast<char*>(data);
@@ -53,15 +54,17 @@ std::string exchange(int fd, std::string local) {
     io(fd, &length, sizeof(length), true);
     io(fd, local.data(), local.size(), true);
     io(fd, &length, sizeof(length), false);
-    if (length > (1U << 16))
+    if (length > (1U << 16)) {
         throw std::runtime_error("invalid handshake length");
+    }
     std::string remote(length, '\0');
     io(fd, remote.data(), remote.size(), false);
     return remote;
 }
 void barrier(int fd, const char* phase) {
-    if (exchange(fd, phase) != phase)
+    if (exchange(fd, phase) != phase) {
         throw std::runtime_error("barrier phase mismatch");
+    }
 }
 uint64_t hash(const std::vector<unsigned char>& data) {
     uint64_t value = 1469598103934665603ULL;
@@ -70,9 +73,10 @@ uint64_t hash(const std::vector<unsigned char>& data) {
 }
 std::vector<unsigned char> pattern(size_t length, int rank) {
     std::vector<unsigned char> bytes(length);
-    for (size_t i = 0; i < length; ++i)
+    for (size_t i = 0; i < length; ++i) {
         bytes[i] = static_cast<unsigned char>(
             (i * 17 + i / 251 + rank * 73 + 11) & 255);
+    }
     return bytes;
 }
 void* offset(void* p, size_t n) {
@@ -109,15 +113,18 @@ void transfer(TransferEngine& engine, int rank, SegmentID peer,
             check(engine.getTransferStatus(batch, i, status),
                   "getTransferStatus");
             if (status.s == COMPLETED) break;
-            if (status.s != INITIAL && status.s != PENDING)
+            if (status.s != INITIAL && status.s != PENDING) {
                 throw std::runtime_error("transfer terminal status=" +
                                          std::to_string(status.s));
-            if (Clock::now() >= deadline)
+            }
+            if (Clock::now() >= deadline) {
                 throw std::runtime_error("transfer timeout");
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        if (status.transferred_bytes != requests[i].length)
+        if (status.transferred_bytes != requests[i].length) {
             throw std::runtime_error("incorrect completed bytes");
+        }
     }
     std::cerr << "rank=" << rank
               << " op=" << (op == Request::WRITE ? "WRITE" : "READ")
@@ -146,8 +153,9 @@ void child(const Options& o, int rank, int fd) {
         config->set("log_level", "info");
         for (const char* name : {"tcp", "shm", "rdma", "nvlink", "mnnvl", "gds",
                                  "io_uring", "ascend_direct", "hp_tcp", "ub",
-                                 "fabric", "mlu", "xpu", "hylink", "mpcomm"})
+                                 "fabric", "mlu", "xpu", "hylink", "mpcomm"}) {
             config->set(std::string("transports/") + name + "/enable", false);
+        }
         config->set("transports/memfabric/enable", true);
         const std::string prefix = "transports/memfabric/gva/";
         config->set(prefix + "enabled", true);
@@ -160,8 +168,9 @@ void child(const Options& o, int rank, int fd) {
         // Deliberately leak on failure: exiting the process is safer than
         // attempting object teardown while failed device work may be in flight.
         auto* engine = new TransferEngine(config);
-        if (!engine->available())
+        if (!engine->available()) {
             throw std::runtime_error("TransferEngine unavailable");
+        }
         barrier(fd, "installed");
         const auto allocation_size =
             o.allocation_size ? o.allocation_size : o.pool / o.allocations;
@@ -177,9 +186,10 @@ void child(const Options& o, int rank, int fd) {
                   "allocateLocalMemory");
             if (options.global_address !=
                     reinterpret_cast<uint64_t>(pools[index]) ||
-                options.type != MEMFABRIC)
+                options.type != MEMFABRIC) {
                 throw std::runtime_error(
                     "allocation options disagree with returned GVA");
+            }
             const auto own = pattern(payload_size, rank + 2 * index);
             const std::vector<unsigned char> zeros(payload_size, 0);
             aclCheck(aclrtMemcpy(pools[index], allocation_size, own.data(),
@@ -201,8 +211,9 @@ void child(const Options& o, int rank, int fd) {
              allocation_size}}.dump();
         const auto remote = nlohmann::json::parse(exchange(fd, local));
         if (remote.at("allocation_size").get<uint64_t>() != allocation_size ||
-            remote.at("gvas").size() != pools.size())
+            remote.at("gvas").size() != pools.size()) {
             throw std::runtime_error("peer allocation layout mismatch");
+        }
         const auto peer_gvas = remote.at("gvas").get<std::vector<uint64_t>>();
         SegmentID peer;
         check(
@@ -224,12 +235,14 @@ void child(const Options& o, int rank, int fd) {
                     peer, reinterpret_cast<void*>(peer_gvas[index]),
                     allocation_size, MEMFABRIC);
                 if (status.ok()) break;
-                if (attempts++ % 50 == 0)
+                if (attempts++ % 50 == 0) {
                     std::cerr << "rank=" << rank << " allocation=" << index
                               << " map retry " << status.ToString()
                               << std::endl;
-                if (Clock::now() >= deadline)
+                }
+                if (Clock::now() >= deadline) {
                     check(status, "mapRemoteMemory timeout");
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }
@@ -243,10 +256,11 @@ void child(const Options& o, int rank, int fd) {
                                  offset(pools[index], payload_size),
                                  payload_size, ACL_MEMCPY_DEVICE_TO_HOST),
                      "read owner destination");
-            if (actual != pattern(payload_size, 1 - rank + 2 * index))
+            if (actual != pattern(payload_size, 1 - rank + 2 * index)) {
                 throw std::runtime_error(
                     "WRITE owner bytes differ for allocation " +
                     std::to_string(index));
+            }
             std::cerr << "rank=" << rank << " allocation=" << index
                       << " WRITE owner checksum=" << hash(actual) << std::endl;
         }
@@ -258,9 +272,10 @@ void child(const Options& o, int rank, int fd) {
                                  offset(pools[index], 2 * payload_size),
                                  payload_size, ACL_MEMCPY_DEVICE_TO_HOST),
                      "read READ result");
-            if (actual != pattern(payload_size, rank + 2 * index))
+            if (actual != pattern(payload_size, rank + 2 * index)) {
                 throw std::runtime_error("READ bytes differ for allocation " +
                                          std::to_string(index));
+            }
             std::cerr << "rank=" << rank << " allocation=" << index
                       << " READ checksum=" << hash(actual) << std::endl;
         }
@@ -268,8 +283,9 @@ void child(const Options& o, int rank, int fd) {
         for (size_t index = 0; index < pools.size(); ++index) {
             const auto status = engine->unmapRemoteMemory(
                 peer, reinterpret_cast<void*>(peer_gvas[index]), MEMFABRIC);
-            if (index + 1 == pools.size() || !status.IsTooManyRequests())
+            if (index + 1 == pools.size() || !status.IsTooManyRequests()) {
                 check(status, "unmapRemoteMemory");
+            }
         }
         barrier(fd, "both-unmapped");
         check(engine->closeSegment(peer), "closeSegment");
@@ -312,43 +328,47 @@ int main(int argc, char** argv) {
             if (arg == "--hbm-only") continue;
             if (i + 1 >= argc) throw std::runtime_error("missing option value");
             const std::string value = argv[++i];
-            if (arg == "--protocol")
+            if (arg == "--protocol") {
                 o.protocol = value;
-            else if (arg == "--device0")
+            } else if (arg == "--device0") {
                 o.devices[0] = std::stoi(value);
-            else if (arg == "--device1")
+            } else if (arg == "--device1") {
                 o.devices[1] = std::stoi(value);
-            else if (arg == "--pool-size")
+            } else if (arg == "--pool-size") {
                 o.pool = std::stoull(value);
-            else if (arg == "--bind-ip")
+            } else if (arg == "--bind-ip") {
                 o.bind_ip = value;
-            else if (arg == "--allocations")
+            } else if (arg == "--allocations") {
                 o.allocations = std::stoull(value);
-            else if (arg == "--allocation-size")
+            } else if (arg == "--allocation-size") {
                 o.allocation_size = std::stoull(value);
-            else if (arg == "--timeout-sec")
+            } else if (arg == "--timeout-sec") {
                 o.timeout = std::stoul(value);
-            else
+            } else {
                 throw std::runtime_error("unknown option " + arg);
+            }
         }
         if ((o.protocol != "device_sdma" && o.protocol != "device_rdma" &&
              o.protocol != "device_urma") ||
             !o.timeout || o.allocations < 1 || o.allocations > 64 ||
             o.pool < (1ULL << 30) || o.pool % (1ULL << 30) ||
             o.devices[0] < 0 || o.devices[1] < 0 ||
-            o.devices[0] == o.devices[1])
+            o.devices[0] == o.devices[1]) {
             throw std::runtime_error(
                 "invalid protocol, timeout, pool (must be 1 GiB aligned) or "
                 "devices");
+        }
         if (o.allocation_size && (o.allocation_size < (6ULL << 20) ||
                                   o.allocation_size % (2ULL << 20) ||
-                                  o.allocation_size > o.pool / o.allocations))
+                                  o.allocation_size > o.pool / o.allocations)) {
             throw std::runtime_error(
                 "allocation size must be at least 6 MiB, 2 MiB aligned, and "
                 "fit its share of the pool");
+        }
         int sockets[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets))
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) {
             throw std::runtime_error("socketpair failed");
+        }
         pid_t children[2]{};
         for (int rank = 0; rank < 2; ++rank) {
             children[rank] = fork();
@@ -379,11 +399,12 @@ int main(int argc, char** argv) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        for (auto pid : children)
+        for (auto pid : children) {
             if (pid > 0) {
                 kill(pid, SIGKILL);
                 waitpid(pid, nullptr, 0);
             }
+        }
         return failed || remaining ? 1 : 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL " << e.what() << std::endl;
