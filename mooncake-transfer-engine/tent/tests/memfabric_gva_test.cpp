@@ -373,6 +373,89 @@ struct Pair {
     }
     Status unmapH() { return a.unmap("b", reinterpret_cast<uint64_t>(bh)); }
 };
+TEST(MemFabricGva, PeerEntityIdIsLocalToPublishingProcess) {
+    Pair p;
+    auto published = nlohmann::json::parse(p.h);
+    published["entity"] = 510u;
+    ASSERT_TRUE(
+        p.a.prepare("b", published.dump(), reinterpret_cast<uint64_t>(p.bh), M)
+            .ok());
+    EXPECT_TRUE(p.a.validateCopyTarget("b", reinterpret_cast<uint64_t>(p.bh),
+                                       published.dump())
+                    .ok());
+}
+
+TEST(MemFabricGva, RejectsPeerEntityOutsideNativeRange) {
+    Pair p;
+    auto published = nlohmann::json::parse(p.h);
+    published["entity"] = 511u;
+    EXPECT_TRUE(
+        p.a.prepare("b", published.dump(), reinterpret_cast<uint64_t>(p.bh), M)
+            .IsInvalidArgument());
+}
+
+TEST(MemFabricGva, CopyTargetRequiresExactPreparedPublication) {
+    Pair p;
+    ASSERT_TRUE(p.mapH().ok());
+    auto original = nlohmann::json::parse(p.h);
+    for (auto key : {"rank", "address", "size"}) {
+        auto changed = original;
+        changed[key] = changed[key].get<double>();
+        EXPECT_FALSE(p.a.validateCopyTarget("b",
+                                            reinterpret_cast<uint64_t>(p.bh),
+                                            changed.dump())
+                         .ok());
+    }
+    auto changed = original;
+    changed["rank"] = (1ULL << 32) + 1;
+    EXPECT_FALSE(p.a.validateCopyTarget("b", reinterpret_cast<uint64_t>(p.bh),
+                                        changed.dump())
+                     .ok());
+    changed = original;
+    changed["slice_blob"][0] = changed["slice_blob"][0].get<double>();
+    EXPECT_FALSE(p.a.validateCopyTarget("b", reinterpret_cast<uint64_t>(p.bh),
+                                        changed.dump())
+                     .ok());
+}
+
+class EntityLifecycleHybm : public FakeHybm {
+   public:
+    uint16_t id = 0;
+    bool fail_create = false, fail_reserve = false, fail_unreserve = false;
+    void* create(const MemFabricGvaConfig& c) override {
+        id = c.entity;
+        return fail_create ? nullptr : FakeHybm::create(c);
+    }
+    int reserve(void*) override { return fail_reserve ? -1 : 0; }
+    int unreserve(void*) override { return fail_unreserve ? -1 : 0; }
+};
+
+TEST(MemFabricGva, RetainsLiveIdAcrossCleanupFailureAndReusesClosedIds) {
+    auto retained_api = std::make_shared<EntityLifecycleHybm>();
+    MemFabricSharedMemory retained(config(), "retained", retained_api);
+    ASSERT_TRUE(retained.initialize().ok());
+    retained_api->fail_unreserve = true;
+    ASSERT_FALSE(retained.close().ok());
+
+    auto api = std::make_shared<EntityLifecycleHybm>();
+    MemFabricSharedMemory other(config(), "other", api);
+    for (int cycle = 0; cycle < 448; ++cycle) {
+        api->fail_create = true;
+        ASSERT_FALSE(other.initialize().ok());
+        api->fail_create = false;
+        api->fail_reserve = true;
+        ASSERT_FALSE(other.initialize().ok());
+        api->fail_reserve = false;
+        ASSERT_TRUE(other.initialize().ok()) << cycle;
+        ASSERT_GE(api->id, 64);
+        ASSERT_LT(api->id, 511);
+        ASSERT_NE(api->id, retained_api->id);
+        ASSERT_TRUE(other.close().ok());
+    }
+    retained_api->fail_unreserve = false;
+    EXPECT_TRUE(retained.close().ok());
+}
+
 TEST(MemFabricGva, DualPoolMapIsIdempotentAndRankUnmapIsDeferred) {
     Pair p;
     ASSERT_TRUE(p.mapH().ok());
@@ -703,13 +786,21 @@ TEST(MemFabricGva, CopyRejectsUnpublishedPoolAndNonIdentityAlias) {
 TEST(MemFabricGva, CopyTargetRejectsChangedGenerationAtReusedLogicalAddress) {
     Pair p;
     ASSERT_TRUE(p.mapH().ok());
-    EXPECT_TRUE(p.a.validateCopyTarget("b", p.h).ok());
+    EXPECT_TRUE(
+        p.a.validateCopyTarget("b", reinterpret_cast<uint64_t>(p.bh), p.h)
+            .ok());
     auto changed = nlohmann::json::parse(p.h);
     changed["generation"] = "restarted-owner";
-    EXPECT_FALSE(p.a.validateCopyTarget("b", changed.dump()).ok());
-    EXPECT_FALSE(p.a.validateCopyTarget("different-owner", p.h).ok());
+    EXPECT_FALSE(p.a.validateCopyTarget("b", reinterpret_cast<uint64_t>(p.bh),
+                                        changed.dump())
+                     .ok());
+    EXPECT_FALSE(p.a.validateCopyTarget("different-owner",
+                                        reinterpret_cast<uint64_t>(p.bh), p.h)
+                     .ok());
     ASSERT_TRUE(p.unmapH().ok());
-    EXPECT_FALSE(p.a.validateCopyTarget("b", p.h).ok());
+    EXPECT_FALSE(
+        p.a.validateCopyTarget("b", reinterpret_cast<uint64_t>(p.bh), p.h)
+            .ok());
 }
 
 namespace {
@@ -813,7 +904,11 @@ TEST_P(MemFabricNetworkGva, NetworkCopyDoesNotRequireRemoteDeviceAddress) {
         local->resolve(reinterpret_cast<uint64_t>(target), M, &device_address)
             .ok());
     EXPECT_EQ(device_address, nullptr);
-    ASSERT_TRUE(local->validateCopyTarget("remote", remote_desc).ok());
+    ASSERT_TRUE(local
+                    ->validateCopyTarget("remote",
+                                         reinterpret_cast<uint64_t>(target),
+                                         remote_desc)
+                    .ok());
     ASSERT_TRUE(begin(direction).ok());
     EXPECT_EQ(direction, 9u);
     ASSERT_TRUE(local
@@ -859,7 +954,11 @@ TEST_P(MemFabricNetworkGva, GenerationChangeInvalidatesPreparedCopyTarget) {
     ASSERT_TRUE(prepare().ok());
     auto descriptor = nlohmann::json::parse(remote_desc);
     descriptor["generation"] = "new-owner-instance";
-    EXPECT_FALSE(local->validateCopyTarget("remote", descriptor.dump()).ok());
+    EXPECT_FALSE(local
+                     ->validateCopyTarget("remote",
+                                          reinterpret_cast<uint64_t>(target),
+                                          descriptor.dump())
+                     .ok());
 }
 
 TEST_P(MemFabricNetworkGva,

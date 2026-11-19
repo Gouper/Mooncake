@@ -206,7 +206,7 @@ class MemFabricSharedMemory {
     Status unmap(const std::string& owner, uint64_t address);
     // Resolve only live local pools or successfully mapped, active peer pools.
     Status resolve(uint64_t address, size_t size, void** device_address);
-    Status validateCopyTarget(const std::string& owner,
+    Status validateCopyTarget(const std::string& owner, uint64_t address,
                               const std::string& descriptor) const;
     Status beginCopy(uint64_t source, uint64_t destination, size_t size,
                      uint32_t& direction);
@@ -231,6 +231,7 @@ class MemFabricSharedMemory {
     };
     struct RemotePool {
         Json descriptor;
+        std::string publication;
         bool active = false, imported = false, mapped = false,
              copy_ready = false;
     };
@@ -247,8 +248,9 @@ class MemFabricSharedMemory {
                         size_t, bool);
     Status validateConfig() const;
     // Resource helpers below require mutex_ to be held by the caller.
-    // Configuration is immutable; device binding belongs to each native caller.
+    // Device binding belongs to each native caller.
     Status initializeContext();
+    void destroyEntity();
     Status bindDevice();
     Status validateDescriptor(const Json&, const std::string&) const;
     RemotePool& recordPool(ImportedRank&, const Json&);

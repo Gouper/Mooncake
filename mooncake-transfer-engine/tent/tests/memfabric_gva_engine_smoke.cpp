@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
                        "--device0 N --device1 N\n"
                        "--pool-size BYTES (default 1073741824; multiple "
                        "of 1 GiB) --bind-ip IP\n"
-                       "--allocations 1|2 (default 1) "
+                       "--allocations 1..64 (default 1) "
                        "--allocation-size BYTES (default pool/allocations; "
                        "at least 6 MiB, multiple of 2 MiB)\n"
                        "--timeout-sec N (default 180) --hbm-only "
@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
         }
         if ((o.protocol != "device_sdma" && o.protocol != "device_rdma" &&
              o.protocol != "device_urma") ||
-            !o.timeout || (o.allocations != 1 && o.allocations != 2) ||
+            !o.timeout || o.allocations < 1 || o.allocations > 64 ||
             o.pool < (1ULL << 30) || o.pool % (1ULL << 30) ||
             o.devices[0] < 0 || o.devices[1] < 0 ||
             o.devices[0] == o.devices[1])

@@ -144,6 +144,9 @@ class MemFabricUnderApi {
 };
 
 // HYBM GVA API: libmf_hybm_core.so.
+constexpr uint32_t kGvaMemoryTypeDevice = 1;
+constexpr uint32_t kGvaMemoryTypeHost = 2;
+
 struct MemFabricGvaConfig {
     bool enabled = false;
     std::string group;

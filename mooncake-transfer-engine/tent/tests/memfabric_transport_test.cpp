@@ -2333,6 +2333,29 @@ TEST_F(MemFabricTransportTest, UrmaPreparationAllowsCopyWithoutDirectMapping) {
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 }
 
+TEST_F(MemFabricTransportTest, WindowCapIsExclusiveAndCheckedBeforeConversion) {
+    for (auto medium : {"hbm_window", "dram_window"}) {
+        auto config = GvaInputConfig();
+        const auto key = std::string("transports/memfabric/gva/") + medium;
+        config->set(key, uint64_t{1048575});
+        ASSERT_TRUE(LoadConfig(config).ok());
+        const auto bytes = std::string(medium) == "hbm_window"
+                               ? GvaConfig().hbm_window
+                               : GvaConfig().dram_window;
+        EXPECT_EQ(bytes, uint64_t{1048575} << 30);
+        for (auto invalid : {1048576ULL, 1048577ULL, 1ULL << 34}) {
+            config->set(key, static_cast<uint64_t>(invalid));
+            EXPECT_FALSE(LoadConfig(config).ok()) << medium << " " << invalid;
+        }
+    }
+}
+
+TEST_F(MemFabricTransportTest, RepeatedGvaConfigReadsDoNotConsumeEntityIds) {
+    auto config = GvaInputConfig();
+    for (int cycle = 0; cycle < 448; ++cycle)
+        ASSERT_TRUE(LoadConfig(config).ok()) << cycle;
+}
+
 TEST_F(MemFabricTransportTest, GvaConfigUsesApplicationDeviceAndWindowBudgets) {
     auto config = GvaInputConfig();
     g_device_id = 3;
@@ -2345,8 +2368,6 @@ TEST_F(MemFabricTransportTest, GvaConfigUsesApplicationDeviceAndWindowBudgets) {
     EXPECT_EQ(GvaConfig().protocol, "device_rdma");
     EXPECT_EQ(GvaConfig().hbm_size, GvaConfig().hbm_window);
     EXPECT_EQ(GvaConfig().dram_size, GvaConfig().dram_window);
-    EXPECT_GE(GvaConfig().entity, 64);
-    EXPECT_LT(GvaConfig().entity, 511);
 }
 
 TEST_F(MemFabricTransportTest,

@@ -20,14 +20,6 @@ namespace tent {
 
 namespace {
 
-// Entity id is a per-process engine/meta index (not a network port): HYBM
-// dedups entities by id inside the process, so ids must be unique within a
-// process, while peers may share the same id. Lower ids are reserved
-// internally; HYBM caps valid ids below 511 (HYBM_ENTITY_NUM_MAX).
-constexpr uint16_t kFirstGvaEntityId = 64;
-constexpr uint16_t kMaxGvaEntityId = 511;
-std::atomic<uint16_t> g_next_gva_entity{kFirstGvaEntityId};
-
 // Must match SMEM Trans's NPU page alignment. All native registration
 // boundaries are multiples of this size, including ranges on remote peers.
 constexpr uint64_t kRegistrationAlignment = 2ULL * 1024 * 1024;
@@ -35,6 +27,7 @@ constexpr uint64_t kRegistrationAlignment = 2ULL * 1024 * 1024;
 // `hbm_window` / `dram_window` configuration values are expressed in GiB and
 // converted to bytes for the HYBM sizing options.
 constexpr uint64_t kGvaWindowUnit = 1ULL << 30;
+constexpr uint64_t kGvaWindowLimitGiB = 1ULL << 20;
 
 Status alignedBufferRange(const BufferDesc& desc, uint64_t& begin,
                           uint64_t& end) {
@@ -109,10 +102,10 @@ Status MemFabricTransport::allocateLocalMemory(void** addr, size_t size,
         return Transport::allocateLocalMemory(addr, size, options);
     uint32_t type = 0;
     if (options.location == "cpu" || options.location.rfind("cpu:", 0) == 0)
-        type = 2;
+        type = kGvaMemoryTypeHost;
     else if (options.location == "npu" || options.location == "*" ||
              options.location == "npu:" + std::to_string(gva_config_.device))
-        type = 1;
+        type = kGvaMemoryTypeDevice;
     else
         return Status::InvalidArgument(
             "GVA location must be cpu or the configured npu device");
@@ -236,18 +229,13 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
         gva_config_.rank_count = ranks;
         gva_config_.rank = rank;
         gva_config_.device = static_cast<uint16_t>(device);
-        // Entity id is auto-assigned per process; it is not a configuration
-        // knob and not a network port. See g_next_gva_entity above.
-        const auto entity =
-            g_next_gva_entity.fetch_add(1, std::memory_order_relaxed);
-        if (entity >= kMaxGvaEntityId)
+        const auto hbm = conf->get(prefix + "hbm_window", uint64_t{0});
+        const auto dram = conf->get(prefix + "dram_window", uint64_t{0});
+        if (hbm >= kGvaWindowLimitGiB || dram >= kGvaWindowLimitGiB)
             return Status::InvalidArgument(
-                "MemFabric GVA entity id exhausted" LOC_MARK);
-        gva_config_.entity = entity;
-        gva_config_.hbm_window =
-            conf->get(prefix + "hbm_window", uint64_t{0}) * kGvaWindowUnit;
-        gva_config_.dram_window =
-            conf->get(prefix + "dram_window", uint64_t{0}) * kGvaWindowUnit;
+                "MemFabric GVA windows must be less than 1048576 GiB");
+        gva_config_.hbm_window = hbm * kGvaWindowUnit;
+        gva_config_.dram_window = dram * kGvaWindowUnit;
         gva_config_.hbm_size = gva_config_.hbm_window;
         gva_config_.dram_size = gva_config_.dram_window;
         return Status::OK();
@@ -784,7 +772,8 @@ Status MemFabricTransport::submitGvaCopies(
                     mapping->second != segment->name)
                     return Status::InvalidArgument(
                         "Map remote GVA pool before copy");
-                return gva_->validateCopyTarget(segment->name, attr->second);
+                return gva_->validateCopyTarget(segment->name, buffer->addr,
+                                                attr->second);
             });
         if (!status.ok()) {
             rollback();
