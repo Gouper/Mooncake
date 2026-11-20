@@ -1,10 +1,8 @@
 if(USE_MEMFABRIC)
-  # Keep the GVA API in a separate archive member so tests can supply their
-  # own mock definitions.
   add_library(
     tent_xport_memfabric STATIC
     memfabric_transport.cpp memfabric_under_api.cpp memfabric_allocator.cpp
-    memfabric_shared_memory.cpp memfabric_gva_api.cpp)
+    memfabric_shared_memory.cpp)
   find_path(
     MEMFABRIC_HYBM_INCLUDE_DIR hybm_big_mem.h
     HINTS ENV MEMFABRIC_HOME

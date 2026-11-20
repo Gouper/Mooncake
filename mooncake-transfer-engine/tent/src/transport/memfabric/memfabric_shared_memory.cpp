@@ -44,7 +44,10 @@ class EntityIds {
     std::mutex mutex_;
     std::bitset<kEntityIdLimit - kFirst> used_;
 };
-Status pending(const char* why, int code = 0) {
+Status pending(const std::string& why) {
+    return Status::TooManyRequests("MemFabric GVA cleanup pending: " + why);
+}
+Status pending(const char* why, int code) {
     return pending(std::string(why) + ", ret=" + std::to_string(code));
 }
 Status nativeError(const char* op, int code = 0) {
