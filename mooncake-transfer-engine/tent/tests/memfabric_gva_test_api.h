@@ -20,7 +20,7 @@ struct FakeHybm {
     std::optional<uint64_t> blocked_source;
     bool reachable = true, stale_registry = false, empty_slice_export = false;
     bool fail_create = false;
-    int initialize_result = 0, reserve_result = 0;
+    int bind_result = 0, initialize_result = 0, reserve_result = 0;
     int result = 0, wait_result = 0, waits = 0;
     int connect_result = 0, map_result = 0, remove_result = 0;
     int entity_export_result = 0, fail_slice_export_at = 0;

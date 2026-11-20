@@ -103,6 +103,8 @@ TEST_F(MemFabricGva, InitializesExplicitlyAndRetriesNativeFailures) {
     native.reserve_result = 0;
     native.entity_export_result = -1;
     EXPECT_FALSE(memory.initialize().ok());
+    ASSERT_TRUE(
+        memory.allocate(&pointer, kPoolSize, kHbm, 0).IsInvalidArgument());
     native.entity_export_result = 0;
     ASSERT_TRUE(memory.initialize().ok());
     EXPECT_EQ(native.creates, 2);
@@ -122,6 +124,11 @@ TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
     auto& native = fakeHybm();
     const auto base = MemFabricGvaApi::base(nullptr, kHbm);
     void* pointer = nullptr;
+    native.bind_result = -23;
+    const auto bind_failure = memory.allocate(&pointer, kPoolSize, kHbm, 0);
+    native.bind_result = 0;
+    ASSERT_TRUE(bind_failure.IsInternalError()) << bind_failure.ToString();
+    EXPECT_EQ(pointer, nullptr);
     EXPECT_FALSE(memory.allocate(&pointer, kPoolSize, kHbm, base + 1).ok());
     EXPECT_EQ(pointer, nullptr);
     native.alias_offset = 128;
@@ -239,6 +246,11 @@ TEST_F(MemFabricGva, SdmaRetriesImportsAndRequiresLiveIdentityMapping) {
     HbmPair pair;
     ASSERT_NO_FATAL_FAILURE(pair.initialize());
     auto& native = fakeHybm();
+    native.bind_result = -23;
+    const auto bind_failure = pair.map();
+    native.bind_result = 0;
+    ASSERT_TRUE(bind_failure.IsInternalError()) << bind_failure.ToString();
+    EXPECT_EQ(native.imports, 0);
     native.entity_import_result = -1;
     EXPECT_FALSE(pair.map().ok());
     EXPECT_EQ(native.slice_imports, 0);

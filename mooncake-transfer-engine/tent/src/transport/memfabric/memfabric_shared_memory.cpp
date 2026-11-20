@@ -219,15 +219,17 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     const auto gva = MemFabricGvaApi::address(entity_, slice);
     const auto mapped = MemFabricGvaApi::size(entity_, slice);
     const auto rank_base = window_bases_[index] + config_.rank * window;
-    bool range = gva >= rank_base && gva - rank_base <= budget && mapped &&
-                 mapped <= budget - (gva - rank_base);
+    const bool in_window = gva >= rank_base;
+    const auto offset = in_window ? gva - rank_base : 0;
+    const bool accounted = in_window && mapped <= UINT64_MAX - offset;
     // HYBM's bump cursor is not rewound by free, including failed fixed-address
     // validation. Account for actual offsets, rather than assuming offset zero.
-    if (gva >= rank_base && mapped <= UINT64_MAX - (gva - rank_base)) {
-        consumed_[index] = std::max(consumed_[index], gva - rank_base + mapped);
-    } else {
-        consumed_[index] = budget;
-    }
+    consumed_[index] =
+        accounted ? std::max(consumed_[index], offset + mapped) : budget;
+    // offset <= budget and mapped <= budget - offset keep offset + mapped
+    // inside the rank window, so no separate overflow check is needed here.
+    const bool range =
+        accounted && offset <= budget && mapped && mapped <= budget - offset;
     // Network DRAM is accessed through its host VA; HYBM may assign a
     // different device alias when registering that host memory.
     const uint32_t address_type = memory_type == kGvaMemoryTypeHost &&
@@ -269,9 +271,8 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     record.descriptor["type"] = memory_type;
     record.descriptor["address"] = gva;
     record.descriptor["size"] = size;
-    record.descriptor["mapped_size"] = mapped;
     record.descriptor["window_base"] = window_bases_[index];
-    record.descriptor["offset"] = gva - rank_base;
+    record.descriptor["offset"] = offset;
     record.descriptor["slice_generation"] = ++slice_generation_;
     slices_.emplace(gva, std::move(record));
     options.global_address = gva;
