@@ -1,7 +1,24 @@
 if(USE_MEMFABRIC)
+  # Keep the GVA API in a separate archive member so tests can supply their
+  # own mock definitions.
   add_library(
-    tent_xport_memfabric STATIC memfabric_transport.cpp memfabric_under_api.cpp
-                                memfabric_allocator.cpp)
+    tent_xport_memfabric STATIC
+    memfabric_transport.cpp memfabric_under_api.cpp memfabric_allocator.cpp
+    memfabric_shared_memory.cpp memfabric_gva_api.cpp)
+  find_path(
+    MEMFABRIC_HYBM_INCLUDE_DIR hybm_big_mem.h
+    HINTS ENV MEMFABRIC_HOME
+    PATH_SUFFIXES include include/host)
+  if(MEMFABRIC_HYBM_INCLUDE_DIR)
+    target_include_directories(tent_xport_memfabric
+                               PRIVATE ${MEMFABRIC_HYBM_INCLUDE_DIR})
+    target_compile_definitions(tent_xport_memfabric
+                               PRIVATE TENT_WITH_HYBM_GVA=1)
+  else()
+    message(
+      STATUS
+        "HYBM headers unavailable; MemFabric trans remains enabled without GVA")
+  endif()
   if(BUILD_UNIT_TESTS AND USE_MEMFABRIC)
     target_include_directories(
       tent_xport_memfabric
