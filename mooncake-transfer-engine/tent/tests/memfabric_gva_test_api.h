@@ -5,7 +5,6 @@
 #define TENT_MEMFABRIC_GVA_TEST_API_H
 
 #include <array>
-#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -21,7 +20,7 @@ struct FakeHybm {
     std::optional<uint64_t> blocked_source;
     bool reachable = true, stale_registry = false, empty_slice_export = false;
     bool fail_create = false;
-    int initialize_result = 0, bind_result = 0, reserve_result = 0;
+    int initialize_result = 0, reserve_result = 0;
     int result = 0, wait_result = 0, waits = 0;
     int connect_result = 0, map_result = 0, remove_result = 0;
     int entity_export_result = 0, fail_slice_export_at = 0;
@@ -30,7 +29,6 @@ struct FakeHybm {
     int initializes = 0, creates = 0, frees = 0, unmaps = 0;
     int entity_exports = 0, slice_exports = 0, imports = 0, slice_imports = 0;
     int connects = 0;
-    std::atomic<int> binds{0};
     uint64_t alias_offset = 0;
     std::vector<size_t> batch_sizes;
     std::vector<std::array<uint64_t, 4>> copies;

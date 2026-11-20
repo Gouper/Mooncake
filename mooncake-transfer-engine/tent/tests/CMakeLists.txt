@@ -901,14 +901,11 @@ target_include_directories(tent_segment_desc_retry_test
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 
 if(USE_MEMFABRIC)
-  add_executable(tent_memfabric_gva_test memfabric_gva_test.cpp)
-  target_sources(tent_memfabric_gva_test PRIVATE memfabric_test_acl_stubs.cpp
-                                                 memfabric_gva_test_api.cpp)
-  target_link_libraries(tent_memfabric_gva_test PRIVATE gtest gtest_main
-                                                        tent_link_group)
-  target_include_directories(
-    tent_memfabric_gva_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
-                                    ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
+  add_executable(tent_memfabric_gva_test memfabric_gva_test.cpp
+                                         memfabric_gva_test_api.cpp)
+  target_link_libraries(
+    tent_memfabric_gva_test PRIVATE gtest gtest_main tent_xport_memfabric
+                                    tent_common)
   add_test(NAME tent_memfabric_gva_test COMMAND tent_memfabric_gva_test)
   add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
   target_sources(tent_memfabric_transport_test
@@ -921,8 +918,7 @@ if(USE_MEMFABRIC)
   add_test(NAME tent_memfabric_transport_test
            COMMAND tent_memfabric_transport_test)
   # The lifecycle test needs ACL stubs for the Ascend platform in host builds.
-  target_sources(tent_local_memory_lifecycle_test
-                 PRIVATE memfabric_test_acl_stubs.cpp)
+  target_sources(tent_local_memory_lifecycle_test PRIVATE mock_acl/acl_stub.cpp)
   target_include_directories(tent_local_memory_lifecycle_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
 endif()

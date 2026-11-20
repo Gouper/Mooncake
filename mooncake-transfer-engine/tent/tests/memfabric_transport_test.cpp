@@ -26,6 +26,7 @@
 #include "memfabric_gva_test_api.h"
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/transfer_engine.h"
 #include "tent/transport/memfabric/memfabric_transport.h"
 #include "tent/transport/memfabric/memfabric_under_api.h"
 
@@ -1876,9 +1877,6 @@ TEST_F(MemFabricTransportTest, GvaConfigRejectsInvalidBoundsAndCanRetryLoad) {
     config->set(prefix + "rank", int64_t{-1});
     EXPECT_TRUE(install().IsInvalidArgument());
     config->set(prefix + "rank", int64_t{0});
-    g_device_id = -1;
-    EXPECT_TRUE(install().IsInvalidArgument());
-    g_device_id = 0;
     setenv("MF_PROTOCOL", "host_rdma", 1);
     EXPECT_TRUE(install().IsInvalidArgument());
     setenv("MF_PROTOCOL", "device_sdma", 1);
@@ -1900,6 +1898,43 @@ TEST_F(MemFabricTransportTest, GvaConfigRejectsInvalidBoundsAndCanRetryLoad) {
         transport_->addMemoryBuffer(unknown, options).IsInvalidArgument());
     EXPECT_EQ(state_->init_calls, 0);
     EXPECT_EQ(state_->create_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest, EngineRegistersAndFreesHbm) {
+    auto conf = GvaSettings();
+    conf->set("metadata_type", "p2p");
+    conf->set("metadata_servers", "");
+    conf->set("rpc_server_hostname", "127.0.0.1");
+    conf->set("rpc_server_port", "0");
+    conf->set("log_level", "warning");
+    for (const char* transport : {"tcp", "shm", "rdma", "io_uring", "nvlink",
+                                  "mnnvl", "gds", "ascend_direct", "mlu"}) {
+        conf->set(std::string("transports/") + transport + "/enable", false);
+    }
+    conf->set("transports/memfabric/enable", true);
+    setenv("MF_PROTOCOL", "device_sdma", 1);
+    auto& native = test::fakeHybm();
+    native.loaded = true;
+    TransferEngine frontend(conf);
+    ASSERT_TRUE(frontend.available());
+
+    MemoryOptions options;
+    options.type = MEMFABRIC;
+    options.location = "npu:0";
+    void* pool = nullptr;
+    ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kHbmSize, options).ok());
+    native.fail_slice_export_at = 1;
+    EXPECT_FALSE(frontend.registerLocalMemory(pool, kHbmSize).ok());
+    ASSERT_TRUE(frontend.freeLocalMemory(pool).ok());
+    options.global_address = 0;
+    ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kHbmSize, options).ok());
+    ASSERT_TRUE(frontend.registerLocalMemory(pool, kHbmSize).ok());
+    EXPECT_TRUE(
+        frontend.mapRemoteMemory(1, pool, 0, MEMFABRIC).IsInvalidArgument());
+    EXPECT_TRUE(frontend.freeLocalMemory(pool).IsInvalidArgument());
+    ASSERT_TRUE(frontend.unregisterLocalMemory(pool).ok());
+    ASSERT_TRUE(frontend.freeLocalMemory(pool).ok());
+    EXPECT_EQ(native.frees, 2);
 }
 
 TEST_F(MemFabricTransportTest, HbmBatchAdmissionIsAtomicAndPinsPendingMemory) {

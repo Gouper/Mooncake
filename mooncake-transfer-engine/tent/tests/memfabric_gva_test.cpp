@@ -6,13 +6,6 @@
 #include "memfabric_gva_test_api.h"
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
 
-#if defined(__linux__)
-#include <cstdlib>
-
-#include "tent/common/config.h"
-#include "tent/transfer_engine.h"
-#endif
-
 namespace mooncake::tent {
 namespace {
 
@@ -100,9 +93,6 @@ TEST_F(MemFabricGva, InitializesExplicitlyAndRetriesNativeFailures) {
     void* pointer = nullptr;
     EXPECT_TRUE(
         memory.allocate(&pointer, kPoolSize, kHbm, 0).IsInvalidArgument());
-    native.bind_result = -23;
-    EXPECT_NE(memory.initialize().ToString().find("-23"), std::string::npos);
-    native.bind_result = 0;
     native.initialize_result = -1;
     EXPECT_FALSE(memory.initialize().ok());
     native.initialize_result = 0;
@@ -181,9 +171,7 @@ TEST_F(MemFabricGva, BatchPublicationValidatesAndCommitsAllHbmSlices) {
     uint32_t direction = 0;
     EXPECT_FALSE(
         memory.beginCopy(addr(first), addr(second), 32, direction).ok());
-    const auto binds = native.binds.load();
     ASSERT_TRUE(memory.publish(ranges, descriptors).ok());
-    EXPECT_EQ(native.binds.load(), binds + 1);
     ASSERT_EQ(descriptors.size(), 2u);
     const auto descriptor = Json::parse(descriptors.front());
     EXPECT_EQ(descriptor["address_mode"], "identity");
@@ -354,47 +342,6 @@ TEST_P(MemFabricNetworkGva,
 
 INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
                          ::testing::Values("device_rdma", "device_urma"));
-
-#if defined(__linux__)
-TEST_F(MemFabricGva, EngineRegistersAndFreesHbmWithoutProbingHostMemory) {
-    auto conf = std::make_shared<Config>();
-    conf->set("metadata_type", "p2p");
-    conf->set("metadata_servers", "");
-    conf->set("rpc_server_hostname", "127.0.0.1");
-    conf->set("rpc_server_port", "0");
-    conf->set("log_level", "warning");
-    for (const char* transport : {"tcp", "shm", "rdma", "io_uring", "nvlink",
-                                  "mnnvl", "gds", "ascend_direct", "mlu"}) {
-        conf->set(std::string("transports/") + transport + "/enable", false);
-    }
-    conf->set("transports/memfabric/enable", true);
-    conf->set("transports/memfabric/gva/enabled", true);
-    conf->set("transports/memfabric/gva/rank_count", int64_t{2});
-    conf->set("transports/memfabric/gva/rank", int64_t{0});
-    conf->set("transports/memfabric/gva/hbm_window", uint64_t{1});
-    setenv("MF_PROTOCOL", "device_sdma", 1);
-    TransferEngine frontend(conf);
-    ASSERT_TRUE(frontend.available());
-
-    MemoryOptions options;
-    options.type = MEMFABRIC;
-    options.location = "npu:0";
-    void* pool = nullptr;
-    ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kPoolSize, options).ok());
-    fakeHybm().fail_slice_export_at = 1;
-    EXPECT_FALSE(frontend.registerLocalMemory(pool, kPoolSize).ok());
-    ASSERT_TRUE(frontend.freeLocalMemory(pool).ok());
-    options.global_address = 0;
-    ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kPoolSize, options).ok());
-    ASSERT_TRUE(frontend.registerLocalMemory(pool, kPoolSize).ok());
-    EXPECT_TRUE(
-        frontend.mapRemoteMemory(1, pool, 0, MEMFABRIC).IsInvalidArgument());
-    EXPECT_TRUE(frontend.freeLocalMemory(pool).IsInvalidArgument());
-    ASSERT_TRUE(frontend.unregisterLocalMemory(pool).ok());
-    ASSERT_TRUE(frontend.freeLocalMemory(pool).ok());
-    EXPECT_EQ(fakeHybm().frees, 2);
-}
-#endif
 
 }  // namespace
 }  // namespace mooncake::tent

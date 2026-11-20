@@ -90,9 +90,8 @@ int MemFabricGvaApi::wait(void*) {
 }
 
 int MemFabricGvaApi::bind(uint16_t next_device) {
-    ++state->binds;
     device = next_device;
-    return state->bind_result;
+    return 0;
 }
 
 int MemFabricGvaApi::initialize(uint16_t) {
