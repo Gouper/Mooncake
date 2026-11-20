@@ -156,7 +156,6 @@ constexpr uint32_t kGvaCopyDestinationDevice = 0x1;
 
 struct MemFabricGvaConfig {
     bool enabled = false;
-    std::string group;
     std::string protocol = "device_sdma";
     uint32_t rank_count = 0, rank = 0;
     uint16_t device = 0, entity = 64;

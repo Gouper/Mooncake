@@ -242,7 +242,6 @@ Status MemFabricTransport::loadGvaConfig(const Config& conf,
         protocol != "device_urma") {
         return Status::InvalidArgument("Unsupported MemFabric GVA protocol");
     }
-    gva_config_.group = conf.get(prefix + "group", "mooncake-memfabric");
     const auto ranks = conf.get(prefix + "rank_count", int64_t{0});
     const auto rank = conf.get(prefix + "rank", int64_t{-1});
     // Capture the application's device before native initialization and

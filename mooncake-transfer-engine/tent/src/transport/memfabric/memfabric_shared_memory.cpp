@@ -44,10 +44,7 @@ class EntityIds {
     std::mutex mutex_;
     std::bitset<kEntityIdLimit - kFirst> used_;
 };
-Status pending(const std::string& why) {
-    return Status::TooManyRequests("MemFabric GVA cleanup pending: " + why);
-}
-Status pending(const char* why, int code) {
+Status pending(const char* why, int code = 0) {
     return pending(std::string(why) + ", ret=" + std::to_string(code));
 }
 Status nativeError(const char* op, int code = 0) {
@@ -95,9 +92,6 @@ Status MemFabricSharedMemory::validateConfig() const {
         return Status::NotImplemented(
             "MemFabric GVA requires compatible HYBM headers and library "
             "symbols");
-    }
-    if (config_.group.empty() || config_.group.size() > 256) {
-        return Status::InvalidArgument("Invalid MemFabric GVA group identity");
     }
     for (auto pair : {std::make_pair(config_.hbm_size, config_.hbm_window),
                       std::make_pair(config_.dram_size, config_.dram_window)}) {
@@ -168,7 +162,6 @@ void MemFabricSharedMemory::destroyEntity() {
 MemFabricSharedMemory::Json MemFabricSharedMemory::makeIdentity() const {
     return Json{{"protocol", config_.protocol},
                 {"address_mode", "identity"},
-                {"group", config_.group},
                 {"segment_name", segment_name_},
                 {"generation", generation_},
                 {"rank", config_.rank},
@@ -383,7 +376,7 @@ Status MemFabricSharedMemory::validateDescriptor(
         }
     }
     for (const char* key :
-         {"address_mode", "protocol", "segment_name", "group", "generation"}) {
+         {"address_mode", "protocol", "segment_name", "generation"}) {
         auto field = descriptor.find(key);
         if (field == descriptor.end()) {
             return invalidDescriptorField(key, "is missing");
@@ -400,7 +393,6 @@ Status MemFabricSharedMemory::validateDescriptor(
         {"address_mode", "identity"},
         {"protocol", config_.protocol},
         {"segment_name", peer_segment_name},
-        {"group", config_.group},
     };
     for (const auto& [key, expected] : identity) {
         if (descriptor.at(key).get_ref<const std::string&>() != expected) {

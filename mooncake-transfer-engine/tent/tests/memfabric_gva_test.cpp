@@ -19,7 +19,6 @@ MemFabricGvaConfig config(uint16_t rank = 0,
                           const char* protocol = "device_sdma") {
     MemFabricGvaConfig options;
     options.enabled = true;
-    options.group = "hbm-test";
     options.protocol = protocol;
     options.rank_count = 2;
     options.rank = options.device = rank;
@@ -193,6 +192,7 @@ TEST_F(MemFabricGva, InvalidBundlesNeverReachNativeImports) {
     HbmPair pair;
     ASSERT_NO_FATAL_FAILURE(pair.initialize());
     const auto desc = Json::parse(pair.publication);
+    EXPECT_FALSE(desc.contains("group"));
     const auto target = addr(pair.target);
     for (const auto& [key, value] : std::vector<std::pair<std::string, Json>>{
              {"address_mode", "logical56"},
