@@ -166,7 +166,6 @@ class MemFabricGvaApi {
     // Symbols are shared for process lifetime, including failed teardown.
     // No CleanupLibrary: unloading could invalidate live entities or workers.
     static bool LoadLibrary();
-    static bool IsLoaded();
     static bool supportsCopy();
     static bool supportsBatchCopy();
     static int batchCopy(void*, const std::vector<MemFabricGvaCopy>&, uint32_t);
