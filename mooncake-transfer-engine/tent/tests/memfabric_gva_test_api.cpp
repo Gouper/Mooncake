@@ -59,12 +59,9 @@ bool FakeHybm::awaitEntry() {
 
 bool MemFabricGvaApi::LoadLibrary() { return state->loaded; }
 
-bool MemFabricGvaApi::supportsCopy() { return true; }
 int MemFabricGvaApi::copy(void*, uint64_t, uint64_t, size_t, uint32_t) {
     return state->result;
 }
-
-bool MemFabricGvaApi::supportsBatchCopy() { return state->batch_available; }
 
 int MemFabricGvaApi::batchCopy(void*,
                                const std::vector<MemFabricGvaCopy>& copies,
@@ -77,7 +74,11 @@ int MemFabricGvaApi::batchCopy(void*,
     }
     state->entered = true;
     state->cv.notify_all();
-    state->cv.wait(lock, [] { return !state->blocked; });
+    state->cv.wait(lock, [&] {
+        return !state->blocked ||
+               (state->blocked_source &&
+                copies.front().source != *state->blocked_source);
+    });
     if (state->throw_batch) throw std::runtime_error("mock HYBM batch error");
     return state->result;
 }
@@ -195,7 +196,6 @@ int MemFabricGvaApi::importBlob(void* handle, bool entity_info,
 }
 
 int MemFabricGvaApi::map(void*) { return state->map_result; }
-bool MemFabricGvaApi::supportsConnect() { return state->connect_available; }
 
 int MemFabricGvaApi::connect(void*, uint32_t) {
     ++state->connects;

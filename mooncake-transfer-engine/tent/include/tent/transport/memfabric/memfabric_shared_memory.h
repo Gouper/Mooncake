@@ -17,7 +17,7 @@ namespace mooncake {
 namespace tent {
 class MemFabricSharedMemory {
    public:
-    MemFabricSharedMemory(MemFabricGvaConfig config, std::string owner);
+    MemFabricSharedMemory(MemFabricGvaConfig config, std::string segment_name);
     ~MemFabricSharedMemory();
     // Initialize the entity and reserve windows before allocation or mapping.
     Status initialize();
@@ -30,22 +30,19 @@ class MemFabricSharedMemory {
     Status publish(const std::vector<std::pair<void*, size_t>>& ranges,
                    std::vector<std::string>& descriptors);
     Status unpublish(void*, std::optional<size_t> size = std::nullopt);
-    Status map(const std::string& owner, const std::string& descriptor,
-               uint64_t address, size_t size);
-    Status prepare(const std::string& owner, const std::string& descriptor,
-                   uint64_t address, size_t size);
-    Status unmap(const std::string& owner, uint64_t address);
-    // Resolve only live local slices or successfully mapped peer slices.
-    Status resolve(uint64_t address, size_t size, void** device_address);
-    Status validateCopyTarget(const std::string& owner, uint64_t address,
+    Status map(const std::string& peer_segment_name,
+               const std::string& descriptor, uint64_t address, size_t size);
+    Status prepare(const std::string& peer_segment_name,
+                   const std::string& descriptor, uint64_t address,
+                   size_t size);
+    Status unmap(const std::string& peer_segment_name, uint64_t address);
+    Status validateCopyTarget(const std::string& peer_segment_name,
+                              uint64_t address,
                               const std::string& descriptor) const;
     Status beginCopy(uint64_t source, uint64_t destination, size_t size,
                      uint32_t& direction);
     Status runCopy(uint64_t source, uint64_t destination, size_t size,
                    uint32_t direction);
-    bool supportsBatchCopy() const {
-        return available_ && MemFabricGvaApi::supportsBatchCopy();
-    }
     // Each member has already been pinned by beginCopy; settles all those pins.
     Status runBatchCopy(const std::vector<MemFabricGvaCopy>&,
                         uint32_t direction);
@@ -67,10 +64,10 @@ class MemFabricSharedMemory {
         bool active = false, imported = false;
     };
     // Native imports grouped by rank, not a peer discovery/connection list.
-    // owner/generation identify the publication; slices retain per-allocation
-    // import and active state that HYBM cannot query for TENT.
+    // segment name/generation identify the publication; slices retain
+    // per-allocation import and active state that HYBM cannot query for TENT.
     struct ImportedRank {
-        std::string owner, generation;
+        std::string segment_name, generation;
         Json entity_blob;
         std::map<uint64_t, RemoteSlice> slices;
         bool cleaned = false;
@@ -79,24 +76,23 @@ class MemFabricSharedMemory {
                         size_t, bool);
     Status validateConfig() const;
     template <typename Copy>
-    Status runPinnedCopy(size_t count, bool supported, Copy copy,
-                         const char* missing_capability, const char* operation);
+    Status runPinnedCopy(size_t count, Copy copy, const char* operation);
     // Resource helpers below require mutex_ to be held by the caller.
     // Device binding belongs to each native caller.
     void destroyEntity();
     Status bindDevice();
-    Status validateDescriptor(const Json&, const std::string&) const;
+    Status validateDescriptor(const Json&,
+                              const std::string& peer_segment_name) const;
     RemoteSlice& recordSlice(ImportedRank&, const Json&);
     Status importPeer(ImportedRank&, const Json&);
     Status verifyPeerMapping(uint32_t, const RemoteSlice&);
     Status cleanupPeer(uint32_t, ImportedRank&);
-    enum class RangeUse { Resolve, Copy };
-    uint32_t memoryTypeForRange(uint64_t, size_t, RangeUse) const;
+    uint32_t memoryTypeForRange(uint64_t, size_t) const;
     Json makeIdentity() const;
     mutable std::mutex mutex_;
     MemFabricGvaConfig config_;
     Status config_status_ = Status::OK();
-    std::string owner_, generation_;
+    std::string segment_name_, generation_;
     const bool available_;
     void* entity_ = nullptr;
     bool initialized_ = false;

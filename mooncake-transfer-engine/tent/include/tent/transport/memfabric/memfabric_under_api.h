@@ -146,6 +146,13 @@ class MemFabricUnderApi {
 // HYBM GVA API: libmf_hybm_core.so.
 constexpr uint32_t kGvaMemoryTypeDevice = 1;
 constexpr uint32_t kGvaMemoryTypeHost = 2;
+// hybm_data_copy_direction is a bitmask: the source type occupies bit 2
+// (host 0x4) or bit 3 (device 0x8), and the destination type occupies bit 0
+// (host 0x0, device 0x1). For example, device-to-device is 0x9.
+constexpr uint32_t kGvaCopySourceHost = 0x4;
+constexpr uint32_t kGvaCopySourceDevice = 0x8;
+constexpr uint32_t kGvaCopyDestinationHost = 0x0;
+constexpr uint32_t kGvaCopyDestinationDevice = 0x1;
 
 struct MemFabricGvaConfig {
     bool enabled = false;
@@ -166,8 +173,6 @@ class MemFabricGvaApi {
     // Symbols are shared for process lifetime, including failed teardown.
     // No CleanupLibrary: unloading could invalidate live entities or workers.
     static bool LoadLibrary();
-    static bool supportsCopy();
-    static bool supportsBatchCopy();
     static int batchCopy(void*, const std::vector<MemFabricGvaCopy>&, uint32_t);
     static int copy(void* entity, uint64_t source, uint64_t destination,
                     size_t size, uint32_t direction);
@@ -190,7 +195,6 @@ class MemFabricGvaApi {
     static int importBlob(void* entity, bool entity_info,
                           const std::vector<uint8_t>& blob);
     static int map(void* entity);
-    static bool supportsConnect();
     static int connect(void* entity, uint32_t rank);
     static int reach(void* entity, uint32_t rank, uint32_t& out);
     static int remove(void* entity, uint32_t rank);

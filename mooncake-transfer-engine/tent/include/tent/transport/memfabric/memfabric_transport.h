@@ -98,6 +98,7 @@ class MemFabricTransport : public Transport {
         std::make_shared<std::atomic<size_t>>(0);
     size_t max_pending_copies_ = 256;
     Status loadConfig(const std::shared_ptr<Config>& conf);
+    Status loadGvaConfig(const Config& conf, const std::string& protocol);
     Status finishInstall();
     // Called with inflight_mu_ held; also serializes registration and teardown.
     Status initializeLocked();

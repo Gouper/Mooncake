@@ -28,6 +28,7 @@ constexpr uint64_t kRegistrationAlignment = 2ULL * 1024 * 1024;
 // converted to bytes for the HYBM sizing options.
 constexpr uint64_t kGvaWindowUnit = 1ULL << 30;
 constexpr uint64_t kGvaWindowLimitGiB = 1ULL << 20;
+constexpr size_t kGvaCopyWorkerCount = 2;
 
 Status alignedBufferRange(const BufferDesc& desc, uint64_t& begin,
                           uint64_t& end) {
@@ -212,50 +213,7 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
                   : "MF_PROTOCOL must be set" LOC_MARK);
     }
     if (conf && conf->get("transports/memfabric/gva/enabled", false)) {
-        auto limit = conf->get("transports/memfabric/gva/max_pending_copies",
-                               int64_t{256});
-        if (limit < 1 || limit > 1048576) {
-            return Status::InvalidArgument("Invalid GVA copy queue capacity");
-        }
-        max_pending_copies_ = static_cast<size_t>(limit);
-        const std::string prefix = "transports/memfabric/gva/";
-        gva_config_.enabled = true;
-        gva_config_.protocol = protocol;
-        if (protocol != "device_sdma" && protocol != "device_rdma" &&
-            protocol != "device_urma") {
-            return Status::InvalidArgument(
-                "Unsupported MemFabric GVA protocol");
-        }
-        gva_config_.group = conf->get(prefix + "group", "mooncake-memfabric");
-        const auto ranks = conf->get(prefix + "rank_count", int64_t{0});
-        const auto rank = conf->get(prefix + "rank", int64_t{-1});
-        // Capture the application's device before native initialization and
-        // retain it for registration and copy threads to bind explicitly.
-        int device = -1;
-        if (aclrtGetDevice(&device) != ACL_ERROR_NONE || device < 0 ||
-            device > UINT16_MAX) {
-            return Status::InvalidArgument(
-                "MemFabric GVA requires an application-bound device");
-        }
-        // Keep conversions safe; HYBM validates rank topology and sizes.
-        if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX) {
-            return Status::InvalidArgument(
-                "Invalid MemFabric GVA configuration");
-        }
-        gva_config_.rank_count = ranks;
-        gva_config_.rank = rank;
-        gva_config_.device = static_cast<uint16_t>(device);
-        const auto hbm = conf->get(prefix + "hbm_window", uint64_t{0});
-        const auto dram = conf->get(prefix + "dram_window", uint64_t{0});
-        if (hbm >= kGvaWindowLimitGiB || dram >= kGvaWindowLimitGiB) {
-            return Status::InvalidArgument(
-                "MemFabric GVA windows must be less than 1048576 GiB");
-        }
-        gva_config_.hbm_window = hbm * kGvaWindowUnit;
-        gva_config_.dram_window = dram * kGvaWindowUnit;
-        gva_config_.hbm_size = gva_config_.hbm_window;
-        gva_config_.dram_size = gva_config_.dram_window;
-        return Status::OK();
+        return loadGvaConfig(*conf, protocol);
     }
     config_.data_op_type_str = protocol;
     config_.data_op_type = parseDataOpType(config_.data_op_type_str);
@@ -267,6 +225,51 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
     LOG(INFO) << "data_op_type=" << config_.data_op_type_str
               << ", store_te_init=" << store;
 
+    return Status::OK();
+}
+
+Status MemFabricTransport::loadGvaConfig(const Config& conf,
+                                         const std::string& protocol) {
+    const std::string prefix = "transports/memfabric/gva/";
+    const auto limit = conf.get(prefix + "max_pending_copies", int64_t{256});
+    if (limit < 1 || limit > 1048576) {
+        return Status::InvalidArgument("Invalid GVA copy queue capacity");
+    }
+    max_pending_copies_ = static_cast<size_t>(limit);
+    gva_config_.enabled = true;
+    gva_config_.protocol = protocol;
+    if (protocol != "device_sdma" && protocol != "device_rdma" &&
+        protocol != "device_urma") {
+        return Status::InvalidArgument("Unsupported MemFabric GVA protocol");
+    }
+    gva_config_.group = conf.get(prefix + "group", "mooncake-memfabric");
+    const auto ranks = conf.get(prefix + "rank_count", int64_t{0});
+    const auto rank = conf.get(prefix + "rank", int64_t{-1});
+    // Capture the application's device before native initialization and
+    // retain it for registration and copy threads to bind explicitly.
+    int device = -1;
+    if (aclrtGetDevice(&device) != ACL_ERROR_NONE || device < 0 ||
+        device > UINT16_MAX) {
+        return Status::InvalidArgument(
+            "MemFabric GVA requires an application-bound device");
+    }
+    // Keep conversions safe; HYBM validates rank topology and sizes.
+    if (ranks < 0 || ranks > UINT32_MAX || rank < 0 || rank > UINT32_MAX) {
+        return Status::InvalidArgument("Invalid MemFabric GVA configuration");
+    }
+    gva_config_.rank_count = ranks;
+    gva_config_.rank = rank;
+    gva_config_.device = static_cast<uint16_t>(device);
+    const auto hbm = conf.get(prefix + "hbm_window", uint64_t{0});
+    const auto dram = conf.get(prefix + "dram_window", uint64_t{0});
+    if (hbm >= kGvaWindowLimitGiB || dram >= kGvaWindowLimitGiB) {
+        return Status::InvalidArgument(
+            "MemFabric GVA windows must be less than 1048576 GiB");
+    }
+    gva_config_.hbm_window = hbm * kGvaWindowUnit;
+    gva_config_.dram_window = dram * kGvaWindowUnit;
+    gva_config_.hbm_size = gva_config_.hbm_window;
+    gva_config_.dram_size = gva_config_.dram_window;
     return Status::OK();
 }
 
@@ -720,10 +723,6 @@ Status MemFabricTransport::submitGvaCopies(
     MemFabricSubBatch* batch, const std::vector<Request>& requests) {
     if (!gva_) return Status::NotImplemented("GVA copy context unavailable");
     if (requests.empty()) return Status::OK();
-    if (!gva_->supportsBatchCopy()) {
-        return Status::NotImplemented(
-            "HYBM native batch copy symbol unavailable");
-    }
     if (requests.size() > max_pending_copies_ -
                           std::min(max_pending_copies_,
                                    gva_pending_->load())) {
@@ -823,10 +822,9 @@ Status MemFabricTransport::submitGvaCopies(
     std::vector<std::shared_ptr<CopyGroup>> groups;
     const auto original_task_count = batch->task_list.size();
     try {
-        // HYBM can reorder batches by rank pair and execute entries in
-        // parallel. Keep consecutive opcode/peer/direction groups, splitting
-        // dependencies so each native batch contains only mutually independent
-        // operations.
+        // Group adjacent independent copies with the same opcode, peer and
+        // direction into one native batch. Workers may execute groups in any
+        // order. Callers must wait for a copy before submitting dependent work.
         std::map<uint64_t, uint64_t> reads, writes;
         auto overlaps = [](const auto& ranges, uint64_t base, size_t size) {
             auto it = ranges.lower_bound(base);
@@ -874,7 +872,10 @@ Status MemFabricTransport::submitGvaCopies(
             task.gva_completion = group.completion;
             batch->task_list.push_back(task);
         }
-        if (!copy_pool_) copy_pool_ = std::make_unique<ThreadPool>(1);
+        if (!copy_pool_) {
+            copy_pool_ = std::make_unique<ThreadPool>(
+                std::min(kGvaCopyWorkerCount, max_pending_copies_));
+        }
         batch->pending_batch_count += copies.size();
     } catch (...) {
         batch->task_list.resize(original_task_count);

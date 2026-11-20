@@ -9,14 +9,16 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace mooncake::tent::test {
 
 struct FakeHybm {
     static constexpr uint64_t kSize = 2ULL << 20;
-    bool loaded = false, batch_available = true, connect_available = true;
+    bool loaded = false;
     bool blocked = false, entered = false, throw_batch = false;
+    std::optional<uint64_t> blocked_source;
     bool reachable = true, stale_registry = false, empty_slice_export = false;
     bool fail_create = false;
     int initialize_result = 0, bind_result = 0, reserve_result = 0;

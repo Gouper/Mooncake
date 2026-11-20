@@ -5,6 +5,7 @@
 #include <bitset>
 #include <random>
 #include <sstream>
+#include <string_view>
 namespace mooncake {
 namespace tent {
 namespace {
@@ -49,12 +50,13 @@ Status pending(const std::string& why) {
 Status pending(const char* why, int code) {
     return pending(std::string(why) + ", ret=" + std::to_string(code));
 }
-Status nativeError(const char* op) {
-    return Status::InternalError(std::string("HYBM GVA ") + op + " failed");
-}
-Status nativeError(const char* op, int code) {
+Status nativeError(const char* op, int code = 0) {
     return Status::InternalError(std::string("HYBM GVA ") + op +
                                  " failed, ret=" + std::to_string(code));
+}
+Status invalidDescriptorField(const char* field, const char* reason) {
+    return Status::InvalidArgument(std::string("GVA descriptor field '") +
+                                   field + "' " + reason);
 }
 bool blobValid(const nlohmann::json& descriptor) {
     if (!descriptor.is_array() || descriptor.empty() ||
@@ -75,9 +77,9 @@ bool containsRange(uint64_t base, uint64_t length, uint64_t address,
 }
 }  // namespace
 MemFabricSharedMemory::MemFabricSharedMemory(MemFabricGvaConfig config,
-                                             std::string owner)
+                                             std::string segment_name)
     : config_(std::move(config)),
-      owner_(std::move(owner)),
+      segment_name_(std::move(segment_name)),
       available_(config_.enabled && MemFabricGvaApi::LoadLibrary()) {
     std::random_device random;
     std::ostringstream generation;
@@ -164,11 +166,10 @@ void MemFabricSharedMemory::destroyEntity() {
     EntityIds::instance().release(config_.entity);
 }
 MemFabricSharedMemory::Json MemFabricSharedMemory::makeIdentity() const {
-    return Json{{"version", 4u},
-                {"protocol", config_.protocol},
+    return Json{{"protocol", config_.protocol},
                 {"address_mode", "identity"},
                 {"group", config_.group},
-                {"owner", owner_},
+                {"segment_name", segment_name_},
                 {"generation", generation_},
                 {"rank", config_.rank},
                 {"ranks", config_.rank_count},
@@ -366,70 +367,116 @@ Status MemFabricSharedMemory::free(void* ptr, size_t size) {
     return Status::OK();
 }
 Status MemFabricSharedMemory::validateDescriptor(
-    const Json& descriptor, const std::string& owner) const {
-    try {
-        for (const char* key :
-             {"version", "rank", "ranks", "entity", "device", "hbm_window",
-              "dram_window", "hbm_size", "dram_size", "type", "address", "size",
-              "mapped_size", "window_base", "offset", "slice_generation"}) {
-            if (!descriptor.at(key).is_number_unsigned()) {
-                return Status::InvalidArgument(
-                    "GVA descriptor integers must be unsigned");
-            }
-        }
-        if (descriptor.at("device").get<uint64_t>() > UINT16_MAX) {
-            return Status::InvalidArgument(
-                "GVA descriptor device is not representable");
-        }
-        if (descriptor.at("version").get<uint64_t>() != 4 ||
-            descriptor.at("address_mode").get<std::string>() != "identity" ||
-            descriptor.at("protocol").get<std::string>() != config_.protocol ||
-            descriptor.at("owner").get<std::string>() != owner ||
-            owner.empty() ||
-            descriptor.at("group").get<std::string>() != config_.group ||
-            descriptor.at("generation").get<std::string>().empty() ||
-            descriptor.at("generation").get<std::string>().size() > 128 ||
-            descriptor.at("ranks").get<uint64_t>() != config_.rank_count ||
-            descriptor.at("rank").get<uint64_t>() >= config_.rank_count ||
-            descriptor.at("rank").get<uint64_t>() == config_.rank ||
-            descriptor.at("entity").get<uint64_t>() >= kEntityIdLimit ||
-            descriptor.at("hbm_window").get<uint64_t>() != config_.hbm_window ||
-            descriptor.at("dram_window").get<uint64_t>() !=
-                config_.dram_window ||
-            descriptor.at("hbm_size").get<uint64_t>() != config_.hbm_size ||
-            descriptor.at("dram_size").get<uint64_t>() != config_.dram_size ||
-            !blobValid(descriptor.at("entity_blob"))) {
-            return Status::InvalidArgument(
-                "Incompatible GVA peer identity/layout");
-        }
-        const auto type = descriptor.at("type").get<uint64_t>();
-        if (type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) {
-            return Status::InvalidArgument("Invalid GVA memory type");
-        }
-        const auto address = descriptor.at("address").get<uint64_t>();
-        const auto size = descriptor.at("size").get<uint64_t>();
-        const auto offset = descriptor.at("offset").get<uint64_t>();
-        const auto base = descriptor.at("window_base").get<uint64_t>();
-        const auto budget =
-            type == kGvaMemoryTypeDevice ? config_.hbm_size : config_.dram_size;
-        const auto window = type == kGvaMemoryTypeDevice ? config_.hbm_window
-                                                         : config_.dram_window;
-        const auto rank = descriptor.at("rank").get<uint64_t>();
-        if (!address || !size || size > UINT64_MAX - address ||
-            size != descriptor.at("mapped_size").get<uint64_t>() ||
-            offset > budget || size > budget - offset || !window ||
-            base != window_bases_[type - kGvaMemoryTypeDevice] ||
-            rank > (UINT64_MAX - base) / window ||
-            offset > UINT64_MAX - (base + rank * window) ||
-            address != base + rank * window + offset ||
-            !descriptor.at("slice_generation").get<uint64_t>() ||
-            !blobValid(descriptor.at("slice_blob"))) {
-            return Status::InvalidArgument("Invalid GVA allocation descriptor");
-        }
-        return Status::OK();
-    } catch (const Json::exception&) {
-        return Status::InvalidArgument("Malformed GVA descriptor");
+    const Json& descriptor, const std::string& peer_segment_name) const {
+    if (!descriptor.is_object()) {
+        return Status::InvalidArgument("GVA descriptor must be a JSON object");
     }
+    for (const char* key :
+         {"rank", "ranks", "hbm_window", "dram_window", "hbm_size", "dram_size",
+          "type", "address", "size", "window_base", "offset"}) {
+        auto field = descriptor.find(key);
+        if (field == descriptor.end()) {
+            return invalidDescriptorField(key, "is missing");
+        }
+        if (!field->is_number_unsigned()) {
+            return invalidDescriptorField(key, "must be an unsigned integer");
+        }
+    }
+    for (const char* key :
+         {"address_mode", "protocol", "segment_name", "group", "generation"}) {
+        auto field = descriptor.find(key);
+        if (field == descriptor.end()) {
+            return invalidDescriptorField(key, "is missing");
+        }
+        if (!field->is_string()) {
+            return invalidDescriptorField(key, "must be a string");
+        }
+    }
+    if (peer_segment_name.empty()) {
+        return invalidDescriptorField("segment_name",
+                                      "has no expected segment name");
+    }
+    const std::pair<const char*, std::string_view> identity[] = {
+        {"address_mode", "identity"},
+        {"protocol", config_.protocol},
+        {"segment_name", peer_segment_name},
+        {"group", config_.group},
+    };
+    for (const auto& [key, expected] : identity) {
+        if (descriptor.at(key).get_ref<const std::string&>() != expected) {
+            return invalidDescriptorField(key,
+                                          "does not match the expected value");
+        }
+    }
+    const std::pair<const char*, uint64_t> layout[] = {
+        {"ranks", config_.rank_count},
+        {"hbm_window", config_.hbm_window},
+        {"dram_window", config_.dram_window},
+        {"hbm_size", config_.hbm_size},
+        {"dram_size", config_.dram_size},
+    };
+    for (const auto& [key, expected] : layout) {
+        if (descriptor.at(key).get<uint64_t>() != expected) {
+            return invalidDescriptorField(key,
+                                          "does not match the local layout");
+        }
+    }
+    const auto rank = descriptor.at("rank").get<uint64_t>();
+    if (rank >= config_.rank_count || rank == config_.rank) {
+        return invalidDescriptorField("rank", "is outside the peer ranks");
+    }
+    const auto type = descriptor.at("type").get<uint64_t>();
+    if (type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) {
+        return invalidDescriptorField("type", "is not a supported memory type");
+    }
+    const auto address = descriptor.at("address").get<uint64_t>();
+    const auto size = descriptor.at("size").get<uint64_t>();
+    const auto offset = descriptor.at("offset").get<uint64_t>();
+    const auto base = descriptor.at("window_base").get<uint64_t>();
+    const auto budget =
+        type == kGvaMemoryTypeDevice ? config_.hbm_size : config_.dram_size;
+    const auto window =
+        type == kGvaMemoryTypeDevice ? config_.hbm_window : config_.dram_window;
+    if (!address) {
+        return invalidDescriptorField("address", "must be nonzero");
+    }
+    if (!size || size > UINT64_MAX - address) {
+        return invalidDescriptorField("size",
+                                      "produces an empty or overflowing range");
+    }
+    if (!window) {
+        return invalidDescriptorField("type", "has no configured GVA window");
+    }
+    if (base != window_bases_[type - kGvaMemoryTypeDevice]) {
+        return invalidDescriptorField("window_base",
+                                      "does not match the local base");
+    }
+    if (rank > (UINT64_MAX - base) / window) {
+        return invalidDescriptorField("rank", "overflows the window address");
+    }
+    const auto rank_base = base + rank * window;
+    if (offset > budget || offset > UINT64_MAX - rank_base) {
+        return invalidDescriptorField("offset", "exceeds the rank window");
+    }
+    if (size > budget - offset) {
+        return invalidDescriptorField(
+            "size", "exceeds the remaining allocation budget");
+    }
+    if (address != rank_base + offset) {
+        return invalidDescriptorField(
+            "address", "does not match the rank base and offset");
+    }
+    for (const char* key : {"entity_blob", "slice_blob"}) {
+        auto field = descriptor.find(key);
+        if (field == descriptor.end()) {
+            return invalidDescriptorField(key, "is missing");
+        }
+        if (!blobValid(*field)) {
+            return invalidDescriptorField(
+                key, "must be a nonempty bounded byte array");
+        }
+    }
+    return Status::OK();
 }
 MemFabricSharedMemory::RemoteSlice& MemFabricSharedMemory::recordSlice(
     ImportedRank& peer, const Json& descriptor) {
@@ -475,17 +522,17 @@ Status MemFabricSharedMemory::verifyPeerMapping(uint32_t rank,
     }
     return Status::OK();
 }
-Status MemFabricSharedMemory::map(const std::string& owner,
+Status MemFabricSharedMemory::map(const std::string& peer_segment_name,
                                   const std::string& descriptor,
                                   uint64_t address, size_t size) {
-    return mapOrPrepare(owner, descriptor, address, size, true);
+    return mapOrPrepare(peer_segment_name, descriptor, address, size, true);
 }
-Status MemFabricSharedMemory::prepare(const std::string& owner,
+Status MemFabricSharedMemory::prepare(const std::string& peer_segment_name,
                                       const std::string& descriptor,
                                       uint64_t address, size_t size) {
-    return mapOrPrepare(owner, descriptor, address, size, false);
+    return mapOrPrepare(peer_segment_name, descriptor, address, size, false);
 }
-Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
+Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
                                            const std::string& descriptor,
                                            uint64_t address, size_t size,
                                            bool direct) {
@@ -496,11 +543,6 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
     if (direct && config_.protocol != "device_sdma") {
         return Status::NotImplemented(
             "Network GVA does not provide a direct device mapping");
-    }
-    if (config_.protocol != "device_sdma" &&
-        !MemFabricGvaApi::supportsConnect()) {
-        return Status::NotImplemented(
-            "HYBM network connect symbol unavailable");
     }
     if (descriptor.size() > (16U << 20)) {
         return Status::InvalidArgument("GVA descriptor bundle exceeds 16 MiB");
@@ -513,17 +555,14 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
         }
         const Json* requested = nullptr;
         std::map<uint64_t, uint64_t> ranges;
-        const auto rank = descriptors.front().at("rank").get<uint32_t>();
+        const auto& first = descriptors.front();
         for (const auto& desc : descriptors) {
-            CHECK_STATUS(validateDescriptor(desc, owner));
-            if (desc.at("rank").get<uint32_t>() != rank ||
-                desc.at("generation") != descriptors.front().at("generation") ||
-                desc.at("entity_blob") !=
-                    descriptors.front().at("entity_blob") ||
-                desc.at("entity") != descriptors.front().at("entity") ||
-                desc.at("device") != descriptors.front().at("device")) {
-                return Status::InvalidArgument(
-                    "Inconsistent GVA allocation bundle");
+            CHECK_STATUS(validateDescriptor(desc, peer_segment_name));
+            for (const char* key : {"rank", "generation", "entity_blob"}) {
+                if (desc.at(key) != first.at(key)) {
+                    return invalidDescriptorField(
+                        key, "differs between allocations in the bundle");
+                }
             }
             const auto base = desc.at("address").get<uint64_t>();
             const auto length = desc.at("size").get<uint64_t>();
@@ -532,6 +571,7 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
             }
             if (base == address && length == size) requested = &desc;
         }
+        const auto rank = first.at("rank").get<uint32_t>();
         uint64_t end = 0;
         for (const auto& [base, length] : ranges) {
             if (base < end) {
@@ -554,27 +594,18 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
         const auto existing = imported_ranks_.find(rank);
         if (existing != imported_ranks_.end() && !existing->second.cleaned) {
             const auto& peer = existing->second;
-            if (peer.owner != owner ||
+            if (peer.segment_name != peer_segment_name ||
                 peer.generation !=
                     requested->at("generation").get<std::string>() ||
                 peer.entity_blob != requested->at("entity_blob")) {
                 return pending("old peer generation must exit first");
             }
             size_t retained = peer.slices.size();
-            // All retained slices of a generation share one entity and device;
-            // validate each new descriptor against that once.
-            const Json& reference = peer.slices.begin()->second.descriptor;
             for (const auto& desc : descriptors) {
                 if (!peer.slices.count(desc.at("address").get<uint64_t>()) &&
                     ++retained > kMaxDescriptors) {
                     return Status::InvalidArgument(
                         "Too many retained peer allocations");
-                }
-                if (desc.at("entity") != reference.at("entity") ||
-                    desc.at("device") != reference.at("device")) {
-                    return Status::InvalidArgument(
-                        "Peer entity or device changed within its "
-                        "generation");
                 }
                 const auto base = desc.at("address").get<uint64_t>();
                 const auto length = desc.at("size").get<uint64_t>();
@@ -599,8 +630,8 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& owner,
         }
         auto& peer = imported_ranks_[rank];
         if (peer.cleaned) peer = ImportedRank{};
-        if (peer.owner.empty()) {
-            peer.owner = owner;
+        if (peer.segment_name.empty()) {
+            peer.segment_name = peer_segment_name;
             peer.generation = requested->at("generation").get<std::string>();
             peer.entity_blob = requested->at("entity_blob");
         }
@@ -662,14 +693,14 @@ Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, ImportedRank& peer) {
     peer.cleaned = true;
     return Status::OK();
 }
-Status MemFabricSharedMemory::unmap(const std::string& owner,
+Status MemFabricSharedMemory::unmap(const std::string& peer_segment_name,
                                     uint64_t address) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_) {
         return pending("GVA copies retain resources");
     }
     for (auto& [rank, peer] : imported_ranks_) {
-        if (peer.owner != owner) continue;
+        if (peer.segment_name != peer_segment_name) continue;
         auto slice = peer.slices.find(address);
         if (slice == peer.slices.end()) continue;
         slice->second.active = false;
@@ -678,15 +709,13 @@ Status MemFabricSharedMemory::unmap(const std::string& owner,
     return Status::InvalidArgument("Unknown GVA mapping");
 }
 uint32_t MemFabricSharedMemory::memoryTypeForRange(uint64_t address,
-                                                   size_t size,
-                                                   RangeUse use) const {
+                                                   size_t size) const {
     for (const auto& [base, slice] : slices_) {
-        if ((use == RangeUse::Resolve || slice.published) &&
+        if (slice.published &&
             containsRange(base, slice.length, address, size)) {
             return slice.memory_type;
         }
     }
-    if (use == RangeUse::Resolve && config_.protocol != "device_sdma") return 0;
     for (const auto& [rank, peer] : imported_ranks_) {
         if (peer.cleaned) continue;
         for (const auto& [base, slice] : peer.slices) {
@@ -699,41 +728,12 @@ uint32_t MemFabricSharedMemory::memoryTypeForRange(uint64_t address,
     }
     return 0;
 }
-Status MemFabricSharedMemory::resolve(uint64_t address, size_t size,
-                                      void** device_address) {
-    if (!device_address) {
-        return Status::InvalidArgument("Null device address output");
-    }
-    *device_address = nullptr;
-    if (!address || !size || size > UINT64_MAX - address) {
-        return Status::InvalidArgument("Invalid GVA resolution range");
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!memoryTypeForRange(address, size, RangeUse::Resolve)) {
-        return Status::InvalidArgument("GVA range is not locally accessible");
-    }
-    CHECK_STATUS(bindDevice());
-    uint64_t first = 0, last = 0;
-    auto ret = MemFabricGvaApi::translate(address, kGvaMemoryTypeDevice, first);
-    if (ret) return nativeError("resolve allocation start", ret);
-    ret = MemFabricGvaApi::translate(address + size - 1, kGvaMemoryTypeDevice,
-                                     last);
-    if (ret) return nativeError("resolve allocation end", ret);
-    // The entry check already rejected size > UINT64_MAX - address and
-    // first == address, so first + size - 1 cannot overflow here.
-    if (!first || first != address || last != first + size - 1) {
-        return Status::InvalidArgument(
-            "GVA range has no contiguous device mapping");
-    }
-    *device_address = reinterpret_cast<void*>(first);
-    return Status::OK();
-}
 Status MemFabricSharedMemory::validateCopyTarget(
-    const std::string& owner, uint64_t address,
+    const std::string& peer_segment_name, uint64_t address,
     const std::string& descriptor) const {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [rank, peer] : imported_ranks_) {
-        if (peer.cleaned || peer.owner != owner) continue;
+        if (peer.cleaned || peer.segment_name != peer_segment_name) continue;
         const auto it = peer.slices.find(address);
         if (it == peer.slices.end()) continue;
         const auto& slice = it->second;
@@ -752,33 +752,32 @@ Status MemFabricSharedMemory::beginCopy(uint64_t source, uint64_t destination,
         return Status::InvalidArgument("Invalid GVA copy range");
     }
     if (copy_failed_) return pending("native copy completion remains unknown");
-    const auto src_type = memoryTypeForRange(source, size, RangeUse::Copy);
-    const auto dst_type = memoryTypeForRange(destination, size, RangeUse::Copy);
+    const auto src_type = memoryTypeForRange(source, size);
+    const auto dst_type = memoryTypeForRange(destination, size);
     if (!src_type || !dst_type) {
         return Status::InvalidArgument(
             "GVA copy requires published local or active mapped peer slices");
     }
     // HYBM_GLOBAL_{HOST,DEVICE}_TO_GLOBAL_{HOST,DEVICE}.
-    direction = (src_type == kGvaMemoryTypeDevice ? 8u : 4u) +
-                (dst_type == kGvaMemoryTypeDevice ? 1u : 0u);
+    direction =
+        (src_type == kGvaMemoryTypeDevice ? kGvaCopySourceDevice
+                                          : kGvaCopySourceHost) +
+        (dst_type == kGvaMemoryTypeDevice ? kGvaCopyDestinationDevice
+                                          : kGvaCopyDestinationHost);
     ++pending_copies_;
     return Status::OK();
 }
 template <typename Copy>
-Status MemFabricSharedMemory::runPinnedCopy(size_t count, bool supported,
-                                            Copy copy,
-                                            const char* missing_capability,
+Status MemFabricSharedMemory::runPinnedCopy(size_t count, Copy copy,
                                             const char* operation) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (copy_failed_) {
+            auto status =
+                pending("previous native copy completion remains unknown");
             pending_copies_ -= std::min(pending_copies_, count);
-            return pending("previous native copy completion remains unknown");
+            return status;
         }
-    }
-    if (!supported) {
-        releaseCopy(count);
-        return Status::NotImplemented(missing_capability);
     }
     // beginCopy pins the resources. Blocking native calls leave mutex_ free.
     const auto bound = MemFabricGvaApi::bind(config_.device);
@@ -786,26 +785,27 @@ Status MemFabricSharedMemory::runPinnedCopy(size_t count, bool supported,
     const bool drained = bound || !result ||
                          (config_.protocol == "device_sdma" &&
                           MemFabricGvaApi::wait(entity_) == 0);
+    auto status = result ? nativeError(operation, result) : Status::OK();
     releaseCopy(count, !drained);
-    return result ? nativeError(operation, result) : Status::OK();
+    return status;
 }
 Status MemFabricSharedMemory::runCopy(uint64_t source, uint64_t destination,
                                       size_t size, uint32_t direction) {
     return runPinnedCopy(
-        1, MemFabricGvaApi::supportsCopy(),
+        1,
         [&] {
             return MemFabricGvaApi::copy(entity_, source, destination, size,
                                          direction);
         },
-        "HYBM copy symbols unavailable", "synchronous copy");
+        "synchronous copy");
 }
 Status MemFabricSharedMemory::runBatchCopy(
     const std::vector<MemFabricGvaCopy>& copies, uint32_t direction) {
     if (copies.empty()) return Status::OK();
     return runPinnedCopy(
-        copies.size(), supportsBatchCopy(),
+        copies.size(),
         [&] { return MemFabricGvaApi::batchCopy(entity_, copies, direction); },
-        "HYBM batch copy capability unavailable", "synchronous batch copy");
+        "synchronous batch copy");
 }
 void MemFabricSharedMemory::releaseCopy(size_t count, bool completion_unknown) {
     std::lock_guard<std::mutex> lock(mutex_);

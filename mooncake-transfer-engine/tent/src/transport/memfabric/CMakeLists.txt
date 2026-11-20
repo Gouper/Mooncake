@@ -1,5 +1,6 @@
 if(USE_MEMFABRIC)
-  # Keep the GVA symbols in a separate archive member for host mock tests.
+  # Keep the GVA API in a separate archive member so tests can supply their
+  # own mock definitions.
   add_library(
     tent_xport_memfabric STATIC
     memfabric_transport.cpp memfabric_under_api.cpp memfabric_allocator.cpp
@@ -9,34 +10,11 @@ if(USE_MEMFABRIC)
     HINTS ENV MEMFABRIC_HOME
     PATH_SUFFIXES include include/host)
   if(MEMFABRIC_HYBM_INCLUDE_DIR)
-    include(CheckCXXSourceCompiles)
-    set(CMAKE_REQUIRED_INCLUDES ${MEMFABRIC_HYBM_INCLUDE_DIR})
-    check_cxx_source_compiles(
-      "
-      #include <hybm_big_mem.h>
-      int main() {
-        static_assert(BM_GVA_NOT_FOUND == -12);
-        static_assert(sizeof(&hybm_gva_to_va) > 0);
-        static_assert(sizeof(&hybm_get_slice_size) > 0);
-        static_assert(sizeof(&hybm_get_memory_ptr) > 0);
-        static_assert(sizeof(&hybm_unmap_rank) > 0);
-        static_assert(sizeof(&hybm_remove_imported) > 0);
-        static_assert(sizeof(&hybm_entity_reach_types) > 0);
-        hybm_options options{};
-        options.enable56BitsGva = false;
-        options.dramShmFd = -1;
-        return 0;
-      }"
-      MEMFABRIC_HYBM_GVA_REGISTRY_HEADERS)
-    unset(CMAKE_REQUIRED_INCLUDES)
-    if(MEMFABRIC_HYBM_GVA_REGISTRY_HEADERS)
-      target_include_directories(tent_xport_memfabric
-                                 PRIVATE ${MEMFABRIC_HYBM_INCLUDE_DIR})
-      target_compile_definitions(tent_xport_memfabric
-                                 PRIVATE TENT_WITH_HYBM_GVA=1)
-    endif()
-  endif()
-  if(NOT MEMFABRIC_HYBM_GVA_REGISTRY_HEADERS)
+    target_include_directories(tent_xport_memfabric
+                               PRIVATE ${MEMFABRIC_HYBM_INCLUDE_DIR})
+    target_compile_definitions(tent_xport_memfabric
+                               PRIVATE TENT_WITH_HYBM_GVA=1)
+  else()
     message(
       STATUS
         "HYBM headers unavailable; MemFabric trans remains enabled without GVA")

@@ -571,10 +571,10 @@ class MemFabricTransportTest : public ::testing::Test {
         return request;
     }
 
-    bool WaitHbm() {
+    bool WaitHbm(size_t pending = 0) {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (transport_->gva_pending_->load() != 0) {
+        while (transport_->gva_pending_->load() != pending) {
             if (std::chrono::steady_clock::now() >= deadline) return false;
             std::this_thread::yield();
         }
@@ -1914,10 +1914,6 @@ TEST_F(MemFabricTransportTest, HbmBatchAdmissionIsAtomicAndPinsPendingMemory) {
     auto invalid = write;
     invalid.source = nullptr;
     EXPECT_TRUE(transport_->submitTransferTasks(batch_, {}).ok());
-    fake.batch_available = false;
-    EXPECT_TRUE(
-        transport_->submitTransferTasks(batch_, {write}).IsNotImplemented());
-    fake.batch_available = true;
     EXPECT_FALSE(
         transport_->submitTransferTasks(batch_, {write, invalid}).ok());
     EXPECT_EQ(batch_->size(), 0u);
@@ -1943,11 +1939,38 @@ TEST_F(MemFabricTransportTest, HbmBatchAdmissionIsAtomicAndPinsPendingMemory) {
     EXPECT_EQ(state_->status_query_calls, 0);
 }
 
+TEST_F(MemFabricTransportTest,
+       IndependentGvaCopiesCompleteConcurrentlyAndKeepPendingMemoryPinned) {
+    ASSERT_TRUE(PrepareHbm().ok());
+    ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    const auto first = HbmRequest(Request::WRITE, peer_, 0, 0);
+    const auto second = HbmRequest(Request::WRITE, peer_, 64, 64, 16);
+    auto& fake = test::fakeHybm();
+    fake.blocked = true;
+    fake.blocked_source = reinterpret_cast<uint64_t>(first.source);
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {first}).ok());
+    ASSERT_TRUE(fake.awaitEntry());
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {second}).ok());
+    ASSERT_TRUE(WaitHbm(1));
+
+    ExpectHbmStatus(0, TransferStatusEnum::PENDING, 0);
+    ExpectHbmStatus(1, TransferStatusEnum::COMPLETED, second.length);
+    EXPECT_FALSE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
+    EXPECT_FALSE(transport_->removeMemoryBuffer(local_hbm_).ok());
+
+    fake.release();
+    ASSERT_TRUE(WaitHbm());
+    ExpectHbmStatus(0, TransferStatusEnum::COMPLETED, first.length);
+    EXPECT_TRUE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
+    EXPECT_TRUE(transport_->removeMemoryBuffer(local_hbm_).ok());
+}
+
 class MemFabricHbmProtocolTest
     : public MemFabricTransportTest,
       public ::testing::WithParamInterface<const char*> {};
 
-TEST_P(MemFabricHbmProtocolTest, BatchesPreserveOpcodePeerAndOverlapOrder) {
+TEST_P(MemFabricHbmProtocolTest, BatchesSeparateOpcodesPeersAndOverlaps) {
     ASSERT_TRUE(PrepareHbm(GetParam()).ok());
     ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
     ASSERT_TRUE(AddHbmPeer(extra_peer_, 2).ok());
@@ -1963,19 +1986,23 @@ TEST_P(MemFabricHbmProtocolTest, BatchesPreserveOpcodePeerAndOverlapOrder) {
     ASSERT_TRUE(transport_->submitTransferTasks(batch_, requests).ok());
     ASSERT_TRUE(WaitHbm());
     const auto& fake = test::fakeHybm();
-    EXPECT_EQ(fake.batch_sizes, (std::vector<size_t>{1, 2, 1, 1, 1}));
-    ASSERT_EQ(fake.copies.size(), requests.size());
+    auto sizes = fake.batch_sizes;
+    std::sort(sizes.begin(), sizes.end());
+    EXPECT_EQ(sizes, (std::vector<size_t>{1, 1, 1, 1, 2}));
+    std::vector<std::array<uint64_t, 4>> expected;
     for (size_t index = 0; index < requests.size(); ++index) {
         const auto& request = requests[index];
         const auto local = reinterpret_cast<uint64_t>(request.source);
         const auto remote = request.target_offset;
         const bool read = request.opcode == Request::READ;
-        EXPECT_EQ(fake.copies[index][0], read ? remote : local);
-        EXPECT_EQ(fake.copies[index][1], read ? local : remote);
-        EXPECT_EQ(fake.copies[index][2], request.length);
-        EXPECT_EQ(fake.copies[index][3], 9u);
+        expected.push_back(
+            {read ? remote : local, read ? local : remote, request.length, 9u});
         ExpectHbmStatus(index, TransferStatusEnum::COMPLETED, request.length);
     }
+    auto copies = fake.copies;
+    std::sort(copies.begin(), copies.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(copies, expected);
     EXPECT_TRUE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
     EXPECT_FALSE(
         transport_->submitTransferTasks(batch_, {requests.back()}).ok());
@@ -1993,7 +2020,7 @@ TEST_P(MemFabricHbmFailureTest,
        FailureMarksWholeBatchAndRetainsOnlyUndrainedPins) {
     ASSERT_TRUE(PrepareHbm().ok());
     ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
-    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     auto& fake = test::fakeHybm();
     const bool drained = GetParam() == 0;
     fake.result = -19;
@@ -2001,13 +2028,11 @@ TEST_P(MemFabricHbmFailureTest,
     fake.throw_batch = GetParam() == 2;
     const auto first = HbmRequest(Request::WRITE, peer_, 0, 0);
     const auto second = HbmRequest(Request::WRITE, peer_, 64, 64);
-    ASSERT_TRUE(
-        transport_->submitTransferTasks(batch_, {first, second, first}).ok());
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {first, second}).ok());
     ASSERT_TRUE(WaitHbm());
-    EXPECT_EQ(fake.batch_sizes,
-              drained ? (std::vector<size_t>{2, 1}) : std::vector<size_t>{2});
-    EXPECT_EQ(fake.waits, GetParam() == 2 ? 0 : (drained ? 2 : 1));
-    for (int index = 0; index < 3; ++index) {
+    EXPECT_EQ(fake.batch_sizes, std::vector<size_t>{2});
+    EXPECT_EQ(fake.waits, GetParam() == 2 ? 0 : 1);
+    for (int index = 0; index < 2; ++index) {
         ExpectHbmStatus(index, TransferStatusEnum::FAILED, 0);
     }
     EXPECT_EQ(transport_->removeMemoryBuffer(local_hbm_).ok(), drained);

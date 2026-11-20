@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tent/transport/memfabric/memfabric_under_api.h"
 
+#if defined(TENT_WITH_HYBM_GVA)
 #include <dlfcn.h>
 
 // HYBM GVA API. Keep its symbols and lifecycle independent of trans.
-#ifdef TENT_WITH_HYBM_GVA
 #include <acl/acl.h>
 #include <cstring>
 #include <atomic>
@@ -13,53 +13,50 @@
 #include <algorithm>
 #include <hybm_big_mem.h>
 #include <hybm_data_op.h>
-static_assert(BM_GVA_NOT_FOUND == -12,
-              "MemFabric GVA requires distinct missing-registry errors");
+#include <thread>
 namespace mooncake {
 namespace tent {
 namespace {
 
-#define HYBM_GVA_SYMBOLS(REQUIRED, OPTIONAL) \
-    REQUIRED(hybm_init)                      \
-    REQUIRED(hybm_uninit)                    \
-    REQUIRED(hybm_create_entity)             \
-    REQUIRED(hybm_destroy_entity)            \
-    REQUIRED(hybm_reserve_mem_space)         \
-    REQUIRED(hybm_unreserve_mem_space)       \
-    REQUIRED(hybm_alloc_local_memory)        \
-    REQUIRED(hybm_free_local_memory)         \
-    REQUIRED(hybm_get_slice_va)              \
-    REQUIRED(hybm_get_memory_ptr)            \
-    REQUIRED(hybm_get_slice_size)            \
-    REQUIRED(hybm_gva_to_va)                 \
-    REQUIRED(hybm_export)                    \
-    REQUIRED(hybm_export_info_free)          \
-    REQUIRED(hybm_import)                    \
-    REQUIRED(hybm_mmap)                      \
-    REQUIRED(hybm_entity_reach_types)        \
-    REQUIRED(hybm_remove_imported)           \
-    REQUIRED(hybm_unmap_rank)                \
-    OPTIONAL(hybm_data_copy)                 \
-    OPTIONAL(hybm_data_batch_copy)           \
-    OPTIONAL(hybm_transport_connect)         \
-    OPTIONAL(hybm_wait)
+#define HYBM_GVA_SYMBOLS(name)     \
+    name(hybm_init)                \
+    name(hybm_uninit)              \
+    name(hybm_create_entity)       \
+    name(hybm_destroy_entity)      \
+    name(hybm_reserve_mem_space)   \
+    name(hybm_unreserve_mem_space) \
+    name(hybm_alloc_local_memory)  \
+    name(hybm_free_local_memory)   \
+    name(hybm_get_slice_va)        \
+    name(hybm_get_memory_ptr)      \
+    name(hybm_get_slice_size)      \
+    name(hybm_gva_to_va)           \
+    name(hybm_export)              \
+    name(hybm_export_info_free)    \
+    name(hybm_import)              \
+    name(hybm_mmap)                \
+    name(hybm_entity_reach_types)  \
+    name(hybm_remove_imported)     \
+    name(hybm_unmap_rank)          \
+    name(hybm_data_copy)           \
+    name(hybm_data_batch_copy)     \
+    name(hybm_transport_connect)   \
+    name(hybm_wait)
 
 struct NativeHybm {
     bool loadSymbols() {
         library_.reset(dlopen("libmf_hybm_core.so", RTLD_NOW | RTLD_LOCAL));
         if (!library_) return false;
-#define LOAD_OPTIONAL(name) \
-    name##_ = reinterpret_cast<decltype(name##_)>(dlsym(library_.get(), #name));
-#define LOAD_REQUIRED(name) \
-    LOAD_OPTIONAL(name)     \
+#define LOAD_REQUIRED(name)                                    \
+    name##_ = (decltype(name##_))dlsym(library_.get(), #name); \
     if (!name##_) return false;
-        HYBM_GVA_SYMBOLS(LOAD_REQUIRED, LOAD_OPTIONAL)
+        HYBM_GVA_SYMBOLS(LOAD_REQUIRED)
 #undef LOAD_REQUIRED
-#undef LOAD_OPTIONAL
         return true;
     }
     struct BatchBuffers {
         void* entity = nullptr;
+        const std::thread::id submitter = std::this_thread::get_id();
         bool failed = false;
         std::vector<void*> sources, destinations;
         std::vector<uint64_t> sizes;
@@ -71,7 +68,7 @@ struct NativeHybm {
     };
     std::unique_ptr<void, CloseLibrary> library_;
 #define DECLARE(name) decltype(&name) name##_ = nullptr;
-    HYBM_GVA_SYMBOLS(DECLARE, DECLARE)
+    HYBM_GVA_SYMBOLS(DECLARE)
 #undef DECLARE
 };
 #undef HYBM_GVA_SYMBOLS
@@ -94,32 +91,21 @@ bool MemFabricGvaApi::LoadLibrary() {
     nativeApiSlot().store(api.release(), std::memory_order_release);
     return true;
 }
-bool MemFabricGvaApi::supportsCopy() {
-    auto* api = nativeApi();
-    return api && api->hybm_data_copy_ && api->hybm_wait_;
-}
 int MemFabricGvaApi::copy(void* entity, uint64_t source, uint64_t destination,
                           size_t size, uint32_t direction) {
     auto* api = nativeApi();
-    if (!api || !api->hybm_data_copy_ || !api->hybm_wait_) return -1;
+    if (!api) return -1;
     hybm_copy_params params{reinterpret_cast<void*>(source),
                             reinterpret_cast<void*>(destination), size};
     return api->hybm_data_copy_(
         entity, &params, static_cast<hybm_data_copy_direction>(direction),
         nullptr, 0);
 }
-bool MemFabricGvaApi::supportsBatchCopy() {
-    auto* api = nativeApi();
-    return api && api->hybm_data_batch_copy_ && api->hybm_wait_;
-}
 int MemFabricGvaApi::batchCopy(void* entity,
                                const std::vector<MemFabricGvaCopy>& copies,
                                uint32_t direction) {
     auto* api = nativeApi();
-    if (!api || !api->hybm_data_batch_copy_ || !api->hybm_wait_ ||
-        copies.empty() || copies.size() > UINT32_MAX) {
-        return -1;
-    }
+    if (!api || copies.empty() || copies.size() > UINT32_MAX) return -1;
     auto buffers = std::make_shared<NativeHybm::BatchBuffers>();
     buffers->entity = entity;
     buffers->sources.reserve(copies.size());
@@ -159,19 +145,21 @@ int MemFabricGvaApi::wait(void* entity) {
     auto* api = nativeApi();
     if (!api) return -1;
     std::vector<std::shared_ptr<NativeHybm::BatchBuffers>> failed;
+    const auto submitter = std::this_thread::get_id();
     {
         std::lock_guard<std::mutex> lock(api->batch_mutex_);
         for (const auto& batch : api->pending_batches_) {
-            if (batch->failed && batch->entity == entity) {
+            if (batch->failed && batch->entity == entity &&
+                batch->submitter == submitter) {
                 failed.push_back(batch);
             }
         }
     }
-    const auto ret = api->hybm_wait_ ? api->hybm_wait_(entity) : -1;
+    const auto ret = api->hybm_wait_(entity);
     if (!ret) {
         std::lock_guard<std::mutex> lock(api->batch_mutex_);
-        // Only release failed calls present when this drain began. A
-        // concurrently failing or still running call must keep its arrays.
+        // HYBM synchronizes the current thread's SDMA stream. Other workers'
+        // failures must retain their own arrays until their streams drain.
         api->pending_batches_.remove_if([&failed](const auto& batch) {
             return std::find(failed.begin(), failed.end(), batch) !=
                    failed.end();
@@ -296,15 +284,9 @@ int MemFabricGvaApi::map(void* entity) {
     auto* api = nativeApi();
     return api ? api->hybm_mmap_(entity, 0) : -1;
 }
-bool MemFabricGvaApi::supportsConnect() {
-    auto* api = nativeApi();
-    return api && api->hybm_transport_connect_;
-}
 int MemFabricGvaApi::connect(void* entity, uint32_t rank) {
     auto* api = nativeApi();
-    return api && api->hybm_transport_connect_
-               ? api->hybm_transport_connect_(entity, &rank, 1, 0)
-               : -1;
+    return api ? api->hybm_transport_connect_(entity, &rank, 1, 0) : -1;
 }
 int MemFabricGvaApi::reach(void* entity_handle, uint32_t rank, uint32_t& out) {
     auto* api = nativeApi();
@@ -326,11 +308,13 @@ int MemFabricGvaApi::unmap(void* entity, uint32_t rank) {
 }  // namespace tent
 }  // namespace mooncake
 #else
+
+// Builds without HYBM headers can use MemFabric trans. GVA initialization
+// reports the native API as unavailable.
 namespace mooncake {
 namespace tent {
+
 bool MemFabricGvaApi::LoadLibrary() { return false; }
-bool MemFabricGvaApi::supportsCopy() { return false; }
-bool MemFabricGvaApi::supportsBatchCopy() { return false; }
 int MemFabricGvaApi::batchCopy(void*, const std::vector<MemFabricGvaCopy>&,
                                uint32_t) {
     return -1;
@@ -359,11 +343,11 @@ int MemFabricGvaApi::importBlob(void*, bool, const std::vector<uint8_t>&) {
     return -1;
 }
 int MemFabricGvaApi::map(void*) { return -1; }
-bool MemFabricGvaApi::supportsConnect() { return false; }
 int MemFabricGvaApi::connect(void*, uint32_t) { return -1; }
 int MemFabricGvaApi::reach(void*, uint32_t, uint32_t&) { return -1; }
 int MemFabricGvaApi::remove(void*, uint32_t) { return -1; }
 int MemFabricGvaApi::unmap(void*, uint32_t) { return -1; }
+
 }  // namespace tent
 }  // namespace mooncake
-#endif
+#endif  // TENT_WITH_HYBM_GVA

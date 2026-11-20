@@ -93,10 +93,10 @@ struct HbmPair {
 TEST_F(MemFabricGva, InitializesExplicitlyAndRetriesNativeFailures) {
     auto& native = fakeHybm();
     native.loaded = false;
-    MemFabricSharedMemory unavailable(config(), "owner");
+    MemFabricSharedMemory unavailable(config(), "segment");
     EXPECT_TRUE(unavailable.initialize().IsNotImplemented());
     native.loaded = true;
-    MemFabricSharedMemory memory(config(), "owner");
+    MemFabricSharedMemory memory(config(), "segment");
     void* pointer = nullptr;
     EXPECT_TRUE(
         memory.allocate(&pointer, kPoolSize, kHbm, 0).IsInvalidArgument());
@@ -128,7 +128,7 @@ TEST_F(MemFabricGva, InitializesExplicitlyAndRetriesNativeFailures) {
 TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
     auto settings = config();
     settings.hbm_window = settings.hbm_size = 5 * kPoolSize;
-    MemFabricSharedMemory memory(settings, "owner");
+    MemFabricSharedMemory memory(settings, "segment");
     ASSERT_TRUE(memory.initialize().ok());
     auto& native = fakeHybm();
     const auto base = MemFabricGvaApi::base(nullptr, kHbm);
@@ -149,17 +149,10 @@ TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
     EXPECT_EQ(options.type, MEMFABRIC);
     EXPECT_EQ(options.location, "npu:0");
     void* output = nullptr;
-    ASSERT_TRUE(memory.resolve(addr(pointer) + 8, 32, &output).ok());
-    EXPECT_EQ(addr(output), addr(pointer) + 8);
-    EXPECT_FALSE(
-        memory.resolve(addr(pointer) + kPoolSize - 1, 2, &output).ok());
-    EXPECT_FALSE(memory.resolve(addr(pointer), 1, nullptr).ok());
-    EXPECT_FALSE(memory.resolve(UINT64_MAX - 3, 8, &output).ok());
     EXPECT_FALSE(memory.allocate(&output, 2 * kPoolSize, kHbm, 0).ok());
     EXPECT_TRUE(memory.close().IsTooManyRequests());
     EXPECT_FALSE(memory.free(pointer, kPoolSize - 1).ok());
     ASSERT_TRUE(memory.free(pointer, kPoolSize).ok());
-    EXPECT_FALSE(memory.resolve(addr(pointer), 32, &output).ok());
     ASSERT_TRUE(memory.allocate(&output, kPoolSize, kHbm, 0).ok());
     EXPECT_EQ(addr(output), base + 4 * kPoolSize);
     ASSERT_TRUE(memory.free(output, kPoolSize).ok());
@@ -167,7 +160,7 @@ TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
 }
 
 TEST_F(MemFabricGva, BatchPublicationValidatesAndCommitsAllHbmSlices) {
-    MemFabricSharedMemory memory(config(), "owner");
+    MemFabricSharedMemory memory(config(), "segment");
     ASSERT_TRUE(memory.initialize().ok());
     void *first = nullptr, *second = nullptr;
     ASSERT_TRUE(memory.allocate(&first, kPoolSize, kHbm, 0).ok());
@@ -193,7 +186,6 @@ TEST_F(MemFabricGva, BatchPublicationValidatesAndCommitsAllHbmSlices) {
     EXPECT_EQ(native.binds.load(), binds + 1);
     ASSERT_EQ(descriptors.size(), 2u);
     const auto descriptor = Json::parse(descriptors.front());
-    EXPECT_EQ(descriptor["version"], 4u);
     EXPECT_EQ(descriptor["address_mode"], "identity");
     EXPECT_EQ(descriptor["type"], kHbm);
     EXPECT_EQ(descriptor["address"], addr(first));
@@ -215,11 +207,9 @@ TEST_F(MemFabricGva, InvalidBundlesNeverReachNativeImports) {
     const auto desc = Json::parse(pair.publication);
     const auto target = addr(pair.target);
     for (const auto& [key, value] : std::vector<std::pair<std::string, Json>>{
-             {"entity", 511u},
-             {"device", 65536u},
-             {"version", 3u},
              {"address_mode", "logical56"},
-             {"owner", "other"},
+             {"segment_name", "other"},
+             {"generation", 1u},
              {"rank", 0u},
              {"ranks", "2"},
              {"offset", UINT64_MAX},
@@ -229,7 +219,9 @@ TEST_F(MemFabricGva, InvalidBundlesNeverReachNativeImports) {
         SCOPED_TRACE(key);
         auto invalid = desc;
         invalid[key] = value;
-        EXPECT_FALSE(pair.map(invalid.dump(), target).ok());
+        const auto status = pair.map(invalid.dump(), target);
+        EXPECT_FALSE(status.ok());
+        EXPECT_NE(status.message().find("'" + key + "'"), std::string::npos);
     }
     EXPECT_FALSE(pair.map("{", target).ok());
     EXPECT_FALSE(pair.map(Json::array({desc, desc}).dump(), target).ok());
@@ -271,8 +263,6 @@ TEST_F(MemFabricGva, SdmaRetriesImportsAndRequiresLiveIdentityMapping) {
     native.map_result = 0;
     native.reachable = false;
     EXPECT_TRUE(pair.map().IsNotImplemented());
-    void* output = nullptr;
-    EXPECT_FALSE(pair.local.resolve(addr(pair.target), 32, &output).ok());
     native.reachable = true;
     const auto imports = native.slice_imports;
     native.alias_offset = 128;
@@ -281,20 +271,13 @@ TEST_F(MemFabricGva, SdmaRetriesImportsAndRequiresLiveIdentityMapping) {
     ASSERT_TRUE(pair.map().ok());
     ASSERT_TRUE(pair.map().ok());
     EXPECT_EQ(native.slice_imports, imports);
-    EXPECT_TRUE(pair.local.resolve(addr(pair.target), 32, &output).ok());
-    EXPECT_EQ(output, pair.target);
-    native.alias_offset = 128;
-    EXPECT_FALSE(pair.local.resolve(addr(pair.target), 32, &output).ok());
-    native.alias_offset = 0;
     native.remove_result = -1;
     EXPECT_TRUE(pair.unmap(pair.target).IsTooManyRequests());
-    EXPECT_FALSE(pair.local.resolve(addr(pair.target), 32, &output).ok());
     native.remove_result = 0;
     native.stale_registry = true;
     EXPECT_TRUE(pair.unmap(pair.target).IsTooManyRequests());
     native.stale_registry = false;
     ASSERT_NO_FATAL_FAILURE(pair.release());
-    EXPECT_FALSE(pair.local.resolve(addr(pair.target), 32, &output).ok());
     EXPECT_TRUE(
         pair.local.unmap("other", addr(pair.target)).IsInvalidArgument());
 }
@@ -314,9 +297,6 @@ TEST_F(MemFabricGva, HbmSlicesShareRankCleanupAndSdmaFailureReleasesPins) {
     auto& native = fakeHybm();
     EXPECT_TRUE(pair.unmap(second).IsTooManyRequests());
     EXPECT_EQ(native.unmaps, 0);
-    void* output = nullptr;
-    EXPECT_FALSE(pair.local.resolve(addr(second), 32, &output).ok());
-    EXPECT_TRUE(pair.local.resolve(addr(pair.target), 32, &output).ok());
     uint32_t direction = 0;
     const std::vector<MemFabricGvaCopy> copies{
         {addr(pair.source), addr(pair.target), 32},
@@ -350,10 +330,7 @@ TEST_P(MemFabricNetworkGva,
     ASSERT_NO_FATAL_FAILURE(pair.initialize());
     auto& native = fakeHybm();
     EXPECT_TRUE(pair.map().IsNotImplemented());
-    native.connect_available = false;
-    EXPECT_TRUE(pair.prepare().IsNotImplemented());
     EXPECT_EQ(native.imports, 0);
-    native.connect_available = true;
     native.connect_result = -1;
     EXPECT_TRUE(pair.prepare().IsTooManyRequests());
     uint32_t direction = 0;
@@ -363,12 +340,6 @@ TEST_P(MemFabricNetworkGva,
     ASSERT_TRUE(pair.prepare().ok());
     EXPECT_EQ(native.connects, 2);
     EXPECT_EQ(native.slice_imports, 1);
-    void* output = nullptr;
-    EXPECT_FALSE(pair.local.resolve(copy.destination, copy.size, &output).ok());
-    ASSERT_TRUE(pair.beginCopy(copy, direction).ok());
-    native.batch_available = false;
-    EXPECT_TRUE(pair.local.runBatchCopy({copy}, direction).IsNotImplemented());
-    native.batch_available = true;
     ASSERT_TRUE(pair.beginCopy(copy, direction).ok());
     ASSERT_TRUE(pair.beginCopy(copy, direction).ok());
     native.result = -23;
