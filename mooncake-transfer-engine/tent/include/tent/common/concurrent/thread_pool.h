@@ -35,31 +35,30 @@ class ThreadPool {
 
    public:
     ThreadPool(size_t n = std::thread::hardware_concurrency()) {
-        workers_.reserve(n);
-        try {
-            for (size_t i = 0; i < n; ++i) {
-                workers_.emplace_back([this] {
-                    while (true) {
-                        std::function<void()> task;
-                        {
-                            std::unique_lock<std::mutex> lk(mu_);
-                            cv_.wait(lk,
-                                     [&] { return stop_ || !tasks_.empty(); });
-                            if (stop_ && tasks_.empty()) return;
-                            task = std::move(tasks_.front());
-                            tasks_.pop();
-                        }
-                        task();
+        for (size_t i = 0; i < n; ++i) {
+            workers_.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_.wait(lk, [&] { return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty()) return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
                     }
-                });
-            }
-        } catch (...) {
-            // A later thread may fail to start after earlier ones are live.
-            stopAndJoin();
-            throw;
+                    task();
+                }
+            });
         }
     }
-    ~ThreadPool() { stopAndJoin(); }
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
 
     template <class F, class... Args>
     auto enqueue(F&& f, Args&&... args)
@@ -78,15 +77,6 @@ class ThreadPool {
     }
 
    private:
-    void stopAndJoin() {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& t : workers_) t.join();
-    }
-
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
     std::mutex mu_;

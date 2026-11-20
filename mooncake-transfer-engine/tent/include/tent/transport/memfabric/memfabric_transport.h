@@ -93,7 +93,8 @@ class MemFabricTransport : public Transport {
 
    private:
     Status submitGvaCopies(MemFabricSubBatch*, const std::vector<Request>&);
-    std::unique_ptr<ThreadPool> copy_pool_;
+    std::vector<std::unique_ptr<ThreadPool>> copy_workers_;
+    size_t next_copy_worker_ = 0;
     std::shared_ptr<std::atomic<size_t>> gva_pending_ =
         std::make_shared<std::atomic<size_t>>(0);
     size_t max_pending_copies_ = 256;

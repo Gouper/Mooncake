@@ -872,9 +872,17 @@ Status MemFabricTransport::submitGvaCopies(
             task.gva_completion = group.completion;
             batch->task_list.push_back(task);
         }
-        if (!copy_pool_) {
-            copy_pool_ = std::make_unique<ThreadPool>(
-                std::min(kGvaCopyWorkerCount, max_pending_copies_));
+        if (copy_workers_.empty()) {
+            const auto worker_count =
+                std::min(kGvaCopyWorkerCount, max_pending_copies_);
+            // Publish only after all workers start. A failed start joins
+            // any idle workers already created by this attempt.
+            decltype(copy_workers_) workers;
+            workers.reserve(worker_count);
+            for (size_t index = 0; index < worker_count; ++index) {
+                workers.push_back(std::make_unique<ThreadPool>(1));
+            }
+            copy_workers_.swap(workers);
         }
         batch->pending_batch_count += copies.size();
     } catch (...) {
@@ -888,7 +896,8 @@ Status MemFabricTransport::submitGvaCopies(
         const auto count = group->copies.size();
         pending->fetch_add(count);
         try {
-            copy_pool_->enqueue([context, pending, group] {
+            auto& worker = *copy_workers_[next_copy_worker_];
+            worker.enqueue([context, pending, group] {
                 auto outcome = TransferStatusEnum::FAILED;
                 try {
                     const auto status =
@@ -902,6 +911,7 @@ Status MemFabricTransport::submitGvaCopies(
                 pending->fetch_sub(group->copies.size(),
                                    std::memory_order_release);
             });
+            next_copy_worker_ = (next_copy_worker_ + 1) % copy_workers_.size();
         } catch (...) {
             context->releaseCopy(count);
             group->completion->status.store(TransferStatusEnum::FAILED,
@@ -1186,9 +1196,10 @@ Status MemFabricTransport::quiesce() {
 Status MemFabricTransport::uninstall() {
     auto drain = quiesce();
     if (!drain.ok() && gva_pending_->load()) return drain;
-    // Join without inflight_mu_. Jobs own their context and completion state.
-    copy_pool_.reset();
     std::lock_guard<std::mutex> lock(inflight_mu_);
+    // Copy jobs have drained and never take inflight_mu_.
+    copy_workers_.clear();
+    next_copy_worker_ = 0;
     if (!installed_) return Status::OK();
     if (gva_) {
         CHECK_STATUS(gva_->close());
