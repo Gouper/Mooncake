@@ -882,8 +882,8 @@ endif()
 
 if(USE_ASCEND_DIRECT)
   add_executable(tent_shared_host_mapper_test shared_host_mapper_test.cpp)
-  target_link_libraries(tent_shared_host_mapper_test
-                        PRIVATE gtest gtest_main tent_link_group)
+  target_link_libraries(tent_shared_host_mapper_test PRIVATE gtest gtest_main
+                                                             tent_link_group)
   target_include_directories(tent_shared_host_mapper_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_shared_host_mapper_test
@@ -901,15 +901,36 @@ target_include_directories(tent_segment_desc_retry_test
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 
 if(USE_MEMFABRIC)
+  # Supply the real trans API and mock GVA API before the production archive.
+  add_library(
+    tent_memfabric_test_api OBJECT
+    ../src/transport/memfabric/memfabric_under_api.cpp
+    memfabric_gva_test_api.cpp)
+  target_compile_definitions(tent_memfabric_test_api
+                             PRIVATE TENT_MEMFABRIC_TEST_GVA_API)
+  target_link_libraries(tent_memfabric_test_api PRIVATE tent_interface
+                                                        glog::glog)
+
+  add_executable(tent_memfabric_gva_test memfabric_gva_test.cpp)
+  target_link_libraries(
+    tent_memfabric_gva_test PRIVATE tent_memfabric_test_api gtest gtest_main
+                                    tent_xport_memfabric tent_common)
+  add_test(NAME tent_memfabric_gva_test COMMAND tent_memfabric_gva_test)
   add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
-  target_link_libraries(tent_memfabric_transport_test PRIVATE gtest gtest_main
-                                                              tent_link_group)
+  target_link_libraries(
+    tent_memfabric_transport_test PRIVATE tent_memfabric_test_api gtest
+                                          gtest_main tent_link_group)
   target_include_directories(
     tent_memfabric_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
                                           ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
   add_test(NAME tent_memfabric_transport_test
            COMMAND tent_memfabric_transport_test)
+  # The lifecycle test needs ACL stubs for the Ascend platform in host builds.
+  target_sources(tent_local_memory_lifecycle_test PRIVATE mock_acl/acl_stub.cpp)
+  target_include_directories(tent_local_memory_lifecycle_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
 endif()
+
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
