@@ -21,6 +21,7 @@ class MemFabricSharedMemory {
     ~MemFabricSharedMemory();
     // Initialize the entity and reserve windows before allocation or mapping.
     Status initialize();
+    // allocate, map, and prepare use the ACL device bound by the caller.
     Status allocate(void**, size_t, uint32_t memory_type, uint64_t requested);
     Status allocate(void**, size_t, uint32_t memory_type, MemoryOptions&);
     Status free(void*, size_t);
@@ -51,6 +52,7 @@ class MemFabricSharedMemory {
 
    private:
     using Json = nlohmann::json;
+    enum class InitState { Uninitialized, RuntimeInitialized, Ready };
     struct Slice {
         void* handle = nullptr;
         uint64_t length = 0;
@@ -91,11 +93,10 @@ class MemFabricSharedMemory {
     Json makeIdentity() const;
     mutable std::mutex mutex_;
     MemFabricGvaConfig config_;
-    Status config_status_ = Status::OK();
     std::string segment_name_, generation_;
     const bool available_;
     void* entity_ = nullptr;
-    bool initialized_ = false;
+    InitState init_state_ = InitState::Uninitialized;
     std::map<uint64_t, Slice> slices_;
     std::array<uint64_t, 2> window_bases_{{0, 0}};
     std::array<uint64_t, 2> consumed_{{0, 0}};

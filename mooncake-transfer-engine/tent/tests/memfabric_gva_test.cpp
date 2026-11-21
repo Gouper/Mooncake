@@ -48,11 +48,11 @@ struct HbmPair {
 
     void initialize() {
         ASSERT_TRUE(local.initialize().ok());
-        ASSERT_TRUE(remote.initialize().ok());
         ASSERT_TRUE(local.allocate(&source, kPoolSize, kHbm, 0).ok());
-        ASSERT_TRUE(remote.allocate(&target, kPoolSize, kHbm, 0).ok());
         std::string descriptor;
         ASSERT_TRUE(local.publish(source, kPoolSize, descriptor).ok());
+        ASSERT_TRUE(remote.initialize().ok());
+        ASSERT_TRUE(remote.allocate(&target, kPoolSize, kHbm, 0).ok());
         ASSERT_TRUE(remote.publish(target, kPoolSize, publication).ok());
     }
 
@@ -65,10 +65,13 @@ struct HbmPair {
     Status map() { return map(publication, addr(target)); }
     Status map(const std::string& desc, uint64_t base,
                size_t size = kPoolSize) {
+        // The simulated ranks share one thread and its active device.
+        (void)MemFabricGvaApi::bind(0);
         return local.map("remote", desc, base, size);
     }
     Status unmap(void* pointer) { return local.unmap("remote", addr(pointer)); }
     Status prepare() {
+        (void)MemFabricGvaApi::bind(0);
         return local.prepare("remote", publication, addr(target), kPoolSize);
     }
     Status beginCopy(const MemFabricGvaCopy& copy, uint32_t& direction) {
@@ -124,11 +127,6 @@ TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
     auto& native = fakeHybm();
     const auto base = MemFabricGvaApi::base(nullptr, kHbm);
     void* pointer = nullptr;
-    native.bind_result = -23;
-    const auto bind_failure = memory.allocate(&pointer, kPoolSize, kHbm, 0);
-    native.bind_result = 0;
-    ASSERT_TRUE(bind_failure.IsInternalError()) << bind_failure.ToString();
-    EXPECT_EQ(pointer, nullptr);
     EXPECT_FALSE(memory.allocate(&pointer, kPoolSize, kHbm, base + 1).ok());
     EXPECT_EQ(pointer, nullptr);
     native.alias_offset = 128;
@@ -246,11 +244,6 @@ TEST_F(MemFabricGva, SdmaRetriesImportsAndRequiresLiveIdentityMapping) {
     HbmPair pair;
     ASSERT_NO_FATAL_FAILURE(pair.initialize());
     auto& native = fakeHybm();
-    native.bind_result = -23;
-    const auto bind_failure = pair.map();
-    native.bind_result = 0;
-    ASSERT_TRUE(bind_failure.IsInternalError()) << bind_failure.ToString();
-    EXPECT_EQ(native.imports, 0);
     native.entity_import_result = -1;
     EXPECT_FALSE(pair.map().ok());
     EXPECT_EQ(native.slice_imports, 0);
@@ -288,6 +281,7 @@ TEST_F(MemFabricGva, HbmSlicesShareRankCleanupAndSdmaFailureReleasesPins) {
     ASSERT_TRUE(pair.map().ok());
     void* second = nullptr;
     std::string publication;
+    (void)MemFabricGvaApi::bind(1);
     ASSERT_TRUE(pair.remote.allocate(&second, kPoolSize, kHbm, 0).ok());
     ASSERT_TRUE(pair.remote.publish(second, kPoolSize, publication).ok());
     const auto bundle =

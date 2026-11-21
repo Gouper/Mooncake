@@ -87,7 +87,6 @@ MemFabricSharedMemory::MemFabricSharedMemory(MemFabricGvaConfig config,
         generation << std::hex << random() << '-';
     }
     generation_ = generation.str();
-    config_status_ = validateConfig();
 }
 MemFabricSharedMemory::~MemFabricSharedMemory() { (void)close(); }
 Status MemFabricSharedMemory::validateConfig() const {
@@ -114,13 +113,13 @@ Status MemFabricSharedMemory::bindDevice() {
 }
 Status MemFabricSharedMemory::initialize() {
     std::lock_guard<std::mutex> lock(mutex_);
-    CHECK_STATUS(config_status_);
+    CHECK_STATUS(validateConfig());
     CHECK_STATUS(bindDevice());
-    if (entity_ && !entity_blob_.is_null()) return Status::OK();
-    if (!initialized_) {
+    if (init_state_ == InitState::Ready) return Status::OK();
+    if (init_state_ == InitState::Uninitialized) {
         const auto ret = MemFabricGvaApi::initialize(config_.device);
         if (ret) return nativeError("initialize", ret);
-        initialized_ = true;
+        init_state_ = InitState::RuntimeInitialized;
     }
     if (!entity_) {
         auto id = EntityIds::instance().acquire(config_.entity);
@@ -155,6 +154,7 @@ Status MemFabricSharedMemory::initialize() {
     const auto ret = MemFabricGvaApi::exportBlob(entity_, nullptr, blob);
     if (ret) return nativeError("export entity", ret);
     entity_blob_ = blob;
+    init_state_ = InitState::Ready;
     return Status::OK();
 }
 void MemFabricSharedMemory::destroyEntity() {
@@ -208,12 +208,10 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
         return Status::InvalidArgument(
             "GVA allocation exceeds remaining native capacity");
     }
-    CHECK_STATUS(config_status_);
-    if (!entity_ || entity_blob_.is_null()) {
+    if (init_state_ != InitState::Ready) {
         return Status::InvalidArgument(
             "MemFabric GVA context is not initialized");
     }
-    CHECK_STATUS(bindDevice());
     void* slice = MemFabricGvaApi::allocate(entity_, memory_type, size);
     if (!slice) return nativeError("allocate slice (null handle)");
     const auto gva = MemFabricGvaApi::address(entity_, slice);
@@ -579,12 +577,10 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
             return Status::InvalidArgument(
                 "Map requires a complete published allocation");
         }
-        CHECK_STATUS(config_status_);
-        if (!entity_ || entity_blob_.is_null()) {
+        if (init_state_ != InitState::Ready) {
             return Status::InvalidArgument(
                 "MemFabric GVA context is not initialized");
         }
-        CHECK_STATUS(bindDevice());
         // Validate the entire bundle against retained descriptors before any
         // native import, preserving other allocations' active state on failure.
         const auto existing = imported_ranks_.find(rank);
@@ -817,7 +813,7 @@ Status MemFabricSharedMemory::close() {
     for (const auto& entry : imported_ranks_) {
         if (!entry.second.cleaned) return pending("peer mappings remain");
     }
-    if (!initialized_) return Status::OK();
+    if (init_state_ == InitState::Uninitialized) return Status::OK();
     CHECK_STATUS(bindDevice());
     for (auto iterator = rollback_.begin(); iterator != rollback_.end();) {
         const auto ret = MemFabricGvaApi::free(entity_, *iterator);
@@ -831,7 +827,7 @@ Status MemFabricSharedMemory::close() {
         entity_blob_ = Json{};
     }
     MemFabricGvaApi::uninitialize();
-    initialized_ = false;
+    init_state_ = InitState::Uninitialized;
     consumed_ = {{0, 0}};
     window_bases_ = {{0, 0}};
     imported_ranks_.clear();

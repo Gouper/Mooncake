@@ -545,6 +545,7 @@ class MemFabricTransportTest : public ::testing::Test {
                                           buffer.transport_attrs[MEMFABRIC]));
         CHECK_STATUS(PublishBuffers(*peer.metadata, name, {buffer}));
         CHECK_STATUS(metadata_->segmentManager().openRemote(peer.id, name));
+        (void)MemFabricGvaApi::bind(transport_->gva_config_.device);
         return transport_->mapRemoteMemory(peer.id, peer.buffer, kHbmSize);
     }
 
