@@ -803,7 +803,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
-            build_targets: tent_memfabric_transport_test tent_memfabric_gva_test transfer_engine
+            build_targets: tent_memfabric_transport_test transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -917,7 +917,7 @@ jobs:
       run: |
         ctest_args=()
         if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
-          ctest_args=(-R '^tent_memfabric_(transport|gva)_test$' --no-tests=error --timeout 120)
+          ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
         fi
         cd build-tent
         mkdir -p test-results

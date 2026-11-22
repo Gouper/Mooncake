@@ -187,7 +187,6 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
 Status MemFabricSharedMemory::allocate(void** out, size_t size,
                                        uint32_t memory_type,
                                        MemoryOptions& options) {
-    if (!out) return Status::InvalidArgument("Null GVA output");
     *out = nullptr;
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_) {
@@ -244,8 +243,7 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
               : 0;
     bool valid = range && mapped == size && !first_ret && !last_ret &&
                  local_address == gva && end == gva + size - 1 &&
-                 (!options.global_address || options.global_address == gva) &&
-                 slices_.find(gva) == slices_.end();
+                 (!options.global_address || options.global_address == gva);
     if (!valid) {
         const auto rollback_ret = MemFabricGvaApi::free(entity_, slice);
         if (rollback_ret) {
@@ -272,7 +270,15 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     record.descriptor["window_base"] = window_bases_[index];
     record.descriptor["offset"] = offset;
     record.descriptor["slice_generation"] = ++slice_generation_;
-    slices_.emplace(gva, std::move(record));
+    if (!slices_.emplace(gva, std::move(record)).second) {
+        const auto rollback_ret = MemFabricGvaApi::free(entity_, slice);
+        if (rollback_ret) {
+            rollback_.push_back(slice);
+            return nativeError("allocation rollback (resources retained)",
+                               rollback_ret);
+        }
+        return Status::InvalidArgument("Native GVA address is already owned");
+    }
     options.global_address = gva;
     options.type = MEMFABRIC;
     options.location = "npu:" + std::to_string(config_.device);
@@ -289,10 +295,6 @@ Status MemFabricSharedMemory::publish(void* ptr, size_t size,
 Status MemFabricSharedMemory::publish(
     const std::vector<std::pair<void*, size_t>>& ranges,
     std::vector<std::string>& descriptors) {
-    if (ranges.empty()) {
-        descriptors.clear();
-        return Status::OK();
-    }
     CHECK_STATUS(bindDevice());
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<Slice*> selected;
@@ -386,10 +388,6 @@ Status MemFabricSharedMemory::validateDescriptor(
         if (!field->is_string()) {
             return invalidDescriptorField(key, "must be a string");
         }
-    }
-    if (peer_segment_name.empty()) {
-        return invalidDescriptorField("segment_name",
-                                      "has no expected segment name");
     }
     const std::pair<const char*, std::string_view> identity[] = {
         {"address_mode", "identity"},
@@ -544,12 +542,13 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
     try {
         auto descriptors = Json::parse(descriptor);
         if (!descriptors.is_array()) descriptors = Json::array({descriptors});
-        if (descriptors.empty() || descriptors.size() > kMaxDescriptors) {
+        if (descriptors.size() > kMaxDescriptors) {
             return Status::InvalidArgument("Invalid GVA allocation bundle");
         }
         const Json* requested = nullptr;
         std::map<uint64_t, uint64_t> ranges;
-        const auto& first = descriptors.front();
+        // An empty bundle throws here and is reported as malformed below.
+        const auto& first = descriptors.at(0);
         for (const auto& desc : descriptors) {
             CHECK_STATUS(validateDescriptor(desc, peer_segment_name));
             for (const char* key : {"rank", "generation", "entity_blob"}) {
@@ -739,7 +738,7 @@ Status MemFabricSharedMemory::validateCopyTarget(
 Status MemFabricSharedMemory::beginCopy(uint64_t source, uint64_t destination,
                                         size_t size, uint32_t& direction) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!size || !source || !destination || size > UINT64_MAX - source ||
+    if (!size || size > UINT64_MAX - source ||
         size > UINT64_MAX - destination) {
         return Status::InvalidArgument("Invalid GVA copy range");
     }
@@ -767,7 +766,7 @@ Status MemFabricSharedMemory::runPinnedCopy(size_t count, Copy copy,
         if (copy_failed_) {
             auto status =
                 pending("previous native copy completion remains unknown");
-            pending_copies_ -= std::min(pending_copies_, count);
+            pending_copies_ -= count;
             return status;
         }
     }
@@ -801,7 +800,8 @@ Status MemFabricSharedMemory::runBatchCopy(
 }
 void MemFabricSharedMemory::releaseCopy(size_t count, bool completion_unknown) {
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_copies_ -= std::min(pending_copies_, count);
+    // beginCopy pinned exactly count; every caller releases exactly once.
+    pending_copies_ -= count;
     copy_failed_ |= completion_unknown;
 }
 Status MemFabricSharedMemory::close() {
