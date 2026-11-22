@@ -731,16 +731,20 @@ Status MemFabricTransport::submitGvaCopies(
                                    gva_pending_->load())) {
         return Status::TooManyRequests("GVA copy queue is full");
     }
-    struct Copy {
-        uint64_t source, destination;
-        size_t size;
-        uint32_t direction;
-    };
     if (requests.size() >
         batch->capacity - std::min(batch->capacity, batch->task_list.size())) {
         return Status::TooManyRequests("GVA sub-batch capacity exceeded");
     }
-    std::vector<Copy> copies;
+    std::vector<GvaCopy> copies;
+    CHECK_STATUS(resolveGvaCopies(requests, copies));
+    std::vector<std::shared_ptr<GvaCopyGroup>> groups;
+    CHECK_STATUS(buildGvaCopyGroups(batch, requests, copies, groups));
+    dispatchGvaCopyGroups(groups);
+    return Status::OK();
+}
+
+Status MemFabricTransport::resolveGvaCopies(
+    const std::vector<Request>& requests, std::vector<GvaCopy>& copies) {
     try {
         copies.reserve(requests.size());
     } catch (...) {
@@ -791,7 +795,7 @@ Status MemFabricTransport::submitGvaCopies(
             rollback();
             return status;
         }
-        Copy copy{local, request.target_offset, request.length, 0};
+        GvaCopy copy{local, request.target_offset, request.length, 0};
         if (request.opcode == Request::READ) {
             std::swap(copy.source, copy.destination);
         }
@@ -803,15 +807,13 @@ Status MemFabricTransport::submitGvaCopies(
         }
         copies.push_back(copy);
     }
-    struct CopyGroup {
-        uint32_t direction;
-        SegmentID target;
-        Request::OpCode opcode;
-        std::vector<MemFabricGvaCopy> copies;
-        std::shared_ptr<MemFabricCopyCompletion> completion =
-            std::make_shared<MemFabricCopyCompletion>();
-    };
-    std::vector<std::shared_ptr<CopyGroup>> groups;
+    return Status::OK();
+}
+
+Status MemFabricTransport::buildGvaCopyGroups(
+    MemFabricSubBatch* batch, const std::vector<Request>& requests,
+    const std::vector<GvaCopy>& copies,
+    std::vector<std::shared_ptr<GvaCopyGroup>>& groups) {
     const auto original_task_count = batch->task_list.size();
     try {
         // Group adjacent independent copies with the same opcode, peer and
@@ -845,7 +847,7 @@ Status MemFabricTransport::submitGvaCopies(
                 overlaps(writes, copy.source, copy.size) ||
                 overlaps(writes, copy.destination, copy.size) ||
                 overlaps(reads, copy.destination, copy.size)) {
-                auto group = std::make_shared<CopyGroup>();
+                auto group = std::make_shared<GvaCopyGroup>();
                 group->direction = copy.direction;
                 group->target = request.target_id;
                 group->opcode = request.opcode;
@@ -878,9 +880,14 @@ Status MemFabricTransport::submitGvaCopies(
         batch->pending_batch_count += copies.size();
     } catch (...) {
         batch->task_list.resize(original_task_count);
-        rollback();
+        gva_->releaseCopy(copies.size());
         return Status::InternalError("Cannot allocate GVA copy queue");
     }
+    return Status::OK();
+}
+
+void MemFabricTransport::dispatchGvaCopyGroups(
+    std::vector<std::shared_ptr<GvaCopyGroup>>& groups) {
     for (const auto& group : groups) {
         auto context = gva_;
         auto pending = gva_pending_;
@@ -910,7 +917,6 @@ Status MemFabricTransport::submitGvaCopies(
             pending->fetch_sub(count);
         }
     }
-    return Status::OK();
 }
 
 Status MemFabricTransport::getTransferStatus(SubBatchRef batch, int task_id,

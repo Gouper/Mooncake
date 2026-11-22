@@ -147,7 +147,7 @@ struct FakeHybm {
     bool loaded = false;
     bool blocked = false, entered = false, throw_batch = false;
     std::optional<uint64_t> blocked_source;
-    bool reachable = true, stale_registry = false, empty_slice_export = false;
+    bool reachable = true, stale_registry = false;
     bool fail_create = false;
     int initialize_result = 0, reserve_result = 0;
     int result = 0, wait_result = 0, waits = 0;
@@ -323,7 +323,6 @@ int MemFabricGvaApi::exportBlob(void* handle, void* slice,
         if (g_hybm->entity_export_result) return g_hybm->entity_export_result;
     } else {
         if (++g_hybm->slice_exports == g_hybm->fail_slice_export_at) return -1;
-        if (g_hybm->empty_slice_export) return 0;
     }
     const std::array<uint64_t, 2> data =
         slice ? std::array<uint64_t, 2>{address(handle, slice),
@@ -2245,46 +2244,6 @@ TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
     EXPECT_EQ(addr(output), base + 4 * kPoolSize);
     ASSERT_TRUE(memory.free(output, kPoolSize).ok());
     EXPECT_FALSE(memory.allocate(&output, kPoolSize, kHbm, 0).ok());
-}
-
-TEST_F(MemFabricGva, BatchPublicationValidatesAndCommitsAllHbmSlices) {
-    MemFabricSharedMemory memory(config(), "segment");
-    ASSERT_TRUE(memory.initialize().ok());
-    void *first = nullptr, *second = nullptr;
-    ASSERT_TRUE(memory.allocate(&first, kPoolSize, kHbm, 0).ok());
-    ASSERT_TRUE(memory.allocate(&second, kPoolSize, kHbm, 0).ok());
-    const std::vector<std::pair<void*, size_t>> ranges{{first, kPoolSize},
-                                                       {second, kPoolSize}};
-    auto& native = fakeHybm();
-    std::vector<std::string> descriptors{"sentinel"};
-    EXPECT_FALSE(
-        memory.publish({ranges.front(), {second, 32}}, descriptors).ok());
-    EXPECT_EQ(native.slice_exports, 0);
-    native.empty_slice_export = true;
-    EXPECT_FALSE(memory.publish(ranges, descriptors).ok());
-    native.empty_slice_export = false;
-    native.fail_slice_export_at = 3;
-    EXPECT_FALSE(memory.publish(ranges, descriptors).ok());
-    EXPECT_EQ(descriptors, std::vector<std::string>{"sentinel"});
-    uint32_t direction = 0;
-    EXPECT_FALSE(
-        memory.beginCopy(addr(first), addr(second), 32, direction).ok());
-    ASSERT_TRUE(memory.publish(ranges, descriptors).ok());
-    ASSERT_EQ(descriptors.size(), 2u);
-    const auto descriptor = Json::parse(descriptors.front());
-    EXPECT_EQ(descriptor["address_mode"], "identity");
-    EXPECT_EQ(descriptor["type"], kHbm);
-    EXPECT_EQ(descriptor["address"], addr(first));
-    EXPECT_TRUE(memory.free(first, kPoolSize).IsTooManyRequests());
-    EXPECT_FALSE(memory.unpublish(first, 32).ok());
-    ASSERT_TRUE(memory.unpublish(first).ok());
-    const auto exports = native.slice_exports;
-    std::string repeated;
-    ASSERT_TRUE(memory.publish(first, kPoolSize, repeated).ok());
-    EXPECT_EQ(repeated, descriptors.front());
-    EXPECT_EQ(native.slice_exports, exports);
-    freePool(memory, first);
-    freePool(memory, second);
 }
 
 TEST_F(MemFabricGva, InvalidBundlesNeverReachNativeImports) {

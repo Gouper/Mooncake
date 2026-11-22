@@ -85,6 +85,9 @@ class MemFabricSharedMemory {
     Status bindDevice();
     Status validateDescriptor(const Json&,
                               const std::string& peer_segment_name) const;
+    Status validateRetainedPeers(uint32_t, const Json&, const std::string&,
+                                 const Json&) const;
+    Status importBundle(uint32_t, const Json&, const std::string&, const Json&);
     RemoteSlice& recordSlice(ImportedRank&, const Json&);
     Status importPeer(ImportedRank&, const Json&);
     Status verifyPeerMapping(uint32_t, const RemoteSlice&);

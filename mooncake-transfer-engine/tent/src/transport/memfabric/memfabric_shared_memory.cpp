@@ -93,8 +93,7 @@ MemFabricSharedMemory::~MemFabricSharedMemory() { (void)close(); }
 Status MemFabricSharedMemory::validateConfig() const {
     if (!available_) {
         return Status::NotImplemented(
-            "MemFabric GVA requires compatible HYBM headers and library "
-            "symbols");
+            "MemFabric GVA requires HYBM headers and library symbols");
     }
     for (auto pair : {std::make_pair(config_.hbm_size, config_.hbm_window),
                       std::make_pair(config_.dram_size, config_.dram_window)}) {
@@ -147,8 +146,7 @@ Status MemFabricSharedMemory::initialize() {
             MemFabricGvaApi::base(entity_, index + kGvaMemoryTypeDevice);
         if (!window_bases_[index] ||
             config_.rank_count > (UINT64_MAX - window_bases_[index]) / window) {
-            return Status::InvalidArgument(
-                "Invalid native GVA window base/range");
+            return Status::InvalidArgument("Invalid gva window base/range");
         }
     }
     std::vector<uint8_t> blob;
@@ -222,19 +220,19 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
         return nativeError("allocation rollback (resources retained)", ret);
     };
     const auto gva = MemFabricGvaApi::address(entity_, slice);
-    const auto mapped = MemFabricGvaApi::size(entity_, slice);
+    const auto slice_size = MemFabricGvaApi::size(entity_, slice);
     const auto rank_base = window_bases_[index] + config_.rank * window;
     const bool in_window = gva >= rank_base;
     const auto offset = in_window ? gva - rank_base : 0;
-    const bool accounted = in_window && mapped <= UINT64_MAX - offset;
     // HYBM's bump cursor is not rewound by free, including failed fixed-address
     // validation. Account for actual offsets, rather than assuming offset zero.
     consumed_[index] =
-        accounted ? std::max(consumed_[index], offset + mapped) : budget;
-    // offset <= budget and mapped <= budget - offset keep offset + mapped
-    // inside the rank window, so no separate overflow check is needed here.
-    const bool range =
-        accounted && offset <= budget && mapped && mapped <= budget - offset;
+        in_window ? std::max(consumed_[index], offset + slice_size) : budget;
+    // offset <= budget and slice_size <= budget - offset keep offset +
+    // slice_size inside the rank window, so no separate overflow check is
+    // needed here.
+    const bool range = in_window && offset <= budget && slice_size &&
+                       slice_size <= budget - offset;
     // Network DRAM is accessed through its host VA; HYBM may assign a
     // different device alias when registering that host memory.
     const uint32_t address_type = memory_type == kGvaMemoryTypeHost &&
@@ -242,22 +240,18 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
                                            config_.protocol == "device_urma")
                                       ? kGvaMemoryTypeHost
                                       : kGvaMemoryTypeDevice;
-    uint64_t local_address = 0, end = 0;
+    uint64_t local_address = 0;
     const auto first_ret =
         range ? MemFabricGvaApi::translate(gva, address_type, local_address)
               : 0;
-    const auto last_ret =
-        range ? MemFabricGvaApi::translate(gva + mapped - 1, address_type, end)
-              : 0;
-    bool valid = range && mapped == size && !first_ret && !last_ret &&
-                 local_address == gva && end == gva + size - 1 &&
+    bool valid = range && slice_size == size && !first_ret &&
+                 local_address == gva &&
                  (!options.global_address || options.global_address == gva);
     if (!valid) {
         CHECK_STATUS(rollback());
         if (first_ret) {
             return nativeError("translate allocation start", first_ret);
         }
-        if (last_ret) return nativeError("translate allocation end", last_ret);
         return Status::InvalidArgument(
             "Native allocation must fit its rank window and requested "
             "identical VA");
@@ -316,10 +310,6 @@ Status MemFabricSharedMemory::publish(
             const auto ret =
                 MemFabricGvaApi::exportBlob(entity_, slice->handle, blob);
             if (ret) return nativeError("export slice", ret);
-            if (blob.empty() || blob.size() > kMaxBlobSize) {
-                return Status::InvalidArgument(
-                    "HYBM exported an invalid slice descriptor");
-            }
             descriptor["slice_blob"] = blob;
         }
         serialized.push_back(descriptor.dump());
@@ -355,7 +345,6 @@ Status MemFabricSharedMemory::free(void* ptr, size_t size) {
         return Status::InvalidArgument("Unknown GVA slice or size");
     }
     if (slice->second.published) return pending("slice is still registered");
-    CHECK_STATUS(bindDevice());
     const auto ret = MemFabricGvaApi::free(entity_, slice->second.handle);
     if (ret) return nativeError("free slice", ret);
     slices_.erase(slice);
@@ -431,25 +420,15 @@ Status MemFabricSharedMemory::validateDescriptor(
         type == kGvaMemoryTypeDevice ? config_.hbm_size : config_.dram_size;
     const auto window =
         type == kGvaMemoryTypeDevice ? config_.hbm_window : config_.dram_window;
-    if (!address) {
-        return invalidDescriptorField("address", "must be nonzero");
-    }
-    if (!size || size > UINT64_MAX - address) {
-        return invalidDescriptorField("size",
-                                      "produces an empty or overflowing range");
-    }
-    if (!window) {
-        return invalidDescriptorField("type", "has no configured GVA window");
+    if (!size) {
+        return invalidDescriptorField("size", "must be nonzero");
     }
     if (base != window_bases_[type - kGvaMemoryTypeDevice]) {
         return invalidDescriptorField("window_base",
                                       "does not match the local base");
     }
-    if (rank > (UINT64_MAX - base) / window) {
-        return invalidDescriptorField("rank", "overflows the window address");
-    }
     const auto rank_base = base + rank * window;
-    if (offset > budget || offset > UINT64_MAX - rank_base) {
+    if (offset > budget) {
         return invalidDescriptorField("offset", "exceeds the rank window");
     }
     if (size > budget - offset) {
@@ -534,6 +513,10 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
     if (pending_copies_ || copy_failed_) {
         return pending("GVA copies retain resources");
     }
+    if (init_state_ != InitState::Ready) {
+        return Status::InvalidArgument(
+            "MemFabric GVA context is not initialized");
+    }
     if (direct && config_.protocol != "device_sdma") {
         return Status::NotImplemented(
             "Network GVA does not provide a direct device mapping");
@@ -578,83 +561,91 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
             return Status::InvalidArgument(
                 "Map requires a complete published allocation");
         }
-        if (init_state_ != InitState::Ready) {
-            return Status::InvalidArgument(
-                "MemFabric GVA context is not initialized");
-        }
         // Validate the entire bundle against retained descriptors before any
         // native import, preserving other allocations' active state on failure.
-        const auto existing = imported_ranks_.find(rank);
-        if (existing != imported_ranks_.end() && !existing->second.cleaned) {
-            const auto& peer = existing->second;
-            if (peer.segment_name != peer_segment_name ||
-                peer.generation !=
-                    requested->at("generation").get<std::string>() ||
-                peer.entity_blob != requested->at("entity_blob")) {
-                return pending("old peer generation must exit first");
-            }
-            const auto& slices = peer.slices;
-            size_t retained = slices.size();
-            for (const auto& desc : descriptors) {
-                const auto base = desc.at("address").get<uint64_t>();
-                const auto next = slices.lower_bound(base);
-                if (next != slices.end() && next->first == base) {
-                    if (desc != next->second.descriptor) {
-                        return pending("peer allocation descriptor changed");
-                    }
-                    continue;
-                }
-                if (++retained > kMaxDescriptors) {
-                    return Status::InvalidArgument(
-                        "Too many retained peer allocations");
-                }
-                const auto length = desc.at("size").get<uint64_t>();
-                const auto prev =
-                    next == slices.begin() ? slices.end() : std::prev(next);
-                if ((next != slices.end() && next->first - base < length) ||
-                    (prev != slices.end() &&
-                     base - prev->first <
-                         prev->second.descriptor.at("size").get<uint64_t>())) {
-                    return Status::InvalidArgument(
-                        "New allocation overlaps retained peer allocation");
-                }
-            }
-        }
-        auto& peer = imported_ranks_[rank];
-        if (peer.cleaned) peer = ImportedRank{};
-        if (peer.segment_name.empty()) {
-            peer.segment_name = peer_segment_name;
-            peer.generation = requested->at("generation").get<std::string>();
-            peer.entity_blob = requested->at("entity_blob");
-        }
-        // Record the requested allocation before HYBM can acquire resources.
-        auto& slice = recordSlice(peer, *requested);
-        slice.active = false;
-        const auto import_ret = MemFabricGvaApi::importBlob(
-            entity_, true, peer.entity_blob.get<std::vector<uint8_t>>());
-        if (import_ret) return nativeError("import entity", import_ret);
-        for (const auto& desc : descriptors) {
-            CHECK_STATUS(importPeer(peer, desc));
-        }
-        auto ret = MemFabricGvaApi::map(entity_);
-        if (ret) {
-            return pending(
-                "map peer allocations (retry when reciprocal imports are "
-                "ready)",
-                ret);
-        }
-        if (config_.protocol == "device_sdma") {
-            CHECK_STATUS(verifyPeerMapping(rank, slice));
-        } else {
-            ret = MemFabricGvaApi::connect(entity_, rank);
-            if (ret) return pending("connect peer (retry when ready)", ret);
-        }
-        slice.publication = requested->dump();
-        slice.active = true;
-        return Status::OK();
+        CHECK_STATUS(validateRetainedPeers(rank, descriptors, peer_segment_name,
+                                           *requested));
+        return importBundle(rank, descriptors, peer_segment_name, *requested);
     } catch (const Json::exception&) {
         return Status::InvalidArgument("Malformed GVA allocation bundle");
     }
+}
+Status MemFabricSharedMemory::validateRetainedPeers(
+    uint32_t rank, const Json& descriptors,
+    const std::string& peer_segment_name, const Json& requested) const {
+    const auto existing = imported_ranks_.find(rank);
+    if (existing == imported_ranks_.end() || existing->second.cleaned) {
+        return Status::OK();
+    }
+    const auto& peer = existing->second;
+    if (peer.segment_name != peer_segment_name ||
+        peer.generation != requested.at("generation").get<std::string>() ||
+        peer.entity_blob != requested.at("entity_blob")) {
+        return pending("old peer generation must exit first");
+    }
+    const auto& slices = peer.slices;
+    size_t retained = slices.size();
+    for (const auto& desc : descriptors) {
+        const auto base = desc.at("address").get<uint64_t>();
+        const auto next = slices.lower_bound(base);
+        if (next != slices.end() && next->first == base) {
+            if (desc != next->second.descriptor) {
+                return pending("peer allocation descriptor changed");
+            }
+            continue;
+        }
+        if (++retained > kMaxDescriptors) {
+            return Status::InvalidArgument(
+                "Too many retained peer allocations");
+        }
+        const auto length = desc.at("size").get<uint64_t>();
+        const auto prev =
+            next == slices.begin() ? slices.end() : std::prev(next);
+        if ((next != slices.end() && next->first - base < length) ||
+            (prev != slices.end() &&
+             base - prev->first <
+                 prev->second.descriptor.at("size").get<uint64_t>())) {
+            return Status::InvalidArgument(
+                "New allocation overlaps retained peer allocation");
+        }
+    }
+    return Status::OK();
+}
+Status MemFabricSharedMemory::importBundle(uint32_t rank,
+                                           const Json& descriptors,
+                                           const std::string& peer_segment_name,
+                                           const Json& requested) {
+    auto& peer = imported_ranks_[rank];
+    if (peer.cleaned) peer = ImportedRank{};
+    if (peer.segment_name.empty()) {
+        peer.segment_name = peer_segment_name;
+        peer.generation = requested.at("generation").get<std::string>();
+        peer.entity_blob = requested.at("entity_blob");
+    }
+    // Record the requested allocation before HYBM can acquire resources.
+    auto& slice = recordSlice(peer, requested);
+    slice.active = false;
+    const auto import_ret = MemFabricGvaApi::importBlob(
+        entity_, true, peer.entity_blob.get<std::vector<uint8_t>>());
+    if (import_ret) return nativeError("import entity", import_ret);
+    for (const auto& desc : descriptors) {
+        CHECK_STATUS(importPeer(peer, desc));
+    }
+    auto ret = MemFabricGvaApi::map(entity_);
+    if (ret) {
+        return pending(
+            "map peer allocations (retry when reciprocal imports are ready)",
+            ret);
+    }
+    if (config_.protocol == "device_sdma") {
+        CHECK_STATUS(verifyPeerMapping(rank, slice));
+    } else {
+        ret = MemFabricGvaApi::connect(entity_, rank);
+        if (ret) return pending("connect peer (retry when ready)", ret);
+    }
+    slice.publication = requested.dump();
+    slice.active = true;
+    return Status::OK();
 }
 Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, ImportedRank& peer) {
     if (peer.cleaned) return Status::OK();

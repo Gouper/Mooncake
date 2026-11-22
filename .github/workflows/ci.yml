@@ -917,6 +917,7 @@ jobs:
       run: |
         ctest_args=()
         if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          # Only the MemFabric test executable is built in this test directory.
           ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
         fi
         cd build-tent

@@ -92,7 +92,25 @@ class MemFabricTransport : public Transport {
     bool supportNotification() const override { return false; }
 
    private:
+    struct GvaCopy {
+        uint64_t source, destination;
+        size_t size;
+        uint32_t direction;
+    };
+    struct GvaCopyGroup {
+        uint32_t direction;
+        SegmentID target;
+        Request::OpCode opcode;
+        std::vector<MemFabricGvaCopy> copies;
+        std::shared_ptr<MemFabricCopyCompletion> completion =
+            std::make_shared<MemFabricCopyCompletion>();
+    };
     Status submitGvaCopies(MemFabricSubBatch*, const std::vector<Request>&);
+    Status resolveGvaCopies(const std::vector<Request>&, std::vector<GvaCopy>&);
+    Status buildGvaCopyGroups(MemFabricSubBatch*, const std::vector<Request>&,
+                              const std::vector<GvaCopy>&,
+                              std::vector<std::shared_ptr<GvaCopyGroup>>&);
+    void dispatchGvaCopyGroups(std::vector<std::shared_ptr<GvaCopyGroup>>&);
     std::vector<std::unique_ptr<ThreadPool>> copy_workers_;
     size_t next_copy_worker_ = 0;
     std::shared_ptr<std::atomic<size_t>> gva_pending_ =
