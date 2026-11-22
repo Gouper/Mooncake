@@ -30,6 +30,14 @@ constexpr uint64_t kGvaWindowUnit = 1ULL << 30;
 constexpr uint64_t kGvaWindowLimitGiB = 1ULL << 20;
 constexpr size_t kGvaCopyWorkerCount = 2;
 
+const std::string* findGvaDescriptor(const BufferDesc& buffer) {
+    const auto attr = buffer.transport_attrs.find(MEMFABRIC);
+    if (attr == buffer.transport_attrs.end() || attr->second.empty()) {
+        return nullptr;
+    }
+    return &attr->second;
+}
+
 Status alignedBufferRange(const BufferDesc& desc, uint64_t& begin,
                           uint64_t& end) {
     constexpr auto mask = kRegistrationAlignment - 1;
@@ -143,19 +151,15 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
     if (!buffer || buffer->addr != reinterpret_cast<uint64_t>(addr)) {
         return Status::InvalidArgument("GVA map requires published slice base");
     }
-    auto attribute = buffer->transport_attrs.find(MEMFABRIC);
-    if (attribute == buffer->transport_attrs.end() ||
-        attribute->second.empty()) {
+    if (!findGvaDescriptor(*buffer)) {
         return Status::InvalidArgument("Missing MemFabric GVA descriptor");
     }
     nlohmann::json bundle = nlohmann::json::array();
     for (const auto& candidate : segment->getMemory().buffers) {
-        auto attr = candidate.transport_attrs.find(MEMFABRIC);
-        if (attr == candidate.transport_attrs.end() || attr->second.empty()) {
-            continue;
-        }
+        const auto* attribute = findGvaDescriptor(candidate);
+        if (!attribute) continue;
         try {
-            auto descriptor = nlohmann::json::parse(attr->second);
+            auto descriptor = nlohmann::json::parse(*attribute);
             if (descriptor.at("address").get<uint64_t>() != candidate.addr ||
                 descriptor.at("size").get<uint64_t>() != candidate.length) {
                 return Status::InvalidArgument(
@@ -752,25 +756,15 @@ Status MemFabricTransport::submitGvaCopies(
         // Source is the local endpoint for both READ and WRITE. It must be
         // inside an owned GVA slice; beginCopy checks full range/publication.
         auto local = reinterpret_cast<uint64_t>(request.source);
-        bool local_owned = false;
-        auto status = metadata_->segmentManager().withCachedSegment(
-            LOCAL_SEGMENT_ID, [&](SegmentDesc* segment) -> Status {
-                auto* buffer = segment->findBuffer(local, request.length);
-                if (buffer) {
-                    auto attr = buffer->transport_attrs.find(MEMFABRIC);
-                    local_owned = attr != buffer->transport_attrs.end() &&
-                                  !attr->second.empty();
-                }
-                return Status::OK();
-            });
-        if (!status.ok() || !local_owned) {
+        const auto local_segment = metadata_->segmentManager().getLocal();
+        const auto* local_buffer =
+            local_segment->findBuffer(local, request.length);
+        if (!local_buffer || !findGvaDescriptor(*local_buffer)) {
             rollback();
-            return status.ok() ? Status::InvalidArgument(
-                                     "Local copy endpoint must be a registered "
-                                     "logical GVA slice")
-                               : status;
+            return Status::InvalidArgument(
+                "Local copy endpoint must be a registered logical GVA slice");
         }
-        status = metadata_->segmentManager().withCachedSegment(
+        auto status = metadata_->segmentManager().withCachedSegment(
             request.target_id, [&](SegmentDesc* segment) -> Status {
                 auto* buffer =
                     segment->findBuffer(request.target_offset, request.length);
@@ -778,9 +772,8 @@ Status MemFabricTransport::submitGvaCopies(
                     return Status::InvalidArgument(
                         "Remote GVA copy range is not registered");
                 }
-                auto attr = buffer->transport_attrs.find(MEMFABRIC);
-                if (attr == buffer->transport_attrs.end() ||
-                    attr->second.empty()) {
+                const auto* descriptor = findGvaDescriptor(*buffer);
+                if (!descriptor) {
                     return Status::InvalidArgument(
                         "Remote copy endpoint must be a GVA slice");
                 }
@@ -792,7 +785,7 @@ Status MemFabricTransport::submitGvaCopies(
                         "Map remote GVA slice before copy");
                 }
                 return gva_->validateCopyTarget(segment->name, buffer->addr,
-                                                attr->second);
+                                                *descriptor);
             });
         if (!status.ok()) {
             rollback();
@@ -849,7 +842,6 @@ Status MemFabricTransport::submitGvaCopies(
             if (groups.empty() || groups.back()->direction != copy.direction ||
                 groups.back()->target != request.target_id ||
                 groups.back()->opcode != request.opcode ||
-                groups.back()->copies.size() == UINT32_MAX ||
                 overlaps(writes, copy.source, copy.size) ||
                 overlaps(writes, copy.destination, copy.size) ||
                 overlaps(reads, copy.destination, copy.size)) {

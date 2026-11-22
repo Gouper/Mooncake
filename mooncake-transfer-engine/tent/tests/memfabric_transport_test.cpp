@@ -2321,6 +2321,10 @@ TEST_F(MemFabricGva, InvalidBundlesNeverReachNativeImports) {
         EXPECT_FALSE(pair.map(Json::array({desc, second}).dump(), target).ok());
     }
     EXPECT_FALSE(pair.map(pair.publication, target + 1, 32).ok());
+    auto unnamed = desc;
+    unnamed["segment_name"] = "";
+    ASSERT_TRUE(pair.local.map("", unnamed.dump(), target, kPoolSize)
+                    .IsInvalidArgument());
     EXPECT_EQ(fakeHybm().imports, 0);
     ASSERT_TRUE(pair.map().ok());
     EXPECT_FALSE(pair.map(shifted.dump(), target + 32).ok());
@@ -2490,6 +2494,8 @@ TEST_F(MemFabricTransportTest, EngineRegistersAndFreesHbm) {
     MemoryOptions options;
     options.type = MEMFABRIC;
     options.location = "npu:0";
+    EXPECT_TRUE(frontend.allocateLocalMemory(nullptr, kHbmSize, options)
+                    .IsInvalidArgument());
     void* pool = nullptr;
     ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kHbmSize, options).ok());
     native.fail_slice_export_at = 1;

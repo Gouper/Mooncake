@@ -3,6 +3,7 @@
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
 #include <algorithm>
 #include <bitset>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string_view>
@@ -187,6 +188,7 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
 Status MemFabricSharedMemory::allocate(void** out, size_t size,
                                        uint32_t memory_type,
                                        MemoryOptions& options) {
+    if (!out) return Status::InvalidArgument("Null GVA output");
     *out = nullptr;
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_) {
@@ -213,6 +215,12 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     }
     void* slice = MemFabricGvaApi::allocate(entity_, memory_type, size);
     if (!slice) return nativeError("allocate slice (null handle)");
+    auto rollback = [this, slice]() {
+        const auto ret = MemFabricGvaApi::free(entity_, slice);
+        if (!ret) return Status::OK();
+        rollback_.push_back(slice);
+        return nativeError("allocation rollback (resources retained)", ret);
+    };
     const auto gva = MemFabricGvaApi::address(entity_, slice);
     const auto mapped = MemFabricGvaApi::size(entity_, slice);
     const auto rank_base = window_bases_[index] + config_.rank * window;
@@ -245,12 +253,7 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
                  local_address == gva && end == gva + size - 1 &&
                  (!options.global_address || options.global_address == gva);
     if (!valid) {
-        const auto rollback_ret = MemFabricGvaApi::free(entity_, slice);
-        if (rollback_ret) {
-            rollback_.push_back(slice);
-            return nativeError("allocation rollback (resources retained)",
-                               rollback_ret);
-        }
+        CHECK_STATUS(rollback());
         if (first_ret) {
             return nativeError("translate allocation start", first_ret);
         }
@@ -271,12 +274,7 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     record.descriptor["offset"] = offset;
     record.descriptor["slice_generation"] = ++slice_generation_;
     if (!slices_.emplace(gva, std::move(record)).second) {
-        const auto rollback_ret = MemFabricGvaApi::free(entity_, slice);
-        if (rollback_ret) {
-            rollback_.push_back(slice);
-            return nativeError("allocation rollback (resources retained)",
-                               rollback_ret);
-        }
+        CHECK_STATUS(rollback());
         return Status::InvalidArgument("Native GVA address is already owned");
     }
     options.global_address = gva;
@@ -388,6 +386,10 @@ Status MemFabricSharedMemory::validateDescriptor(
         if (!field->is_string()) {
             return invalidDescriptorField(key, "must be a string");
         }
+    }
+    if (peer_segment_name.empty()) {
+        return invalidDescriptorField("segment_name",
+                                      "has no expected segment name");
     }
     const std::pair<const char*, std::string_view> identity[] = {
         {"address_mode", "identity"},
@@ -591,31 +593,30 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
                 peer.entity_blob != requested->at("entity_blob")) {
                 return pending("old peer generation must exit first");
             }
-            size_t retained = peer.slices.size();
+            const auto& slices = peer.slices;
+            size_t retained = slices.size();
             for (const auto& desc : descriptors) {
-                if (!peer.slices.count(desc.at("address").get<uint64_t>()) &&
-                    ++retained > kMaxDescriptors) {
+                const auto base = desc.at("address").get<uint64_t>();
+                const auto next = slices.lower_bound(base);
+                if (next != slices.end() && next->first == base) {
+                    if (desc != next->second.descriptor) {
+                        return pending("peer allocation descriptor changed");
+                    }
+                    continue;
+                }
+                if (++retained > kMaxDescriptors) {
                     return Status::InvalidArgument(
                         "Too many retained peer allocations");
                 }
-                const auto base = desc.at("address").get<uint64_t>();
                 const auto length = desc.at("size").get<uint64_t>();
-                for (const auto& [old_base, old] : peer.slices) {
-                    if (base == old_base) {
-                        if (desc != old.descriptor) {
-                            return pending(
-                                "peer allocation descriptor changed");
-                        }
-                    } else {
-                        const auto old_length =
-                            old.descriptor.at("size").get<uint64_t>();
-                        if (base >= old_base ? base - old_base < old_length
-                                             : old_base - base < length) {
-                            return Status::InvalidArgument(
-                                "New allocation overlaps retained peer "
-                                "allocation");
-                        }
-                    }
+                const auto prev =
+                    next == slices.begin() ? slices.end() : std::prev(next);
+                if ((next != slices.end() && next->first - base < length) ||
+                    (prev != slices.end() &&
+                     base - prev->first <
+                         prev->second.descriptor.at("size").get<uint64_t>())) {
+                    return Status::InvalidArgument(
+                        "New allocation overlaps retained peer allocation");
                 }
             }
         }
@@ -668,17 +669,13 @@ Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, ImportedRank& peer) {
     for (const auto& [base, slice] : peer.slices) {
         const auto size = slice.descriptor.at("size").get<uint64_t>();
         uint64_t va = 0;
-        const auto first_ret =
-            MemFabricGvaApi::translate(base, kGvaMemoryTypeDevice, va);
-        if (first_ret != -12) {
-            return pending("GVA registry still contains imported mappings",
-                           first_ret);
-        }
-        const auto last_ret = MemFabricGvaApi::translate(
-            base + size - 1, kGvaMemoryTypeDevice, va);
-        if (last_ret != -12) {
-            return pending("GVA registry still contains imported mappings",
-                           last_ret);
+        for (const auto address : {base, base + size - 1}) {
+            const auto code =
+                MemFabricGvaApi::translate(address, kGvaMemoryTypeDevice, va);
+            if (code != -12) {
+                return pending("GVA registry still contains imported mappings",
+                               code);
+            }
         }
     }
     peer.cleaned = true;
