@@ -88,6 +88,8 @@ class CoroRpcAgent {
     // concurrent bulk transfers are not serialized on one io_context.
     Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
 
+    Status StartAt(const std::string &host, uint16_t port, size_t threads);
+
     Status stop();
 
     Status call(const std::string &server_addr, int func_id,
@@ -112,6 +114,8 @@ class CoroRpcAgent {
         bool retry_rpc_error_once = false);
 
    private:
+    Status StartListener(const std::string &host, uint16_t port, size_t threads);
+
     async_simple::coro::Lazy<void> process(int func_id);
 
     std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);

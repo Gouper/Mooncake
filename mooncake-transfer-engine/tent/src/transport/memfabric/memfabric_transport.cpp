@@ -98,6 +98,15 @@ bool MemFabricTransport::supportsGlobalAddressing() const {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     return static_cast<bool>(gva_);
 }
+Status MemFabricTransport::GetGvaBases(uint64_t &host, uint64_t &device) const
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (!gva_ || stopping_)
+        return Status::NotImplemented("MemFabric GVA is unavailable");
+    gva_->GetBases(host, device);
+    return Status::OK();
+}
+
 bool MemFabricTransport::warmupMemory(void*, size_t) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     // GVA NPU mappings must not be prefaulted as CPU pages.

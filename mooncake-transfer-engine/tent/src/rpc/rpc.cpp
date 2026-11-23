@@ -129,32 +129,41 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
     if (threads > 1)
         LOG(INFO) << "CoroRpcAgent: RPC server threads set to " << threads;
     for (int retry = 0; retry < kMaxRetry; ++retry) {
-        try {
-            if (port == 0)
-                port = kStartPort + SimpleRandom::Get().next(kPortRange);
-            server_ = new coro_rpc::coro_rpc_server(threads, port,
-                                                    ipv6 ? "::" : "0.0.0.0");
-            server_->register_handler<&CoroRpcAgent::process>(this);
-            server_->async_start();
-            const auto err = server_->get_errc();
-            if (err) {
-                LOG(WARNING)
-                    << "Failed to start RPC server(async_start) on port "
-                    << port << ": " << err.message();
-                delete server_;
-                server_ = nullptr;
-                port = 0;
-                continue;
-            }
-            running_ = true;
+        if (port == 0)
+            port = kStartPort + SimpleRandom::Get().next(kPortRange);
+        if (StartListener(ipv6 ? "::" : "0.0.0.0", port, threads).ok())
             return Status::OK();
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to start RPC server on port " << port
-                         << ": " << e.what();
-            port = 0;
-        }
+        port = 0;
     }
     return Status::RpcServiceError("Failed to bind any RPC port" LOC_MARK);
+}
+
+Status CoroRpcAgent::StartAt(const std::string &host, uint16_t port, size_t threads)
+{
+    if (running_)
+        return Status::InvalidArgument("RPC server already started" LOC_MARK);
+    easylog::set_min_severity(easylog::Severity::FATAL);
+    return StartListener(host, port, threads);
+}
+
+Status CoroRpcAgent::StartListener(const std::string &host, uint16_t port, size_t threads)
+{
+    try {
+        auto server = std::make_unique<coro_rpc::coro_rpc_server>(threads, port, host);
+        server->register_handler<&CoroRpcAgent::process>(this);
+        server->async_start();
+        const auto error = server->get_errc();
+        if (error) {
+            LOG(WARNING) << "Failed to start RPC server on port " << port << ", error:" << error.message() << ".";
+            return Status::RpcServiceError("Failed to bind RPC listener");
+        }
+        server_ = server.release();
+        running_ = true;
+        return Status::OK();
+    } catch (const std::exception &) {
+        LOG(WARNING) << "Failed to start RPC server on port " << port << ".";
+        return Status::RpcServiceError("Failed to start RPC listener");
+    }
 }
 
 Status CoroRpcAgent::stop() {

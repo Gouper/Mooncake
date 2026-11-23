@@ -21,6 +21,7 @@ class MemFabricSharedMemory {
     ~MemFabricSharedMemory();
     // Initialize the entity and reserve windows before allocation or mapping.
     Status initialize();
+    void GetBases(uint64_t &host, uint64_t &device) const;
     // allocate, map, and prepare use the ACL device bound by the caller.
     Status allocate(void**, size_t, uint32_t memory_type, MemoryOptions&);
     Status free(void*, size_t);

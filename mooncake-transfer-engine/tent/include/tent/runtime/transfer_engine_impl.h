@@ -264,6 +264,11 @@ class TransferEngineImpl {
     TransferEngineImpl(std::shared_ptr<Config> config,
                        bool config_loaded = true);
 
+    TransferEngineImpl(std::shared_ptr<Config> config, bool config_loaded,
+                       bool load_environment);
+
+    Status GetMemFabricGvaBases(uint64_t &host, uint64_t &device) const;
+
     ~TransferEngineImpl();
 
     TransferEngineImpl(const TransferEngineImpl&) = delete;

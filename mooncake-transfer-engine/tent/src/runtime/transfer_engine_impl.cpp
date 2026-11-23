@@ -49,6 +49,9 @@
 #ifdef USE_MLU
 #include "tent/transport/mlu/mlu_transport.h"
 #endif
+#ifdef USE_MEMFABRIC
+#include "tent/transport/memfabric/memfabric_transport.h"
+#endif
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -327,6 +330,11 @@ TransferEngineImpl::TransferEngineImpl()
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
                                        bool config_loaded)
+    : TransferEngineImpl(std::move(conf), config_loaded, true) {}
+
+TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
+                                       bool config_loaded,
+                                       bool load_environment)
     : conf_(conf),
       available_(false),
       port_(0),
@@ -337,11 +345,13 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
         LOG(ERROR) << "Cannot construct Transfer Engine with a null config";
         return;
     }
-    auto preserved = captureExplicitTransferEngineConfig(*conf_);
-    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
-    // explicit metadata identity intact.
-    auto status = ConfigHelper().loadFromEnv(*conf_);
-    restoreExplicitTransferEngineConfig(*conf_, preserved);
+    auto status = Status::OK();
+    if (load_environment) {
+        auto preserved = captureExplicitTransferEngineConfig(*conf_);
+        // Keep the caller's explicit metadata identity.
+        status = ConfigHelper().loadFromEnv(*conf_);
+        restoreExplicitTransferEngineConfig(*conf_, preserved);
+    }
     if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -352,6 +362,19 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
 }
 
 TransferEngineImpl::~TransferEngineImpl() { deconstruct(); }
+
+Status TransferEngineImpl::GetMemFabricGvaBases(uint64_t &host, uint64_t &device) const
+{
+#ifdef USE_MEMFABRIC
+    const auto *transport = static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get());
+    if (transport)
+        return transport->GetGvaBases(host, device);
+#else
+    static_cast<void>(host);
+    static_cast<void>(device);
+#endif
+    return Status::NotImplemented("MemFabric GVA transport is unavailable");
+}
 
 std::string randomSegmentName() {
     std::string name = "segment_noname_";

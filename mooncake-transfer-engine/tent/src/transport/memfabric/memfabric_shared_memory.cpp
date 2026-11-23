@@ -156,6 +156,13 @@ Status MemFabricSharedMemory::initialize() {
     init_state_ = InitState::Ready;
     return Status::OK();
 }
+void MemFabricSharedMemory::GetBases(uint64_t &host, uint64_t &device) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    host = window_bases_[kGvaMemoryTypeHost - kGvaMemoryTypeDevice];
+    device = window_bases_[0];
+}
+
 void MemFabricSharedMemory::destroyEntity() {
     MemFabricGvaApi::destroy(entity_);
     entity_ = nullptr;

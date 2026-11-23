@@ -264,3 +264,5 @@ install(
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
+install(FILES ../include/tent/memory_engine.h DESTINATION include/tent)
+install(FILES ../include/tent/common/status.h DESTINATION include/tent/common)

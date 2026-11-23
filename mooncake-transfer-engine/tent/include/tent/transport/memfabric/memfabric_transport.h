@@ -86,6 +86,7 @@ class MemFabricTransport : public Transport {
     Status freeLocalMemory(void*, size_t) override;
     bool warmupMemory(void* address, size_t size) override;
     bool supportsGlobalAddressing() const override;
+    Status GetGvaBases(uint64_t &host, uint64_t &device) const;
     Status mapRemoteMemory(SegmentID, void*, size_t) override;
     Status unmapRemoteMemory(SegmentID, void*) override;
     const char* getName() const override { return "memfabric"; }
