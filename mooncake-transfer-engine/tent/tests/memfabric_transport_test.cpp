@@ -25,8 +25,12 @@
 #include <thread>
 #include <vector>
 
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
+
 #include "memfabric_allocator.h"
 #include "tent/common/config.h"
+#include "tent/memory_engine.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/transfer_engine.h"
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
@@ -153,7 +157,8 @@ struct FakeHybm {
     int result = 0, wait_result = 0, waits = 0;
     int connect_result = 0, map_result = 0, remove_result = 0;
     int entity_export_result = 0, fail_slice_export_at = 0;
-    int entity_import_result = 0, slice_import_result = 0;
+    int entity_import_result = 0;
+    std::atomic<int> slice_import_result{0};
     int translate_result = 0;
     int initializes = 0, creates = 0, frees = 0, unmaps = 0;
     int entity_exports = 0, slice_exports = 0, imports = 0, slice_imports = 0;
@@ -186,11 +191,12 @@ struct HybmSlice {
 struct HybmEntity {
     MemFabricGvaConfig config;
     uint64_t serial;
-    uint64_t cursor = 0;
+    std::array<uint64_t, 2> cursors{};
     std::map<uint64_t, HybmSlice> slices;
 };
 
 auto g_hybm = std::make_unique<FakeHybm>();
+std::mutex gHybmMutex;
 std::map<uint16_t, std::unique_ptr<HybmEntity>> g_hybm_entities;
 thread_local uint16_t g_hybm_device;
 
@@ -271,6 +277,7 @@ int MemFabricGvaApi::initialize(uint16_t) {
 void MemFabricGvaApi::uninitialize() {}
 
 void* MemFabricGvaApi::create(const MemFabricGvaConfig& config) {
+    std::lock_guard lock(gHybmMutex);
     if (g_hybm->fail_create) return nullptr;
     auto created = std::make_unique<HybmEntity>();
     created->config = config;
@@ -280,6 +287,7 @@ void* MemFabricGvaApi::create(const MemFabricGvaConfig& config) {
 }
 
 void MemFabricGvaApi::destroy(void* handle) {
+    std::lock_guard lock(gHybmMutex);
     const auto id = hybmEntity(handle).config.device;
     g_hybm_entities.erase(id);
 }
@@ -288,17 +296,19 @@ int MemFabricGvaApi::reserve(void*) { return g_hybm->reserve_result; }
 int MemFabricGvaApi::unreserve(void*) { return 0; }
 
 void* MemFabricGvaApi::allocate(void* handle, uint32_t type, uint64_t bytes) {
-    if (type != kGvaMemoryTypeDevice) return nullptr;
+    if (type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) return nullptr;
+    std::lock_guard lock(gHybmMutex);
     auto& local = hybmEntity(handle);
-    const auto addr = base(handle, type) +
-                      local.config.rank * local.config.hbm_window +
-                      local.cursor;
-    local.cursor += bytes;
+    const auto window = type == kGvaMemoryTypeDevice ? local.config.hbm_window : local.config.dram_window;
+    auto& cursor = local.cursors.at(type - kGvaMemoryTypeDevice);
+    const auto addr = base(handle, type) + local.config.rank * window + cursor;
+    cursor += bytes;
     local.slices.emplace(addr, HybmSlice{bytes, false});
     return reinterpret_cast<void*>(addr);
 }
 
 int MemFabricGvaApi::free(void* handle, void* slice) {
+    std::lock_guard lock(gHybmMutex);
     ++g_hybm->frees;
     hybmEntity(handle).slices.erase(reinterpret_cast<uint64_t>(slice));
     return 0;
@@ -309,6 +319,7 @@ uint64_t MemFabricGvaApi::address(void*, void* slice) {
 }
 
 uint64_t MemFabricGvaApi::size(void* handle, void* slice) {
+    std::lock_guard lock(gHybmMutex);
     return hybmEntity(handle).slices.at(address(handle, slice)).size;
 }
 
@@ -317,9 +328,11 @@ uint64_t MemFabricGvaApi::base(void*, uint32_t type) {
 }
 
 int MemFabricGvaApi::translate(uint64_t addr, uint32_t type, uint64_t& out) {
+    std::lock_guard lock(gHybmMutex);
     if (g_hybm->translate_result) return g_hybm->translate_result;
     auto local = g_hybm_entities.find(g_hybm_device);
-    if (type != kGvaMemoryTypeDevice || local == g_hybm_entities.end())
+    if ((type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) ||
+        local == g_hybm_entities.end())
         return -12;
     const auto& slices = local->second->slices;
     auto slice = slices.upper_bound(addr);
@@ -352,10 +365,12 @@ int MemFabricGvaApi::exportBlob(void* handle, void* slice,
 
 int MemFabricGvaApi::importBlob(void* handle, bool entity_info,
                                 const std::vector<uint8_t>& blob) {
+    std::lock_guard lock(gHybmMutex);
     ++g_hybm->imports;
     if (entity_info) return g_hybm->entity_import_result;
     ++g_hybm->slice_imports;
-    if (g_hybm->slice_import_result) return g_hybm->slice_import_result;
+    const auto result = g_hybm->slice_import_result.load();
+    if (result) return result;
     std::array<uint64_t, 2> data;
     if (blob.size() != sizeof(data)) return -1;
     std::memcpy(data.data(), blob.data(), sizeof(data));
@@ -366,6 +381,7 @@ int MemFabricGvaApi::importBlob(void* handle, bool entity_info,
 int MemFabricGvaApi::map(void*) { return g_hybm->map_result; }
 
 int MemFabricGvaApi::connect(void*, uint32_t) {
+    std::lock_guard lock(gHybmMutex);
     ++g_hybm->connects;
     return g_hybm->connect_result;
 }
@@ -378,15 +394,18 @@ int MemFabricGvaApi::reach(void*, uint32_t, uint32_t& out) {
 int MemFabricGvaApi::remove(void*, uint32_t) { return g_hybm->remove_result; }
 
 int MemFabricGvaApi::unmap(void* handle, uint32_t rank) {
+    std::lock_guard lock(gHybmMutex);
     ++g_hybm->unmaps;
     if (g_hybm->stale_registry) return 0;
     auto& local = hybmEntity(handle);
-    const auto window = local.config.hbm_window;
-    const auto start = base(handle, kGvaMemoryTypeDevice) + rank * window;
-    const auto end = start + window;
+    const auto inWindow = [&](uint64_t address, uint32_t type, uint64_t window) {
+        const auto start = base(handle, type) + rank * window;
+        return address >= start && address - start < window;
+    };
     std::erase_if(local.slices, [&](const auto& entry) {
-        return entry.second.imported && entry.first >= start &&
-               entry.first < end;
+        return entry.second.imported &&
+               (inWindow(entry.first, kGvaMemoryTypeDevice, local.config.hbm_window) ||
+                inWindow(entry.first, kGvaMemoryTypeHost, local.config.dram_window));
     });
     return 0;
 }
@@ -2408,6 +2427,284 @@ TEST_P(MemFabricNetworkGva,
 
 INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
                          ::testing::Values("device_rdma", "device_urma"));
+
+::testing::AssertionResult IsOk(const Status &status)
+{
+    if (status.ok()) {
+        return ::testing::AssertionSuccess();
+    }
+    return ::testing::AssertionFailure() << status.ToString();
+}
+
+uint64_t MockSliceSize(uint16_t device, const void *address)
+{
+    std::lock_guard lock(gHybmMutex);
+    const auto entity = g_hybm_entities.find(device);
+    if (entity == g_hybm_entities.end()) {
+        return 0;
+    }
+    const auto &slices = entity->second->slices;
+    const auto slice = slices.find(reinterpret_cast<uint64_t>(address));
+    return slice == slices.end() ? 0 : slice->second.size;
+}
+
+uint16_t PickLoopbackPort()
+{
+    asio::io_context context;
+    asio::ip::tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    return acceptor.local_endpoint().port();
+}
+
+class MemoryEngineTest : public MemFabricGva {
+protected:
+    static constexpr uint32_t FIRST_RANK = 0;
+    static constexpr uint32_t SECOND_RANK = 1;
+    static constexpr uint32_t WORLD_SIZE = 2;
+    static constexpr uint64_t WINDOW_SIZE = 1ULL << 30;
+    static constexpr size_t REQUEST_SIZE = 4UL << 10;
+    static constexpr int NATIVE_ERROR = -1;
+    static constexpr unsigned RPC_THREADS = 2;
+    static constexpr const char *LOOPBACK = "127.0.0.1";
+
+    void SetUp() override
+    {
+        MemFabricGva::SetUp();
+        ResetAcl();
+        g_device_count = static_cast<int>(WORLD_SIZE);
+        ASSERT_EQ(setenv("MF_PROTOCOL", "device_rdma", 1), 0);
+        mServerUrl = std::string(LOOPBACK) + ":" + std::to_string(PickLoopbackPort());
+        Config config;
+        config.set("memory_engine/server_url", mServerUrl);
+        config.set("memory_engine/server/world_size", WORLD_SIZE);
+        config.set("memory_engine/server/host_mem_max", WINDOW_SIZE);
+        config.set("memory_engine/server/device_mem_max", WINDOW_SIZE);
+        config.set("memory_engine/server/rpc_server_threads", RPC_THREADS);
+        ASSERT_TRUE(IsOk(MemoryEngineServer::Start(config, &mServer)));
+    }
+
+    void TearDown() override
+    {
+        mServer.reset();
+        EXPECT_EQ(unsetenv("MF_PROTOCOL"), 0);
+        ResetAcl();
+        MemFabricGva::TearDown();
+    }
+
+    void ConfigureClient(Config &config, std::optional<uint32_t> rank = std::nullopt) const
+    {
+        config.set("memory_engine/server_url", mServerUrl);
+        config.set("memory_engine/client_host", LOOPBACK);
+        config.set("memory_engine/world_size", WORLD_SIZE);
+        config.set("memory_engine/host_mem_max", WINDOW_SIZE);
+        config.set("memory_engine/device_mem_max", WINDOW_SIZE);
+        config.set("memory_engine/auto_ranking", !rank.has_value());
+        if (rank) {
+            config.set("memory_engine/local_rank", *rank);
+        }
+        config.set("rpc_server_hostname", LOOPBACK);
+        config.set("rpc_server_threads", RPC_THREADS);
+        config.set("log_level", "warning");
+        config.set("transports/rdma/enable", false);
+    }
+
+    Status CreateClient(std::unique_ptr<MemoryEngine> &engine, uint16_t device,
+                        std::optional<uint32_t> rank = std::nullopt) const
+    {
+        CHECK_ASCEND(aclrtSetDevice(static_cast<int>(device)));
+        Config config;
+        ConfigureClient(config, rank);
+        return MemoryEngine::Create(config, &engine);
+    }
+
+private:
+    std::string mServerUrl;
+    std::unique_ptr<MemoryEngineServer> mServer;
+};
+
+TEST_F(MemoryEngineTest, RejectsInvalidOutputsAndClientLayouts)
+{
+    Config config;
+    std::unique_ptr<MemoryEngineServer> server;
+    EXPECT_TRUE(MemoryEngineServer::Start(config, &server).IsInvalidArgument());
+    EXPECT_EQ(server, nullptr);
+
+    std::unique_ptr<MemoryEngine> engine;
+    ConfigureClient(config);
+    EXPECT_TRUE(MemoryEngine::Create(config, nullptr).IsInvalidArgument());
+    config.set("memory_engine/host_mem_max", REQUEST_SIZE);
+    EXPECT_TRUE(MemoryEngine::Create(config, &engine).IsInvalidArgument());
+    EXPECT_EQ(engine, nullptr);
+
+    ConfigureClient(config, WORLD_SIZE);
+    EXPECT_TRUE(MemoryEngine::Create(config, &engine).IsInvalidArgument());
+    EXPECT_EQ(engine, nullptr);
+
+    ConfigureClient(config);
+    config.set("memory_engine/host_mem_max", 0U);
+    EXPECT_TRUE(MemoryEngine::Create(config, &engine).IsInvalidArgument());
+    EXPECT_EQ(engine, nullptr);
+}
+
+TEST_F(MemoryEngineTest, ReservesExplicitAndAutomaticRanksUntilLeave)
+{
+    std::unique_ptr<MemoryEngine> explicitRank, automaticRank, next;
+    ASSERT_TRUE(IsOk(CreateClient(explicitRank, SECOND_RANK, SECOND_RANK)));
+    EXPECT_EQ(explicitRank->GetLocalRank(), SECOND_RANK);
+    EXPECT_TRUE(CreateClient(next, FIRST_RANK, SECOND_RANK).IsInvalidEntry());
+    EXPECT_EQ(next, nullptr);
+
+    ASSERT_TRUE(IsOk(CreateClient(automaticRank, FIRST_RANK)));
+    EXPECT_EQ(automaticRank->GetLocalRank(), FIRST_RANK);
+    EXPECT_TRUE(CreateClient(next, FIRST_RANK).IsTooManyRequests());
+    EXPECT_EQ(next, nullptr);
+
+    ASSERT_TRUE(IsOk(explicitRank->Leave()));
+    ASSERT_TRUE(IsOk(CreateClient(next, SECOND_RANK)));
+    EXPECT_EQ(next->GetLocalRank(), SECOND_RANK);
+}
+
+TEST_F(MemoryEngineTest, FailedCreateReleasesRank)
+{
+    std::unique_ptr<MemoryEngine> engine;
+    fakeHybm().reserve_result = NATIVE_ERROR;
+    EXPECT_FALSE(CreateClient(engine, FIRST_RANK, FIRST_RANK).ok());
+    EXPECT_EQ(engine, nullptr);
+
+    fakeHybm().reserve_result = 0;
+    ASSERT_TRUE(IsOk(CreateClient(engine, FIRST_RANK, FIRST_RANK)));
+    EXPECT_EQ(engine->GetLocalRank(), FIRST_RANK);
+}
+
+TEST_F(MemoryEngineTest, ValidatesAndAllocatesInHostAndDeviceWindows)
+{
+    std::unique_ptr<MemoryEngine> engine;
+    ASSERT_TRUE(IsOk(CreateClient(engine, SECOND_RANK, SECOND_RANK)));
+    void *address = nullptr;
+    EXPECT_TRUE(engine->Allocate(REQUEST_SIZE, MemoryEngineMemType::Host, &address).IsInvalidEntry());
+    EXPECT_TRUE(engine->Free(nullptr).IsInvalidEntry());
+    ASSERT_TRUE(IsOk(engine->Join()));
+    ASSERT_TRUE(IsOk(engine->Join()));
+
+    for (auto type : {MemoryEngineMemType::Host, MemoryEngineMemType::Device}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        void *base = nullptr;
+        ASSERT_TRUE(IsOk(engine->GvaBase(type, SECOND_RANK, &base)));
+        EXPECT_TRUE(engine->GvaBase(type, WORLD_SIZE, &address).IsInvalidArgument());
+        EXPECT_TRUE(engine->Allocate(0, type, &address).IsInvalidArgument());
+        EXPECT_TRUE(engine->Allocate(REQUEST_SIZE, type, nullptr).IsInvalidArgument());
+        EXPECT_TRUE(engine->Allocate(WINDOW_SIZE + REQUEST_SIZE, type, &address).IsTooManyRequests());
+        ASSERT_TRUE(IsOk(engine->Allocate(REQUEST_SIZE, type, &address)));
+        EXPECT_EQ(address, base);
+        EXPECT_EQ(MockSliceSize(SECOND_RANK, address), FakeHybm::kSize);
+
+        uint32_t rank = FIRST_RANK;
+        ASSERT_TRUE(IsOk(engine->RankOfGva(address, &rank)));
+        EXPECT_EQ(rank, SECOND_RANK);
+        const auto interior = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(address) + REQUEST_SIZE);
+        EXPECT_TRUE(engine->Free(interior).IsInvalidArgument());
+        ASSERT_TRUE(IsOk(engine->Free(address)));
+        EXPECT_EQ(MockSliceSize(SECOND_RANK, address), 0U);
+        EXPECT_TRUE(engine->Free(address).IsInvalidArgument());
+    }
+}
+
+TEST_F(MemoryEngineTest, SharesExistingAndNewAllocationsAndDrainsRetiredSlices)
+{
+    std::unique_ptr<MemoryEngine> owner, peer;
+    ASSERT_TRUE(IsOk(CreateClient(owner, FIRST_RANK)));
+    ASSERT_TRUE(IsOk(owner->Join()));
+    void *early = nullptr;
+    ASSERT_TRUE(IsOk(owner->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &early)));
+    ASSERT_TRUE(IsOk(CreateClient(peer, SECOND_RANK)));
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, early), 0U);
+    ASSERT_TRUE(IsOk(peer->Join()));
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, early), FakeHybm::kSize);
+
+    void *late = nullptr;
+    ASSERT_TRUE(IsOk(owner->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &late)));
+    EXPECT_NE(late, early);
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, late), FakeHybm::kSize);
+    EXPECT_TRUE(peer->Free(early).IsInvalidArgument());
+    ASSERT_TRUE(IsOk(owner->Free(early)));
+    EXPECT_EQ(MockSliceSize(FIRST_RANK, early), FakeHybm::kSize);
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, late), FakeHybm::kSize);
+
+    ASSERT_TRUE(IsOk(owner->Free(late)));
+    for (auto *address : {early, late}) {
+        EXPECT_EQ(MockSliceSize(FIRST_RANK, address), 0U);
+        EXPECT_EQ(MockSliceSize(SECOND_RANK, address), 0U);
+    }
+}
+
+TEST_F(MemoryEngineTest, FailedJoinCanRetryWithTheSameRank)
+{
+    std::unique_ptr<MemoryEngine> owner, peer;
+    ASSERT_TRUE(IsOk(CreateClient(owner, FIRST_RANK)));
+    ASSERT_TRUE(IsOk(owner->Join()));
+    void *address = nullptr;
+    ASSERT_TRUE(IsOk(owner->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &address)));
+    ASSERT_TRUE(IsOk(CreateClient(peer, SECOND_RANK)));
+
+    fakeHybm().slice_import_result = NATIVE_ERROR;
+    EXPECT_TRUE(peer->Join().IsInternalError());
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, address), 0U);
+    void *unallocated = nullptr;
+    EXPECT_TRUE(peer->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &unallocated).IsInvalidEntry());
+
+    fakeHybm().slice_import_result = 0;
+    ASSERT_TRUE(IsOk(peer->Join()));
+    EXPECT_EQ(peer->GetLocalRank(), SECOND_RANK);
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, address), FakeHybm::kSize);
+}
+
+TEST_F(MemoryEngineTest, FailedPublishReleasesLocalAllocation)
+{
+    std::unique_ptr<MemoryEngine> owner, peer;
+    ASSERT_TRUE(IsOk(CreateClient(owner, FIRST_RANK)));
+    ASSERT_TRUE(IsOk(owner->Join()));
+    ASSERT_TRUE(IsOk(CreateClient(peer, SECOND_RANK)));
+    ASSERT_TRUE(IsOk(peer->Join()));
+    void *base = nullptr;
+    ASSERT_TRUE(IsOk(owner->GvaBase(MemoryEngineMemType::Device, FIRST_RANK, &base)));
+
+    fakeHybm().slice_import_result = NATIVE_ERROR;
+    void *address = nullptr;
+    EXPECT_TRUE(owner->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &address).IsInternalError());
+    EXPECT_EQ(address, nullptr);
+    EXPECT_EQ(MockSliceSize(FIRST_RANK, base), 0U);
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, base), 0U);
+
+    fakeHybm().slice_import_result = 0;
+    ASSERT_TRUE(IsOk(owner->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &address)));
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, address), FakeHybm::kSize);
+}
+
+TEST_F(MemoryEngineTest, LeaveRevokesLiveAllocationsAndAllowsRejoin)
+{
+    std::unique_ptr<MemoryEngine> owner, peer;
+    ASSERT_TRUE(IsOk(CreateClient(owner, FIRST_RANK, FIRST_RANK)));
+    ASSERT_TRUE(IsOk(CreateClient(peer, SECOND_RANK, SECOND_RANK)));
+    ASSERT_TRUE(IsOk(owner->Join()));
+    ASSERT_TRUE(IsOk(peer->Join()));
+    void *address = nullptr;
+    ASSERT_TRUE(IsOk(owner->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &address)));
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, address), FakeHybm::kSize);
+
+    ASSERT_TRUE(IsOk(owner->Leave()));
+    ASSERT_TRUE(IsOk(owner->Leave()));
+    EXPECT_TRUE(owner->Free(address).IsInvalidEntry());
+    EXPECT_EQ(MockSliceSize(FIRST_RANK, address), 0U);
+    EXPECT_EQ(MockSliceSize(SECOND_RANK, address), 0U);
+
+    void *peerAddress = nullptr;
+    ASSERT_TRUE(IsOk(peer->Allocate(REQUEST_SIZE, MemoryEngineMemType::Device, &peerAddress)));
+    ASSERT_EQ(aclrtSetDevice(static_cast<int>(FIRST_RANK)), ACL_SUCCESS);
+    ASSERT_TRUE(IsOk(owner->Join()));
+    EXPECT_EQ(owner->GetLocalRank(), FIRST_RANK);
+    EXPECT_EQ(MockSliceSize(FIRST_RANK, peerAddress), FakeHybm::kSize);
+    ASSERT_TRUE(IsOk(peer->Free(peerAddress)));
+    EXPECT_EQ(MockSliceSize(FIRST_RANK, peerAddress), 0U);
+}
 
 }  // namespace
 
