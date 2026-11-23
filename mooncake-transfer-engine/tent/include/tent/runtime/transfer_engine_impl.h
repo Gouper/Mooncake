@@ -268,6 +268,7 @@ class TransferEngineImpl {
                        bool load_environment);
 
     Status GetMemFabricGvaBases(uint64_t &host, uint64_t &device) const;
+    Status CloseMemFabricGva();
 
     ~TransferEngineImpl();
 

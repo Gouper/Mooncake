@@ -376,6 +376,11 @@ Status TransferEngineImpl::GetMemFabricGvaBases(uint64_t &host, uint64_t &device
     return Status::NotImplemented("MemFabric GVA transport is unavailable");
 }
 
+Status TransferEngineImpl::CloseMemFabricGva()
+{
+    return transport_list_[MEMFABRIC]->uninstall();
+}
+
 std::string randomSegmentName() {
     std::string name = "segment_noname_";
     for (int i = 0; i < 8; ++i) name += 'a' + SimpleRandom::Get().next(26);

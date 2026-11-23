@@ -24,6 +24,8 @@ class MemoryEngine {
     ~MemoryEngine();
 
     Status Join();
+    // The caller must quiesce any direct access to GVA before leaving.
+    Status Leave();
 
     uint32_t GetLocalRank() const;
     Status GvaBase(MemoryEngineMemType type, uint32_t rank, void **address) const;
