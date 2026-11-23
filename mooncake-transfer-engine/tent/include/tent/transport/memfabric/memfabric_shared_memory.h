@@ -24,8 +24,8 @@ class MemFabricSharedMemory {
     void GetBases(uint64_t &host, uint64_t &device) const;
     std::string GetIdentity() const;
     Status PrepareRank(const std::string &segment, const std::string &identity);
-    Status CloseRank(const std::string &segment);
-    Status Revoke(const std::string &segment, uint64_t address);
+    Status CloseRank(uint32_t rank, const std::string &segment);
+    Status Revoke(uint32_t rank, const std::string &segment, uint64_t address);
     // allocate, map, and prepare use the ACL device bound by the caller.
     Status allocate(void**, size_t, uint32_t memory_type, MemoryOptions&);
     Status free(void*, size_t);
@@ -73,6 +73,7 @@ class MemFabricSharedMemory {
         std::string segment_name, generation;
         Json entity_blob;
         std::map<uint64_t, RemoteSlice> slices;
+        size_t activeSlices = 0;
         bool cleaned = false;
         bool entityImported = false;
     };
@@ -96,6 +97,7 @@ class MemFabricSharedMemory {
     Status importPeer(ImportedRank&, const Json&);
     Status verifyPeerMapping(uint32_t, const RemoteSlice&);
     Status cleanupPeer(uint32_t, ImportedRank&);
+    void Deactivate(ImportedRank &peer, RemoteSlice &slice);
     uint32_t memoryTypeForRange(uint64_t, size_t) const;
     Json makeIdentity() const;
     mutable std::mutex mutex_;

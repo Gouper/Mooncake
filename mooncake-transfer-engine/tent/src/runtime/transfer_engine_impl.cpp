@@ -402,22 +402,27 @@ Status TransferEngineImpl::PrepareMemFabricPeer(const std::string &segment, cons
 #endif
 }
 
-Status TransferEngineImpl::CloseMemFabricPeer(SegmentID id, const std::string &segment)
+Status TransferEngineImpl::CloseMemFabricPeer(SegmentID id, uint32_t rank, const std::string &segment)
 {
 #ifdef USE_MEMFABRIC
-    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->CloseGvaPeer(id, segment);
+    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->CloseGvaPeer(id, rank, segment);
 #else
     static_cast<void>(id);
+    static_cast<void>(rank);
     static_cast<void>(segment);
     return Status::NotImplemented("MemFabric GVA transport is unavailable");
 #endif
 }
 
-Status TransferEngineImpl::RevokeMemFabricRegion(const std::string &segment, uint64_t address)
+Status TransferEngineImpl::RevokeMemFabricRegion(SegmentID id, uint32_t rank, const std::string &segment,
+                                               uint64_t address)
 {
 #ifdef USE_MEMFABRIC
-    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->RevokeGvaRegion(segment, address);
+    auto &transport = static_cast<MemFabricTransport &>(*transport_list_[MEMFABRIC]);
+    return transport.RevokeGvaRegion(id, rank, segment, address);
 #else
+    static_cast<void>(id);
+    static_cast<void>(rank);
     static_cast<void>(segment);
     static_cast<void>(address);
     return Status::NotImplemented("MemFabric GVA transport is unavailable");

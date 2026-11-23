@@ -18,6 +18,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -89,6 +90,7 @@ struct Bases {
 struct Region {
     uint64_t address{};
     size_t size{};
+    bool revoking = false;
 };
 
 enum class MemberState { Pending, Registered, Joining, Joined, Leaving };
@@ -103,6 +105,7 @@ struct Registration {
     std::string identity;
     uint64_t generation{};
     std::map<uint64_t, Region> regions;
+    std::unordered_set<uint64_t> revokedRegions;
     bool leavePrepared = false;
 };
 
@@ -142,18 +145,64 @@ struct LocalRegion {
 
 class Mutation {
    public:
-    explicit Mutation(std::atomic<bool> &busy) : mBusy(busy), mAcquired(!busy.exchange(true)) {}
+    explicit Mutation(std::atomic<uint64_t> &active, bool exclusive = true)
+        : mActive(active), mWeight(exclusive ? EXCLUSIVE : SHARED), mAcquired(Acquire(exclusive))
+    {
+    }
+
     ~Mutation()
     {
         if (mAcquired)
-            mBusy.store(false);
+            mActive.fetch_sub(mWeight, std::memory_order_release);
     }
 
     bool Acquired() const { return mAcquired; }
 
    private:
-    std::atomic<bool> &mBusy;
+    bool Acquire(bool exclusive)
+    {
+        uint64_t active = 0;
+        if (exclusive)
+            return mActive.compare_exchange_strong(active, EXCLUSIVE, std::memory_order_acquire);
+        active = mActive.load(std::memory_order_relaxed);
+        while (active < EXCLUSIVE - SHARED) {
+            if (mActive.compare_exchange_weak(active, active + SHARED, std::memory_order_acquire))
+                return true;
+        }
+        return false;
+    }
+
+    static constexpr uint64_t EXCLUSIVE = 1ULL << 63;
+    static constexpr uint64_t SHARED = 1;
+    std::atomic<uint64_t> &mActive;
+    const uint64_t mWeight;
     const bool mAcquired;
+};
+
+class OwnerMutation {
+   public:
+    OwnerMutation(std::mutex &mutex, std::unordered_set<std::string> &active, const std::string &id)
+        : mMutex(mutex), mActive(active), mId(id)
+    {
+        std::lock_guard lock(mMutex);
+        mAcquired = mActive.insert(id).second;
+    }
+
+    ~OwnerMutation()
+    {
+        if (mAcquired) {
+            std::lock_guard lock(mMutex);
+            mActive.erase(mId);
+        }
+    }
+
+    bool Acquired() const { return mAcquired; }
+
+   private:
+    std::mutex &mMutex;
+    std::unordered_set<std::string> &mActive;
+    const std::string &mId;
+    bool mAcquired{};
 };
 
 struct ClientOptions {
@@ -373,8 +422,10 @@ json ShareRequest(const Registration &target, const Registration &owner, bool ma
 {
     auto regions = json::array();
     if (mapRegions) {
-        for (const auto &[address, region] : owner.regions)
-            regions.push_back({{"address", address}, {"size", region.size}});
+        for (const auto &[address, region] : owner.regions) {
+            if (!region.revoking)
+                regions.push_back({{"address", address}, {"size", region.size}});
+        }
     }
     return {{"id", target.id}, {"rank", owner.rank}, {"segment", owner.segment}, {"regions", std::move(regions)},
             {"identity", owner.identity},
@@ -453,7 +504,8 @@ struct MemoryEngineServer::Impl {
     void Reap();
 
     std::mutex mMutex;
-    std::atomic<bool> mMutating{false};
+    std::atomic<uint64_t> mMutating{0};
+    std::unordered_set<std::string> mUpdatingOwners;
     uint64_t mGeneration{};
     Layout mLayout;
     Layout mConfiguredLayout;
@@ -861,21 +913,29 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const Regi
     const auto now = Clock::now();
     if (found == mRegistrations.end() || found->second.state != MemberState::Joined || found->second.expires <= now)
         return Status::InvalidEntry("MemoryEngine owner is not joined");
-    const auto &owner = found->second;
+    auto &owner = found->second;
     if (!InRankWindow(mBases->host, mLayout.hostWindow, owner.rank, region) &&
         !InRankWindow(mBases->device, mLayout.deviceWindow, owner.rank, region))
         return Status::InvalidArgument("MemoryEngine region lies outside the owner rank window");
 
-    auto existing = owner.regions.find(region.address);
+    const auto existing = owner.regions.find(region.address);
+    if (publish && owner.revokedRegions.contains(region.address))
+        return Status::InvalidEntry("MemoryEngine region was already revoked");
     if (existing != owner.regions.end() && existing->second.size != region.size)
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     if (publish && existing != owner.regions.end())
         return Status::OK();
     if (publish && RegionOverlaps(owner.regions, region))
         return Status::InvalidArgument("MemoryEngine region overlaps an existing allocation");
+    if (!publish) {
+        owner.revokedRegions.insert(region.address);
+        if (existing != owner.regions.end())
+            existing->second.revoking = true;
+    }
 
     for (const auto &[peerId, peer] : mRegistrations) {
-        if (peerId == id || peer.state != MemberState::Joined || (!publish && peer.expires <= now))
+        const bool available = publish ? peer.state == MemberState::Joined : peer.generation && peer.expires > now;
+        if (peerId == id || !available)
             continue;
         calls.push_back({peer.callback, {{"id", peerId}, {"rank", owner.rank}, {"address", region.address},
                                          {"size", region.size}, {"generation", std::max(peer.generation,
@@ -897,13 +957,16 @@ void MemoryEngineServer::Impl::CommitRegion(const std::string &id, const Region 
 
 Status MemoryEngineServer::Impl::UpdateRegion(const json &request, bool publish)
 {
-    Mutation mutation(mMutating);
+    Mutation mutation(mMutating, false);
     if (!mutation.Acquired())
         return Status::TooManyRequests("MemoryEngine region operation in progress");
     Region region;
     if (!ReadRegion(request, region))
         return Status::InvalidArgument("Invalid MemoryEngine region");
     const auto id = request.at("id").get<std::string>();
+    OwnerMutation owner(mMutex, mUpdatingOwners, id);
+    if (!owner.Acquired())
+        return Status::TooManyRequests("MemoryEngine owner region operation in progress");
     std::vector<PeerCall> peers;
     CHECK_STATUS(PrepareRegion(id, region, publish, peers));
     const auto op = publish ? MemoryRpc::MapRegion : MemoryRpc::UnmapRegion;
@@ -966,11 +1029,12 @@ struct MemoryEngine::Impl {
     Status Join();
     Status Leave();
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
+    Status Free(void *address);
     Status DestroyTent();
     Status SharePeer(const json &request);
     Status UnsharePeer(const json &request);
     Status PeerIdentity(const json &request, uint32_t &rank, uint64_t &generation) const;
-    Status UnmapPeer(PeerMapping &peer);
+    Status UnmapPeer(uint32_t rank, PeerMapping &peer);
     Status MapPeerRegions(PeerMapping &peer, const json &regions);
     Status MapPeerRegion(PeerMapping &peer, const Region &region);
     Status UpdatePeerRegion(const json &request, bool map);
@@ -979,6 +1043,8 @@ struct MemoryEngine::Impl {
     Status UpdateLocalRegion(uint64_t address, size_t size, bool publish);
     Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
     Status ReconcileAllocation();
+    Status RetireLocal(uint64_t address, LocalRegion &local);
+    Status DrainRetired(uint64_t requested);
     void StartHeartbeat(Milliseconds interval);
 
     mutable std::mutex mApiMutex;
@@ -998,6 +1064,7 @@ struct MemoryEngine::Impl {
     bool mRegistrationAttempted = false;
     std::unordered_map<uint32_t, PeerMapping> mPeers;
     std::unordered_map<uint64_t, LocalRegion> mLocalRegions;
+    std::unordered_set<uint64_t> mRetired;
     std::optional<uint64_t> mFailedAllocation;
     size_t mLiveRegions{};
     CoroRpcAgent mRpc;
@@ -1130,13 +1197,13 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &request, bool map)
     if (mapped.size != region.size)
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     mapped.revoked = true;
-    return mTent->RevokeMemFabricRegion(peer.segmentName, region.address);
+    return mTent->RevokeMemFabricRegion(peer.segment, rank, peer.segmentName, region.address);
 }
 
-Status MemoryEngine::Impl::UnmapPeer(PeerMapping &peer)
+Status MemoryEngine::Impl::UnmapPeer(uint32_t rank, PeerMapping &peer)
 {
     if (peer.segment != LOCAL_SEGMENT_ID) {
-        CHECK_STATUS(mTent->CloseMemFabricPeer(peer.segment, peer.segmentName));
+        CHECK_STATUS(mTent->CloseMemFabricPeer(peer.segment, rank, peer.segmentName));
         CHECK_STATUS(mTent->closeSegment(peer.segment));
         peer.segment = LOCAL_SEGMENT_ID;
     }
@@ -1158,7 +1225,7 @@ Status MemoryEngine::Impl::SharePeer(const json &request)
     if (peer.generation > generation || (peer.generation == generation && peer.revoked))
         return Status::InvalidEntry("MemoryEngine peer generation was replaced or revoked");
     if (peer.generation < generation) {
-        CHECK_STATUS(UnmapPeer(peer));
+        CHECK_STATUS(UnmapPeer(rank, peer));
         peer.generation = generation;
         peer.revoked = false;
     }
@@ -1187,7 +1254,7 @@ Status MemoryEngine::Impl::UnsharePeer(const json &request)
         return Status::OK();
     peer.generation = generation;
     peer.revoked = true;
-    return UnmapPeer(peer);
+    return UnmapPeer(rank, peer);
 }
 
 Status MemoryEngine::Impl::Join()
@@ -1274,6 +1341,7 @@ Status MemoryEngine::Impl::ReconcileAllocation()
         mLocalRegions.erase(*mFailedAllocation);
     } else {
         local.state = RegionState::Retired;
+        mRetired.insert(*mFailedAllocation);
     }
     mFailedAllocation.reset();
     return Status::OK();
@@ -1291,6 +1359,7 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
         return Status::TooManyRequests("MemoryEngine allocation exceeds the rank window");
     const auto aligned = ((size - 1) / ALLOCATION_ALIGNMENT + 1) * ALLOCATION_ALIGNMENT;
     CHECK_STATUS(ReconcileAllocation());
+    CHECK_STATUS(DrainRetired(0));
     CHECK_STATUS(PrepareNativePeers());
 
     uint64_t allocated{};
@@ -1311,6 +1380,55 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
     return Status::OK();
 }
 
+Status MemoryEngine::Impl::RetireLocal(uint64_t address, LocalRegion &local)
+{
+    local.state = RegionState::Revoking;
+    CHECK_STATUS(UpdateLocalRegion(address, local.size, false));
+    CHECK_STATUS(ReleaseLocal(address, local, false));
+    local.state = RegionState::Retired;
+    mRetired.insert(address);
+    --mLiveRegions;
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::DrainRetired(uint64_t requested)
+{
+    // HYBM unmaps an imported rank as a unit. Its revoked slices can still
+    // have native mappings until peers revoke the last live slice.
+    if (mLiveRegions || mFailedAllocation)
+        return Status::OK();
+    Status result;
+    for (auto it = mRetired.begin(); it != mRetired.end();) {
+        auto local = mLocalRegions.find(*it);
+        auto status = ReleaseLocal(local->first, local->second, true);
+        if (status.ok()) {
+            mLocalRegions.erase(local);
+            it = mRetired.erase(it);
+        } else {
+            if (*it == requested)
+                result = status;
+            LOG(WARNING) << "Failed to release retired MemoryEngine allocation, rank:" << mRank << ".";
+            ++it;
+        }
+    }
+    return result;
+}
+
+Status MemoryEngine::Impl::Free(void *address)
+{
+    std::lock_guard lock(mApiMutex);
+    if (!mJoined)
+        return Status::InvalidEntry("Join MemoryEngine before freeing");
+    const auto key = reinterpret_cast<uint64_t>(address);
+    const auto found = mLocalRegions.find(key);
+    if (found == mLocalRegions.end() || mFailedAllocation == key)
+        return Status::InvalidArgument("MemoryEngine requires an owned allocation base");
+    auto &local = found->second;
+    if (local.state != RegionState::Retired)
+        CHECK_STATUS(RetireLocal(key, local));
+    return DrainRetired(key);
+}
+
 Status MemoryEngine::Impl::DestroyTent()
 {
     std::lock_guard lock(mPeerMutex);
@@ -1318,7 +1436,7 @@ Status MemoryEngine::Impl::DestroyTent()
         return Status::OK();
     for (auto &[rank, peer] : mPeers) {
         peer.revoked = true;
-        auto status = UnmapPeer(peer);
+        auto status = UnmapPeer(rank, peer);
         if (!status.ok()) {
             LOG(WARNING) << "Failed to remove MemoryEngine peer during leave, rank:" << rank << ".";
             return status;
@@ -1329,6 +1447,7 @@ Status MemoryEngine::Impl::DestroyTent()
         it = mLocalRegions.erase(it);
     }
     mFailedAllocation.reset();
+    mRetired.clear();
     mLiveRegions = 0;
     CHECK_STATUS(mTent->CloseMemFabricGva());
     mTent.reset();
@@ -1496,6 +1615,11 @@ Status MemoryEngine::Leave()
 Status MemoryEngine::Allocate(size_t size, MemoryEngineMemType type, void **address)
 {
     return mImpl->Allocate(size, type, address);
+}
+
+Status MemoryEngine::Free(void *address)
+{
+    return mImpl->Free(address);
 }
 
 Status MemoryEngine::GvaBase(MemoryEngineMemType type, uint32_t rank, void **address) const

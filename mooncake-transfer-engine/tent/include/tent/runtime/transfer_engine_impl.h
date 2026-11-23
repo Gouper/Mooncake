@@ -271,9 +271,9 @@ class TransferEngineImpl {
     Status CloseMemFabricGva();
     Status GetMemFabricGvaIdentity(std::string &identity) const;
     Status PrepareMemFabricPeer(const std::string &segment, const std::string &identity);
-    Status CloseMemFabricPeer(SegmentID id, const std::string &segment);
+    Status CloseMemFabricPeer(SegmentID id, uint32_t rank, const std::string &segment);
     Status MapMemFabricRegion(SegmentID id, void *address, size_t size);
-    Status RevokeMemFabricRegion(const std::string &segment, uint64_t address);
+    Status RevokeMemFabricRegion(SegmentID id, uint32_t rank, const std::string &segment, uint64_t address);
 
     ~TransferEngineImpl();
 

@@ -122,20 +122,23 @@ Status MemFabricTransport::PrepareGvaPeer(const std::string &segment, const std:
     return gva_->PrepareRank(segment, identity);
 }
 
-Status MemFabricTransport::CloseGvaPeer(SegmentID id, const std::string &segment)
+Status MemFabricTransport::CloseGvaPeer(SegmentID id, uint32_t rank, const std::string &segment)
 {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    CHECK_STATUS(gva_->CloseRank(segment));
+    CHECK_STATUS(gva_->CloseRank(rank, segment));
     auto it = gva_remote_.lower_bound({id, 0});
     while (it != gva_remote_.end() && it->first.first == id)
         it = gva_remote_.erase(it);
     return Status::OK();
 }
 
-Status MemFabricTransport::RevokeGvaRegion(const std::string &segment, uint64_t address)
+Status MemFabricTransport::RevokeGvaRegion(SegmentID id, uint32_t rank, const std::string &segment,
+                                           uint64_t address)
 {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    return gva_->Revoke(segment, address);
+    CHECK_STATUS(gva_->Revoke(rank, segment, address));
+    gva_remote_.erase({id, address});
+    return Status::OK();
 }
 
 bool MemFabricTransport::warmupMemory(void*, size_t) {

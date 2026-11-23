@@ -178,39 +178,34 @@ Status MemFabricSharedMemory::PrepareRank(const std::string &segment, const std:
     return ImportIdentity(identity.at("rank").get<uint32_t>(), identity);
 }
 
-Status MemFabricSharedMemory::CloseRank(const std::string &segment)
+Status MemFabricSharedMemory::CloseRank(uint32_t rank, const std::string &segment)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
-    for (auto &[rank, peer] : imported_ranks_) {
-        if (peer.segment_name == segment) {
-            for (auto &entry : peer.slices)
-                entry.second.active = false;
-            return cleanupPeer(rank, peer);
-        }
-    }
-    return Status::OK();
+    const auto found = imported_ranks_.find(rank);
+    if (found == imported_ranks_.end() || found->second.segment_name != segment)
+        return Status::OK();
+    auto &peer = found->second;
+    for (auto &entry : peer.slices)
+        entry.second.active = false;
+    peer.activeSlices = 0;
+    return cleanupPeer(rank, peer);
 }
 
-Status MemFabricSharedMemory::Revoke(const std::string &segment, uint64_t address)
+Status MemFabricSharedMemory::Revoke(uint32_t rank, const std::string &segment, uint64_t address)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_copies_ || copy_failed_)
         return pending("GVA copies retain resources");
-    for (auto &[rank, peer] : imported_ranks_) {
-        if (peer.segment_name != segment || peer.cleaned)
-            continue;
-        const auto slice = peer.slices.find(address);
-        if (slice != peer.slices.end())
-            slice->second.active = false;
-        for (const auto &entry : peer.slices) {
-            if (entry.second.active)
-                return Status::OK();
-        }
-        return cleanupPeer(rank, peer);
-    }
-    return Status::OK();
+    const auto found = imported_ranks_.find(rank);
+    if (found == imported_ranks_.end() || found->second.segment_name != segment || found->second.cleaned)
+        return Status::OK();
+    auto &peer = found->second;
+    const auto slice = peer.slices.find(address);
+    if (slice != peer.slices.end())
+        Deactivate(peer, slice->second);
+    return peer.activeSlices ? Status::OK() : cleanupPeer(rank, peer);
 }
 
 void MemFabricSharedMemory::destroyEntity() {
@@ -692,7 +687,7 @@ Status MemFabricSharedMemory::importBundle(uint32_t rank, const Json &descriptor
     CHECK_STATUS(ImportIdentity(rank, requested));
     auto &peer = imported_ranks_.at(rank);
     auto &slice = recordSlice(peer, requested);
-    slice.active = false;
+    Deactivate(peer, slice);
     for (const auto& desc : descriptors) {
         CHECK_STATUS(importPeer(peer, desc));
     }
@@ -710,13 +705,12 @@ Status MemFabricSharedMemory::importBundle(uint32_t rank, const Json &descriptor
     }
     slice.publication = requested.dump();
     slice.active = true;
+    ++peer.activeSlices;
     return Status::OK();
 }
 Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, ImportedRank& peer) {
     if (peer.cleaned) return Status::OK();
-    for (const auto& [base, slice] : peer.slices) {
-        if (slice.active) return pending("another allocation is active");
-    }
+    if (peer.activeSlices) return pending("another allocation is active");
     CHECK_STATUS(bindDevice());
     auto ret = MemFabricGvaApi::remove(entity_, rank);
     if (ret) return pending("remove imported rank", ret);
@@ -737,6 +731,14 @@ Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, ImportedRank& peer) {
     peer.cleaned = true;
     return Status::OK();
 }
+void MemFabricSharedMemory::Deactivate(ImportedRank &peer, RemoteSlice &slice)
+{
+    if (slice.active) {
+        slice.active = false;
+        --peer.activeSlices;
+    }
+}
+
 Status MemFabricSharedMemory::unmap(const std::string& peer_segment_name,
                                     uint64_t address) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -747,7 +749,7 @@ Status MemFabricSharedMemory::unmap(const std::string& peer_segment_name,
         if (peer.segment_name != peer_segment_name) continue;
         auto slice = peer.slices.find(address);
         if (slice == peer.slices.end()) continue;
-        slice->second.active = false;
+        Deactivate(peer, slice->second);
         return cleanupPeer(rank, peer);
     }
     return Status::InvalidArgument("Unknown GVA mapping");
