@@ -87,7 +87,7 @@ struct Bases {
     bool operator==(const Bases &) const = default;
 };
 
-struct Region {
+struct GvaRegion {
     uint64_t address{};
     size_t size{};
     bool revoking = false;
@@ -101,11 +101,11 @@ struct Registration {
     std::string callback;
     Clock::time_point expires;
     MemberState state{MemberState::Pending};
-    std::string segment;
-    std::string identity;
+    std::string segment{};
+    std::string identity{};
     uint64_t generation{};
-    std::map<uint64_t, Region> regions;
-    std::unordered_set<uint64_t> revokedRegions;
+    std::map<uint64_t, GvaRegion> regions{};
+    std::unordered_set<uint64_t> revokedRegions{};
     bool leavePrepared = false;
 };
 
@@ -438,7 +438,7 @@ PeerCall UnshareRequest(const Registration &target, const Registration &owner)
                               {"generation", std::max(target.generation, owner.generation)}}};
 }
 
-bool ReadRegion(const json &payload, Region &region)
+bool ReadRegion(const json &payload, GvaRegion &region)
 {
     const auto address = ReadUnsigned(payload.at("address"), UINT64_MAX);
     const auto size = ReadUnsigned(payload.at("size"), std::numeric_limits<size_t>::max());
@@ -448,14 +448,14 @@ bool ReadRegion(const json &payload, Region &region)
     return true;
 }
 
-bool InRankWindow(uint64_t base, uint64_t window, uint32_t rank, const Region &region)
+bool InRankWindow(uint64_t base, uint64_t window, uint32_t rank, const GvaRegion &region)
 {
     const auto start = base + rank * window;
     return window && region.address >= start && region.address - start < window &&
            region.size <= window - (region.address - start);
 }
 
-bool RegionOverlaps(const std::map<uint64_t, Region> &regions, const Region &region)
+bool RegionOverlaps(const std::map<uint64_t, GvaRegion> &regions, const GvaRegion &region)
 {
     const auto next = regions.lower_bound(region.address);
     if (next != regions.end() && next->first - region.address < region.size)
@@ -496,8 +496,8 @@ struct MemoryEngineServer::Impl {
     Status FinishLeave(const std::string &id);
     Status PrepareLeave(const std::string &id, std::vector<PeerCall> &calls);
     Status UpdateRegion(const json &request, bool publish);
-    Status PrepareRegion(const std::string &id, const Region &region, bool publish, std::vector<PeerCall> &calls);
-    void CommitRegion(const std::string &id, const Region &region, bool publish);
+    Status PrepareRegion(const std::string &id, const GvaRegion &region, bool publish, std::vector<PeerCall> &calls);
+    void CommitRegion(const std::string &id, const GvaRegion &region, bool publish);
     Status ClaimRank(std::optional<uint32_t> requested, uint32_t &rank);
     void ReleaseRank(uint32_t rank);
     void ResetUnconfirmedLayout();
@@ -905,7 +905,7 @@ Status MemoryEngineServer::Impl::Join(const json &request)
     return cleanup.ok() ? status : cleanup;
 }
 
-Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const Region &region, bool publish,
+Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaRegion &region, bool publish,
                                                std::vector<PeerCall> &calls)
 {
     std::lock_guard lock(mMutex);
@@ -944,7 +944,7 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const Regi
     return Status::OK();
 }
 
-void MemoryEngineServer::Impl::CommitRegion(const std::string &id, const Region &region, bool publish)
+void MemoryEngineServer::Impl::CommitRegion(const std::string &id, const GvaRegion &region, bool publish)
 {
     std::lock_guard lock(mMutex);
     auto &regions = mRegistrations.at(id).regions;
@@ -960,7 +960,7 @@ Status MemoryEngineServer::Impl::UpdateRegion(const json &request, bool publish)
     Mutation mutation(mMutating, false);
     if (!mutation.Acquired())
         return Status::TooManyRequests("MemoryEngine region operation in progress");
-    Region region;
+    GvaRegion region;
     if (!ReadRegion(request, region))
         return Status::InvalidArgument("Invalid MemoryEngine region");
     const auto id = request.at("id").get<std::string>();
@@ -1036,7 +1036,7 @@ struct MemoryEngine::Impl {
     Status PeerIdentity(const json &request, uint32_t &rank, uint64_t &generation) const;
     Status UnmapPeer(uint32_t rank, PeerMapping &peer);
     Status MapPeerRegions(PeerMapping &peer, const json &regions);
-    Status MapPeerRegion(PeerMapping &peer, const Region &region);
+    Status MapPeerRegion(PeerMapping &peer, const GvaRegion &region);
     Status UpdatePeerRegion(const json &request, bool map);
     Status PrepareNativePeers();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, uint64_t &address);
@@ -1157,7 +1157,7 @@ Status MemoryEngine::Impl::PeerIdentity(const json &request, uint32_t &rank, uin
 Status MemoryEngine::Impl::MapPeerRegions(PeerMapping &peer, const json &regions)
 {
     for (const auto &entry : regions) {
-        Region region;
+        GvaRegion region;
         if (!ReadRegion(entry, region))
             return Status::InvalidArgument("Invalid MemoryEngine mapped region");
         CHECK_STATUS(MapPeerRegion(peer, region));
@@ -1165,7 +1165,7 @@ Status MemoryEngine::Impl::MapPeerRegions(PeerMapping &peer, const json &regions
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::MapPeerRegion(PeerMapping &peer, const Region &region)
+Status MemoryEngine::Impl::MapPeerRegion(PeerMapping &peer, const GvaRegion &region)
 {
     auto &mapped = peer.regions.try_emplace(region.address, RemoteRegion{region.size}).first->second;
     if (mapped.revoked || mapped.size != region.size)
@@ -1187,7 +1187,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &request, bool map)
     if (!mTent || found == mPeers.end() || found->second.revoked || found->second.generation != generation)
         return map ? Status::InvalidEntry("MemoryEngine peer relationship is not current") : Status::OK();
 
-    Region region;
+    GvaRegion region;
     if (!ReadRegion(request, region))
         return Status::InvalidArgument("Invalid MemoryEngine peer region");
     auto &peer = found->second;
