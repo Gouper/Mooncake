@@ -262,6 +262,14 @@ bool rpcFunctionWasNotFound(coro_rpc::errc ec, std::string_view message,
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     std::string server_addr, int func_id, std::string request,
     bool retry_rpc_error_once) {
+    return CallBefore(std::move(server_addr), func_id, std::move(request),
+                      std::chrono::steady_clock::time_point::max(), retry_rpc_error_once);
+}
+
+Lazy<std::pair<Status, std::string>> CoroRpcAgent::CallBefore(
+    std::string server_addr, int func_id, std::string request,
+    std::chrono::steady_clock::time_point deadline, bool retry_rpc_error_once)
+{
     if (tl_inside_rpc_handler) {
         co_return std::make_pair(
             Status::InvalidArgument(
@@ -270,6 +278,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     }
 
     const int max_attempts = retry_rpc_error_once ? 2 : 1;
+    const bool bounded = deadline != std::chrono::steady_clock::time_point::max();
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         auto pool = getOrCreatePool(server_addr);
         auto acquired = pool->acquire();
@@ -280,7 +289,13 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         if (!lease.client) {
             lease.client = std::make_unique<coro_rpc_client>(
                 GetTransferEngineRpcClientIoContextPool().get_executor());
-            auto conn_result = co_await lease.client->connect(server_addr);
+            const auto budget = deadline - std::chrono::steady_clock::now();
+            if (bounded && budget <= std::chrono::steady_clock::duration::zero()) {
+                lease.broken = true;
+                co_return std::make_pair(Status::TimedOut("RPC connection deadline expired"), "");
+            }
+            auto connect = bounded ? lease.client->connect(server_addr, budget) : lease.client->connect(server_addr);
+            auto conn_result = co_await std::move(connect);
             if (conn_result.val() != 0) {
                 lease.broken = true;
                 auto msg =
@@ -295,8 +310,14 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 
         lease->set_req_attachment(request);
 
-        auto call_result =
-            co_await lease->call<&CoroRpcAgent::process>(func_id);
+        const auto budget = deadline - std::chrono::steady_clock::now();
+        if (bounded && budget <= std::chrono::steady_clock::duration::zero())
+            co_return std::make_pair(Status::TimedOut("RPC request deadline expired"), "");
+        auto request_call = bounded
+                                ? lease->call_for<&CoroRpcAgent::process>(
+                                      std::chrono::ceil<std::chrono::milliseconds>(budget), func_id)
+                                : lease->call<&CoroRpcAgent::process>(func_id);
+        auto call_result = co_await std::move(request_call);
 
         if (!call_result.has_value()) {
             lease.broken = true;

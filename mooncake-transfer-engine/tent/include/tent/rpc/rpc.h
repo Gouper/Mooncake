@@ -16,6 +16,7 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <functional>
@@ -112,6 +113,10 @@ class CoroRpcAgent {
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
         std::string server_addr, int func_id, std::string request,
         bool retry_rpc_error_once = false);
+
+    async_simple::coro::Lazy<std::pair<Status, std::string>> CallBefore(
+        std::string server_addr, int func_id, std::string request,
+        std::chrono::steady_clock::time_point deadline, bool retry_rpc_error_once = false);
 
    private:
     Status StartListener(const std::string &host, uint16_t port, size_t threads);

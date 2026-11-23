@@ -23,6 +23,8 @@ class MemoryEngine {
     static Status Create(std::unique_ptr<MemoryEngine> *engine);
     ~MemoryEngine();
 
+    Status Join();
+
     uint32_t GetLocalRank() const;
     Status GvaBase(MemoryEngineMemType type, uint32_t rank, void **address) const;
     Status RankOfGva(const void *address, uint32_t *rank) const;

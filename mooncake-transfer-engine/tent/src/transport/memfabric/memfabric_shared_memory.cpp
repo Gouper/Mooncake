@@ -514,6 +514,7 @@ Status MemFabricSharedMemory::mapOrPrepare(const std::string& peer_segment_name,
         return Status::NotImplemented(
             "Network GVA does not provide a direct device mapping");
     }
+    CHECK_STATUS(bindDevice());
     if (descriptor.size() > (16U << 20)) {
         return Status::InvalidArgument("GVA descriptor bundle exceeds 16 MiB");
     }
