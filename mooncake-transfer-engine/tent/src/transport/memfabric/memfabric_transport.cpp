@@ -107,6 +107,37 @@ Status MemFabricTransport::GetGvaBases(uint64_t &host, uint64_t &device) const
     return Status::OK();
 }
 
+Status MemFabricTransport::GetGvaIdentity(std::string &identity) const
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (!gva_ || stopping_)
+        return Status::NotImplemented("MemFabric GVA is unavailable");
+    identity = gva_->GetIdentity();
+    return Status::OK();
+}
+
+Status MemFabricTransport::PrepareGvaPeer(const std::string &segment, const std::string &identity)
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    return gva_->PrepareRank(segment, identity);
+}
+
+Status MemFabricTransport::CloseGvaPeer(SegmentID id, const std::string &segment)
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    CHECK_STATUS(gva_->CloseRank(segment));
+    auto it = gva_remote_.lower_bound({id, 0});
+    while (it != gva_remote_.end() && it->first.first == id)
+        it = gva_remote_.erase(it);
+    return Status::OK();
+}
+
+Status MemFabricTransport::RevokeGvaRegion(const std::string &segment, uint64_t address)
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    return gva_->Revoke(segment, address);
+}
+
 bool MemFabricTransport::warmupMemory(void*, size_t) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     // GVA NPU mappings must not be prefaulted as CPU pages.
@@ -145,6 +176,16 @@ Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
 }
 Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
                                            size_t size) {
+    return MapGva(id, addr, size, true);
+}
+
+Status MemFabricTransport::MapGvaRegion(SegmentID id, void *addr, size_t size)
+{
+    return MapGva(id, addr, size, false);
+}
+
+Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool includeBundle)
+{
     std::shared_ptr<MemFabricSharedMemory> context;
     std::shared_ptr<ControlService> metadata;
     {
@@ -156,7 +197,12 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
         metadata = metadata_;
     }
     SegmentDescRef segment;
-    CHECK_STATUS(metadata->segmentManager().getRemoteCached(segment, id));
+    CHECK_STATUS(metadata->segmentManager().withCachedSegment(id, segment, [&](SegmentDesc *current) {
+        auto *buffer = current->findBuffer(reinterpret_cast<uint64_t>(addr), size);
+        if (!buffer)
+            return Status::NeedsRefreshCache("MemFabric GVA region has not been published");
+        return Status::OK();
+    }));
     auto* buffer = segment->findBuffer(reinterpret_cast<uint64_t>(addr), size);
     if (!buffer || buffer->addr != reinterpret_cast<uint64_t>(addr)) {
         return Status::InvalidArgument("GVA map requires published slice base");
@@ -166,6 +212,8 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
     }
     nlohmann::json bundle = nlohmann::json::array();
     for (const auto& candidate : segment->getMemory().buffers) {
+        if (!includeBundle && &candidate != buffer)
+            continue;
         const auto* attribute = findGvaDescriptor(candidate);
         if (!attribute) continue;
         try {

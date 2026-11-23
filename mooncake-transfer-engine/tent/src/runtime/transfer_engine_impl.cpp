@@ -381,6 +381,61 @@ Status TransferEngineImpl::CloseMemFabricGva()
     return transport_list_[MEMFABRIC]->uninstall();
 }
 
+Status TransferEngineImpl::GetMemFabricGvaIdentity(std::string &identity) const
+{
+#ifdef USE_MEMFABRIC
+    return static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get())->GetGvaIdentity(identity);
+#else
+    static_cast<void>(identity);
+    return Status::NotImplemented("MemFabric GVA transport is unavailable");
+#endif
+}
+
+Status TransferEngineImpl::PrepareMemFabricPeer(const std::string &segment, const std::string &identity)
+{
+#ifdef USE_MEMFABRIC
+    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->PrepareGvaPeer(segment, identity);
+#else
+    static_cast<void>(segment);
+    static_cast<void>(identity);
+    return Status::NotImplemented("MemFabric GVA transport is unavailable");
+#endif
+}
+
+Status TransferEngineImpl::CloseMemFabricPeer(SegmentID id, const std::string &segment)
+{
+#ifdef USE_MEMFABRIC
+    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->CloseGvaPeer(id, segment);
+#else
+    static_cast<void>(id);
+    static_cast<void>(segment);
+    return Status::NotImplemented("MemFabric GVA transport is unavailable");
+#endif
+}
+
+Status TransferEngineImpl::RevokeMemFabricRegion(const std::string &segment, uint64_t address)
+{
+#ifdef USE_MEMFABRIC
+    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->RevokeGvaRegion(segment, address);
+#else
+    static_cast<void>(segment);
+    static_cast<void>(address);
+    return Status::NotImplemented("MemFabric GVA transport is unavailable");
+#endif
+}
+
+Status TransferEngineImpl::MapMemFabricRegion(SegmentID id, void *address, size_t size)
+{
+#ifdef USE_MEMFABRIC
+    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->MapGvaRegion(id, address, size);
+#else
+    static_cast<void>(id);
+    static_cast<void>(address);
+    static_cast<void>(size);
+    return Status::NotImplemented("MemFabric GVA transport is unavailable");
+#endif
+}
+
 std::string randomSegmentName() {
     std::string name = "segment_noname_";
     for (int i = 0; i < 8; ++i) name += 'a' + SimpleRandom::Get().next(26);

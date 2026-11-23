@@ -4,6 +4,7 @@
 #ifndef TENT_MEMORY_ENGINE_H
 #define TENT_MEMORY_ENGINE_H
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -26,6 +27,7 @@ class MemoryEngine {
     Status Join();
     // The caller must quiesce any direct access to GVA before leaving.
     Status Leave();
+    Status Allocate(size_t size, MemoryEngineMemType type, void **address);
 
     uint32_t GetLocalRank() const;
     Status GvaBase(MemoryEngineMemType type, uint32_t rank, void **address) const;
