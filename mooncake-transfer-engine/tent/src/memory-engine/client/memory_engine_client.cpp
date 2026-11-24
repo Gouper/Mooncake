@@ -277,7 +277,7 @@ struct MemoryEngine::Impl {
     uint32_t mRank{};
     std::string mServer;
     std::string mId;
-    std::string mCallback;
+    std::string mCallbackAddress;
     bool mJoined = false;
     bool mLeaving = false;
     bool mReady = false;
@@ -334,7 +334,7 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
     }, true));
     uint16_t port{};
     CHECK_STATUS(mRpc.start(port, ipv6));
-    mCallback = buildIpAddrWithPort(host, port, ipv6);
+    mCallbackAddress = buildIpAddrWithPort(host, port, ipv6);
     return Status::OK();
 }
 
@@ -346,7 +346,7 @@ Status MemoryEngine::Impl::Register()
         mPeers.clear();
     }
     json request{{"id", mId}, {"worldSize", mLayout.worldSize}, {"hostWindow", mLayout.hostWindow},
-                 {"deviceWindow", mLayout.deviceWindow}, {"callback", mCallback}};
+                 {"deviceWindow", mLayout.deviceWindow}, {"callback", mCallbackAddress}};
     if (mOptions.requestedRank) {
         request["rank"] = *mOptions.requestedRank;
     }
