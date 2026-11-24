@@ -281,8 +281,9 @@ Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &end
     }
 
     CHECK_STATUS(RegisterRpcHandlers());
-    CHECK_STATUS(checkLocalIpAddress(endpoint.host, endpoint.ipv6));
-    CHECK_STATUS(mRpc.StartAt(endpoint.host, endpoint.port, static_cast<size_t>(*threads)));
+    auto listener = endpoint;
+    CHECK_STATUS(checkLocalIpAddress(listener.host, listener.ipv6));
+    CHECK_STATUS(mRpc.StartAt(listener.host, listener.port, static_cast<size_t>(*threads)));
     mReaper = std::jthread([this](std::stop_token stop) { RunPeriodic(stop, REAP_INTERVAL, [this] { Reap(); }); });
     return Status::OK();
 }
