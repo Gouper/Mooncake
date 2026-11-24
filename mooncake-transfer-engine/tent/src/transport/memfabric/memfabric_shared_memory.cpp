@@ -181,14 +181,17 @@ Status MemFabricSharedMemory::PrepareRank(const std::string &segment, const std:
 Status MemFabricSharedMemory::CloseRank(uint32_t rank, const std::string &segment)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (pending_copies_ || copy_failed_)
+    if (pending_copies_ || copy_failed_) {
         return pending("GVA copies retain resources");
+    }
     const auto found = imported_ranks_.find(rank);
-    if (found == imported_ranks_.end() || found->second.segment_name != segment)
+    if (found == imported_ranks_.end() || found->second.segment_name != segment) {
         return Status::OK();
+    }
     auto &peer = found->second;
-    for (auto &entry : peer.slices)
+    for (auto &entry : peer.slices) {
         entry.second.active = false;
+    }
     peer.activeSlices = 0;
     return cleanupPeer(rank, peer);
 }
@@ -196,15 +199,18 @@ Status MemFabricSharedMemory::CloseRank(uint32_t rank, const std::string &segmen
 Status MemFabricSharedMemory::Revoke(uint32_t rank, const std::string &segment, uint64_t address)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (pending_copies_ || copy_failed_)
+    if (pending_copies_ || copy_failed_) {
         return pending("GVA copies retain resources");
+    }
     const auto found = imported_ranks_.find(rank);
-    if (found == imported_ranks_.end() || found->second.segment_name != segment || found->second.cleaned)
+    if (found == imported_ranks_.end() || found->second.segment_name != segment || found->second.cleaned) {
         return Status::OK();
+    }
     auto &peer = found->second;
     const auto slice = peer.slices.find(address);
-    if (slice != peer.slices.end())
+    if (slice != peer.slices.end()) {
         Deactivate(peer, slice->second);
+    }
     return peer.activeSlices ? Status::OK() : cleanupPeer(rank, peer);
 }
 
@@ -390,13 +396,12 @@ Status MemFabricSharedMemory::free(void* ptr, size_t size) {
     slices_.erase(slice);
     return Status::OK();
 }
-Status MemFabricSharedMemory::ValidateIdentity(const Json &descriptor, const std::string &peer_segment_name) const
+Status MemFabricSharedMemory::ValidateIdentity(const Json &descriptor, const std::string &peerSegmentName) const
 {
     if (!descriptor.is_object()) {
         return Status::InvalidArgument("GVA descriptor must be a JSON object");
     }
-    for (const char* key :
-         {"rank", "ranks", "hbm_window", "dram_window", "hbm_size", "dram_size"}) {
+    for (const char *key : {"rank", "ranks", "hbm_window", "dram_window", "hbm_size", "dram_size"}) {
         auto field = descriptor.find(key);
         if (field == descriptor.end()) {
             return invalidDescriptorField(key, "is missing");
@@ -405,8 +410,7 @@ Status MemFabricSharedMemory::ValidateIdentity(const Json &descriptor, const std
             return invalidDescriptorField(key, "must be an unsigned integer");
         }
     }
-    for (const char* key :
-         {"address_mode", "protocol", "segment_name", "generation"}) {
+    for (const char *key : {"address_mode", "protocol", "segment_name", "generation"}) {
         auto field = descriptor.find(key);
         if (field == descriptor.end()) {
             return invalidDescriptorField(key, "is missing");
@@ -415,19 +419,18 @@ Status MemFabricSharedMemory::ValidateIdentity(const Json &descriptor, const std
             return invalidDescriptorField(key, "must be a string");
         }
     }
-    if (peer_segment_name.empty()) {
+    if (peerSegmentName.empty()) {
         return invalidDescriptorField("segment_name",
                                       "has no expected segment name");
     }
     const std::pair<const char*, std::string_view> identity[] = {
         {"address_mode", "identity"},
         {"protocol", config_.protocol},
-        {"segment_name", peer_segment_name},
+        {"segment_name", peerSegmentName},
     };
-    for (const auto& [key, expected] : identity) {
-        if (descriptor.at(key).get_ref<const std::string&>() != expected) {
-            return invalidDescriptorField(key,
-                                          "does not match the expected value");
+    for (const auto &[key, expected] : identity) {
+        if (descriptor.at(key).get_ref<const std::string &>() != expected) {
+            return invalidDescriptorField(key, "does not match the expected value");
         }
     }
     const std::pair<const char*, uint64_t> layout[] = {
@@ -437,10 +440,9 @@ Status MemFabricSharedMemory::ValidateIdentity(const Json &descriptor, const std
         {"hbm_size", config_.hbm_size},
         {"dram_size", config_.dram_size},
     };
-    for (const auto& [key, expected] : layout) {
+    for (const auto &[key, expected] : layout) {
         if (descriptor.at(key).get<uint64_t>() != expected) {
-            return invalidDescriptorField(key,
-                                          "does not match the local layout");
+            return invalidDescriptorField(key, "does not match the local layout");
         }
     }
     const auto rank = descriptor.at("rank").get<uint64_t>();
@@ -448,18 +450,20 @@ Status MemFabricSharedMemory::ValidateIdentity(const Json &descriptor, const std
         return invalidDescriptorField("rank", "is outside the peer ranks");
     }
     const auto blob = descriptor.find("entity_blob");
-    if (blob == descriptor.end() || !blobValid(*blob))
+    if (blob == descriptor.end() || !blobValid(*blob)) {
         return invalidDescriptorField("entity_blob", "must be a nonempty bounded byte array");
+    }
     return Status::OK();
 }
 
-Status MemFabricSharedMemory::validateDescriptor(
-    const Json& descriptor, const std::string& peer_segment_name) const {
-    CHECK_STATUS(ValidateIdentity(descriptor, peer_segment_name));
+Status MemFabricSharedMemory::validateDescriptor(const Json &descriptor, const std::string &peerSegmentName) const
+{
+    CHECK_STATUS(ValidateIdentity(descriptor, peerSegmentName));
     for (const char *key : {"type", "address", "size", "window_base", "offset"}) {
         const auto field = descriptor.find(key);
-        if (field == descriptor.end() || !field->is_number_unsigned())
+        if (field == descriptor.end() || !field->is_number_unsigned()) {
             return invalidDescriptorField(key, "must be an unsigned integer");
+        }
     }
     const auto rank = descriptor.at("rank").get<uint64_t>();
     const auto type = descriptor.at("type").get<uint64_t>();
@@ -481,7 +485,7 @@ Status MemFabricSharedMemory::validateDescriptor(
         return invalidDescriptorField("window_base",
                                       "does not match the local base");
     }
-    const auto rank_base = base + rank * window;
+    const auto rankBase = base + rank * window;
     if (offset > budget) {
         return invalidDescriptorField("offset", "exceeds the rank window");
     }
@@ -489,13 +493,14 @@ Status MemFabricSharedMemory::validateDescriptor(
         return invalidDescriptorField(
             "size", "exceeds the remaining allocation budget");
     }
-    if (address != rank_base + offset) {
+    if (address != rankBase + offset) {
         return invalidDescriptorField(
             "address", "does not match the rank base and offset");
     }
     const auto blob = descriptor.find("slice_blob");
-    if (blob == descriptor.end() || !blobValid(*blob))
+    if (blob == descriptor.end() || !blobValid(*blob)) {
         return invalidDescriptorField("slice_blob", "must be a nonempty bounded byte array");
+    }
     return Status::OK();
 }
 MemFabricSharedMemory::RemoteSlice& MemFabricSharedMemory::recordSlice(
@@ -662,20 +667,23 @@ Status MemFabricSharedMemory::validateRetainedPeers(
 Status MemFabricSharedMemory::ImportIdentity(uint32_t rank, const Json &identity)
 {
     auto &peer = imported_ranks_[rank];
-    if (peer.cleaned)
+    if (peer.cleaned) {
         peer = ImportedRank{};
+    }
     if (peer.segment_name.empty()) {
         peer.segment_name = identity.at("segment_name").get<std::string>();
         peer.generation = identity.at("generation").get<std::string>();
         peer.entity_blob = identity.at("entity_blob");
     }
     if (peer.segment_name != identity.at("segment_name") || peer.generation != identity.at("generation") ||
-        peer.entity_blob != identity.at("entity_blob"))
+        peer.entity_blob != identity.at("entity_blob")) {
         return pending("old peer identity must exit first");
+    }
     if (!peer.entityImported) {
         const auto result = MemFabricGvaApi::importBlob(entity_, true, peer.entity_blob.get<std::vector<uint8_t>>());
-        if (result)
+        if (result) {
             return nativeError("import entity", result);
+        }
         peer.entityImported = true;
     }
     return Status::OK();
@@ -709,13 +717,21 @@ Status MemFabricSharedMemory::importBundle(uint32_t rank, const Json &descriptor
     return Status::OK();
 }
 Status MemFabricSharedMemory::cleanupPeer(uint32_t rank, ImportedRank& peer) {
-    if (peer.cleaned) return Status::OK();
-    if (peer.activeSlices) return pending("another allocation is active");
+    if (peer.cleaned) {
+        return Status::OK();
+    }
+    if (peer.activeSlices) {
+        return pending("another allocation is active");
+    }
     CHECK_STATUS(bindDevice());
     auto ret = MemFabricGvaApi::remove(entity_, rank);
-    if (ret) return pending("remove imported rank", ret);
+    if (ret) {
+        return pending("remove imported rank", ret);
+    }
     ret = MemFabricGvaApi::unmap(entity_, rank);
-    if (ret) return pending("unmap rank", ret);
+    if (ret) {
+        return pending("unmap rank", ret);
+    }
     for (const auto& [base, slice] : peer.slices) {
         const auto size = slice.descriptor.at("size").get<uint64_t>();
         uint64_t va = 0;

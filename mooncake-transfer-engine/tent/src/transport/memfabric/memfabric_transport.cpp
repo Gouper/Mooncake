@@ -101,8 +101,9 @@ bool MemFabricTransport::supportsGlobalAddressing() const {
 Status MemFabricTransport::GetGvaBases(uint64_t &host, uint64_t &device) const
 {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (!gva_ || stopping_)
+    if (!gva_ || stopping_) {
         return Status::NotImplemented("MemFabric GVA is unavailable");
+    }
     gva_->GetBases(host, device);
     return Status::OK();
 }
@@ -110,8 +111,9 @@ Status MemFabricTransport::GetGvaBases(uint64_t &host, uint64_t &device) const
 Status MemFabricTransport::GetGvaIdentity(std::string &identity) const
 {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (!gva_ || stopping_)
+    if (!gva_ || stopping_) {
         return Status::NotImplemented("MemFabric GVA is unavailable");
+    }
     identity = gva_->GetIdentity();
     return Status::OK();
 }
@@ -127,8 +129,9 @@ Status MemFabricTransport::CloseGvaPeer(SegmentID id, uint32_t rank, const std::
     std::lock_guard<std::mutex> lock(inflight_mu_);
     CHECK_STATUS(gva_->CloseRank(rank, segment));
     auto it = gva_remote_.lower_bound({id, 0});
-    while (it != gva_remote_.end() && it->first.first == id)
+    while (it != gva_remote_.end() && it->first.first == id) {
         it = gva_remote_.erase(it);
+    }
     return Status::OK();
 }
 
@@ -202,11 +205,12 @@ Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool in
     SegmentDescRef segment;
     CHECK_STATUS(metadata->segmentManager().withCachedSegment(id, segment, [&](SegmentDesc *current) {
         auto *buffer = current->findBuffer(reinterpret_cast<uint64_t>(addr), size);
-        if (!buffer)
+        if (!buffer) {
             return Status::NeedsRefreshCache("MemFabric GVA region has not been published");
+        }
         return Status::OK();
     }));
-    auto* buffer = segment->findBuffer(reinterpret_cast<uint64_t>(addr), size);
+    auto *buffer = segment->findBuffer(reinterpret_cast<uint64_t>(addr), size);
     if (!buffer || buffer->addr != reinterpret_cast<uint64_t>(addr)) {
         return Status::InvalidArgument("GVA map requires published slice base");
     }
@@ -214,11 +218,14 @@ Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool in
         return Status::InvalidArgument("Missing MemFabric GVA descriptor");
     }
     nlohmann::json bundle = nlohmann::json::array();
-    for (const auto& candidate : segment->getMemory().buffers) {
-        if (!includeBundle && &candidate != buffer)
+    for (const auto &candidate : segment->getMemory().buffers) {
+        if (!includeBundle && &candidate != buffer) {
             continue;
-        const auto* attribute = findGvaDescriptor(candidate);
-        if (!attribute) continue;
+        }
+        const auto *attribute = findGvaDescriptor(candidate);
+        if (!attribute) {
+            continue;
+        }
         try {
             auto descriptor = nlohmann::json::parse(*attribute);
             if (descriptor.at("address").get<uint64_t>() != candidate.addr ||
@@ -227,7 +234,7 @@ Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool in
                     "GVA descriptor disagrees with published buffer");
             }
             bundle.push_back(std::move(descriptor));
-        } catch (const nlohmann::json::exception&) {
+        } catch (const nlohmann::json::exception &) {
             return Status::InvalidArgument("Malformed MemFabric GVA metadata");
         }
     }
@@ -235,9 +242,9 @@ Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool in
         std::lock_guard<std::mutex> lock(inflight_mu_);
         gva_remote_[{id, reinterpret_cast<uint64_t>(addr)}] = segment->name;
     }
-    return context->prepare(segment->name, bundle.dump(),
-                            reinterpret_cast<uint64_t>(addr), size);
+    return context->prepare(segment->name, bundle.dump(), reinterpret_cast<uint64_t>(addr), size);
 }
+
 Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     std::shared_ptr<MemFabricSharedMemory> context;
     std::string peer;

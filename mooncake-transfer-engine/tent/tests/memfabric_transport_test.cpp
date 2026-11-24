@@ -278,7 +278,9 @@ void MemFabricGvaApi::uninitialize() {}
 
 void* MemFabricGvaApi::create(const MemFabricGvaConfig& config) {
     std::lock_guard lock(gHybmMutex);
-    if (g_hybm->fail_create) return nullptr;
+    if (g_hybm->fail_create) {
+        return nullptr;
+    }
     auto created = std::make_unique<HybmEntity>();
     created->config = config;
     created->serial = ++g_hybm->creates;
@@ -296,7 +298,9 @@ int MemFabricGvaApi::reserve(void*) { return g_hybm->reserve_result; }
 int MemFabricGvaApi::unreserve(void*) { return 0; }
 
 void* MemFabricGvaApi::allocate(void* handle, uint32_t type, uint64_t bytes) {
-    if (type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) return nullptr;
+    if (type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) {
+        return nullptr;
+    }
     std::lock_guard lock(gHybmMutex);
     auto& local = hybmEntity(handle);
     const auto window = type == kGvaMemoryTypeDevice ? local.config.hbm_window : local.config.dram_window;
@@ -329,19 +333,27 @@ uint64_t MemFabricGvaApi::base(void*, uint32_t type) {
 
 int MemFabricGvaApi::translate(uint64_t addr, uint32_t type, uint64_t& out) {
     std::lock_guard lock(gHybmMutex);
-    if (g_hybm->translate_result) return g_hybm->translate_result;
+    if (g_hybm->translate_result) {
+        return g_hybm->translate_result;
+    }
     auto local = g_hybm_entities.find(g_hybm_device);
     if ((type != kGvaMemoryTypeDevice && type != kGvaMemoryTypeHost) ||
-        local == g_hybm_entities.end())
+        local == g_hybm_entities.end()) {
         return -12;
+    }
     const auto& slices = local->second->slices;
     auto slice = slices.upper_bound(addr);
-    if (slice == slices.begin()) return -12;
-    --slice;
-    if (addr - slice->first >= slice->second.size) return -12;
-    if (slice->second.imported &&
-        local->second->config.protocol != "device_sdma")
+    if (slice == slices.begin()) {
         return -12;
+    }
+    --slice;
+    if (addr - slice->first >= slice->second.size) {
+        return -12;
+    }
+    if (slice->second.imported &&
+        local->second->config.protocol != "device_sdma") {
+        return -12;
+    }
     out = addr + g_hybm->alias_offset;
     return 0;
 }
@@ -367,12 +379,18 @@ int MemFabricGvaApi::importBlob(void* handle, bool entity_info,
                                 const std::vector<uint8_t>& blob) {
     std::lock_guard lock(gHybmMutex);
     ++g_hybm->imports;
-    if (entity_info) return g_hybm->entity_import_result;
+    if (entity_info) {
+        return g_hybm->entity_import_result;
+    }
     ++g_hybm->slice_imports;
     const auto result = g_hybm->slice_import_result.load();
-    if (result) return result;
+    if (result) {
+        return result;
+    }
     std::array<uint64_t, 2> data;
-    if (blob.size() != sizeof(data)) return -1;
+    if (blob.size() != sizeof(data)) {
+        return -1;
+    }
     std::memcpy(data.data(), blob.data(), sizeof(data));
     hybmEntity(handle).slices.emplace(data[0], HybmSlice{data[1], true});
     return 0;
@@ -396,7 +414,9 @@ int MemFabricGvaApi::remove(void*, uint32_t) { return g_hybm->remove_result; }
 int MemFabricGvaApi::unmap(void* handle, uint32_t rank) {
     std::lock_guard lock(gHybmMutex);
     ++g_hybm->unmaps;
-    if (g_hybm->stale_registry) return 0;
+    if (g_hybm->stale_registry) {
+        return 0;
+    }
     auto& local = hybmEntity(handle);
     const auto inWindow = [&](uint64_t address, uint32_t type, uint64_t window) {
         const auto start = base(handle, type) + rank * window;

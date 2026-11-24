@@ -123,16 +123,20 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
     const static uint16_t kStartPort = 15000;
     const static uint16_t kPortRange = 2000;
     const static int kMaxRetry = 10;
-    if (running_)
+    if (running_) {
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
+    }
     easylog::set_min_severity(easylog::Severity::FATAL);
-    if (threads > 1)
+    if (threads > 1) {
         LOG(INFO) << "CoroRpcAgent: RPC server threads set to " << threads;
+    }
     for (int retry = 0; retry < kMaxRetry; ++retry) {
-        if (port == 0)
+        if (port == 0) {
             port = kStartPort + SimpleRandom::Get().next(kPortRange);
-        if (StartListener(ipv6 ? "::" : "0.0.0.0", port, threads).ok())
+        }
+        if (StartListener(ipv6 ? "::" : "0.0.0.0", port, threads).ok()) {
             return Status::OK();
+        }
         port = 0;
     }
     return Status::RpcServiceError("Failed to bind any RPC port" LOC_MARK);
@@ -140,8 +144,9 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
 
 Status CoroRpcAgent::StartAt(const std::string &host, uint16_t port, size_t threads)
 {
-    if (running_)
+    if (running_) {
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
+    }
     easylog::set_min_severity(easylog::Severity::FATAL);
     return StartListener(host, port, threads);
 }
@@ -267,8 +272,8 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 }
 
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::CallBefore(
-    std::string server_addr, int func_id, std::string request,
-    std::chrono::steady_clock::time_point deadline, bool retry_rpc_error_once)
+    std::string serverAddr, int funcId, std::string request,
+    std::chrono::steady_clock::time_point deadline, bool retryRpcErrorOnce)
 {
     if (tl_inside_rpc_handler) {
         co_return std::make_pair(
@@ -277,14 +282,14 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::CallBefore(
             "");
     }
 
-    const int max_attempts = retry_rpc_error_once ? 2 : 1;
+    const int maxAttempts = retryRpcErrorOnce ? 2 : 1;
     const bool bounded = deadline != std::chrono::steady_clock::time_point::max();
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        auto pool = getOrCreatePool(server_addr);
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        auto pool = getOrCreatePool(serverAddr);
         auto acquired = pool->acquire();
         const uint64_t generation = acquired.generation;
         ClientLease lease{std::move(acquired.client), pool, false};
-        const bool from_pool = lease.client != nullptr;
+        const bool fromPool = lease.client != nullptr;
 
         if (!lease.client) {
             lease.client = std::make_unique<coro_rpc_client>(
@@ -294,15 +299,17 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::CallBefore(
                 lease.broken = true;
                 co_return std::make_pair(Status::TimedOut("RPC connection deadline expired"), "");
             }
-            auto connect = bounded ? lease.client->connect(server_addr, budget) : lease.client->connect(server_addr);
-            auto conn_result = co_await std::move(connect);
-            if (conn_result.val() != 0) {
+            auto connect = bounded ? lease.client->connect(serverAddr, budget) : lease.client->connect(serverAddr);
+            auto connectResult = co_await std::move(connect);
+            if (connectResult.val() != 0) {
                 lease.broken = true;
                 auto msg =
-                    "Failed to connect RPC server. server: " + server_addr +
-                    ", func_id: " + std::to_string(func_id) +
-                    ", message: " + std::string{conn_result.message()};
-                if (attempt + 1 < max_attempts) continue;
+                    "Failed to connect RPC server. server: " + serverAddr +
+                    ", func_id: " + std::to_string(funcId) +
+                    ", message: " + std::string{connectResult.message()};
+                if (attempt + 1 < maxAttempts) {
+                    continue;
+                }
                 co_return std::make_pair(
                     Status::RpcConnectionError(msg + LOC_MARK), "");
             }
@@ -311,28 +318,31 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::CallBefore(
         lease->set_req_attachment(request);
 
         const auto budget = deadline - std::chrono::steady_clock::now();
-        if (bounded && budget <= std::chrono::steady_clock::duration::zero())
+        if (bounded && budget <= std::chrono::steady_clock::duration::zero()) {
             co_return std::make_pair(Status::TimedOut("RPC request deadline expired"), "");
-        auto request_call = bounded
+        }
+        auto requestCall = bounded
                                 ? lease->call_for<&CoroRpcAgent::process>(
-                                      std::chrono::ceil<std::chrono::milliseconds>(budget), func_id)
-                                : lease->call<&CoroRpcAgent::process>(func_id);
-        auto call_result = co_await std::move(request_call);
+                                      std::chrono::ceil<std::chrono::milliseconds>(budget), funcId)
+                                : lease->call<&CoroRpcAgent::process>(funcId);
+        auto callResult = co_await std::move(requestCall);
 
-        if (!call_result.has_value()) {
+        if (!callResult.has_value()) {
             lease.broken = true;
             // An idle pooled connection only learns that its peer restarted
             // when it is next used. Drop the whole pool so a retry starts
             // from a fresh connection.
-            if (from_pool && !peerAnswered(call_result.error().code)) {
+            if (fromPool && !peerAnswered(callResult.error().code)) {
                 pool->clearIfCurrent(generation);
             }
-            const auto& error = call_result.error();
-            auto msg = "Failed to call RPC function. server: " + server_addr +
-                       ", func_id: " + std::to_string(func_id) +
+            const auto& error = callResult.error();
+            auto msg = "Failed to call RPC function. server: " + serverAddr +
+                       ", func_id: " + std::to_string(funcId) +
                        ", message: " + std::string{error.msg};
-            if (attempt + 1 < max_attempts) continue;
-            if (rpcFunctionWasNotFound(error.code, error.msg, func_id)) {
+            if (attempt + 1 < maxAttempts) {
+                continue;
+            }
+            if (rpcFunctionWasNotFound(error.code, error.msg, funcId)) {
                 co_return std::make_pair(
                     Status::RpcFunctionNotFound(msg + LOC_MARK), "");
             }

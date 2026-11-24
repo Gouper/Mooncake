@@ -330,29 +330,34 @@ TransferEngineImpl::TransferEngineImpl()
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
                                        bool config_loaded)
-    : TransferEngineImpl(std::move(conf), config_loaded, true) {}
+    : TransferEngineImpl(std::move(conf), config_loaded, true)
+{
+}
 
-TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
-                                       bool config_loaded,
-                                       bool load_environment)
+TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf, bool configLoaded, bool loadEnvironment)
     : conf_(conf),
       available_(false),
       port_(0),
       ipv6_(false),
-      merge_requests_(true) {
-    if (!config_loaded) return;
+      merge_requests_(true)
+{
+    if (!configLoaded) {
+        return;
+    }
     if (!conf_) {
         LOG(ERROR) << "Cannot construct Transfer Engine with a null config";
         return;
     }
     auto status = Status::OK();
-    if (load_environment) {
+    if (loadEnvironment) {
         auto preserved = captureExplicitTransferEngineConfig(*conf_);
         // Keep the caller's explicit metadata identity.
         status = ConfigHelper().loadFromEnv(*conf_);
         restoreExplicitTransferEngineConfig(*conf_, preserved);
     }
-    if (status.ok()) status = construct();
+    if (status.ok()) {
+        status = construct();
+    }
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
@@ -367,8 +372,9 @@ Status TransferEngineImpl::GetMemFabricGvaBases(uint64_t &host, uint64_t &device
 {
 #ifdef USE_MEMFABRIC
     const auto *transport = static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get());
-    if (transport)
+    if (transport) {
         return transport->GetGvaBases(host, device);
+    }
 #else
     static_cast<void>(host);
     static_cast<void>(device);
