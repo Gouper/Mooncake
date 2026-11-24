@@ -484,9 +484,10 @@ Status MemoryEngineServer::Impl::Heartbeat(const json &request)
 Status MemoryEngineServer::Impl::Cancel(const json &request)
 {
     const auto id = request.at("id").get<std::string>();
+    const auto &callbackAddress = request.at("callback").get_ref<const std::string &>();
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(id);
-    if (found != mRegistrations.end()) {
+    if (found != mRegistrations.end() && found->second.callback == callbackAddress) {
         if (found->second.state != MemberState::Pending && found->second.state != MemberState::Registered) {
             return Status::InvalidEntry("Unshare joined MemoryEngine rank before canceling");
         }

@@ -843,8 +843,9 @@ Status MemoryEngine::Impl::CancelRegistration()
     if (!mRegistrationAttempted) {
         return Status::OK();
     }
+    const json request{{"id", mId}, {"callback", mCallbackAddress}};
     json response;
-    CHECK_STATUS(Call(mRpc, mServer, MemoryRpc::Cancel, {{"id", mId}}, response));
+    CHECK_STATUS(Call(mRpc, mServer, MemoryRpc::Cancel, request, response));
     mRegistrationAttempted = false;
     return Status::OK();
 }
