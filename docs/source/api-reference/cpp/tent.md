@@ -220,10 +220,30 @@ on every client.
 | `client_host` | Client callback address. An empty value enables automatic selection. |
 | `heartbeat_interval_ms` | Client heartbeat interval. Defaults to `3000` and must be shorter than the server timeout. |
 | `join_timeout_ms` | Registration and join timeout in milliseconds. Defaults to `120000`. |
+| `batch_copy_timeout_ms` | Batch copy deadline in milliseconds. Defaults to `30000`. Set to `0` for no deadline. |
 | `server.world_size`, `server.host_mem_max`, `server.device_mem_max` | Expected layout. Each nonzero value must match the client value. |
 | `server.gva_base_host`, `server.gva_base_device` | Expected GVA base addresses. For each zero value the server accepts the first confirmed base. |
 | `server.heartbeat_timeout_ms` | Time before a rank expires without a heartbeat. Defaults to `20000`. |
 | `server.rpc_server_threads` | Server RPC worker count. Defaults to `4`. |
+
+### MemoryEngine batch copy
+
+After `Join()`, call `BatchCopy(entries, &results)` with a source address,
+destination address, and byte count for each entry. The client accepts copies
+between local user buffers, between a local user buffer and a GVA in either
+direction, and between two GVAs owned by the calling rank. Keep both buffers
+valid for the call and place dependent copies in separate batches. Source and
+destination ranges must be disjoint or identical.
+
+When the call returns `OK`, `results[i]` gives the status of entry `i` as a
+`MemoryEngineCopyResult`. A copy between GVAs on different ranks returns
+`Unsupported` (`-6`) for that entry. An already submitted synchronous HYBM
+transfer can finish after the deadline, and its destination may be updated
+even when the result is `TimedOut`.
+
+For Ascend A2 with `MF_PROTOCOL=device_rdma` and
+`MF_HYBM_RDMA_USE_HCOMM=1`, install the HYBM AICPU kernel in each client's CANN
+environment with `mfcli kernel install`.
 
 ## Core APIs
 

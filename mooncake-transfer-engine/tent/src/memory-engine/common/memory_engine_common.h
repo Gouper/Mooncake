@@ -44,6 +44,7 @@ inline constexpr char CONFIG_LOCAL_RANK[] = "memory_engine/local_rank";
 inline constexpr char CONFIG_CLIENT_HOST[] = "memory_engine/client_host";
 inline constexpr char CONFIG_HEARTBEAT_INTERVAL_MS[] = "memory_engine/heartbeat_interval_ms";
 inline constexpr char CONFIG_JOIN_TIMEOUT_MS[] = "memory_engine/join_timeout_ms";
+inline constexpr char CONFIG_BATCH_COPY_TIMEOUT_MS[] = "memory_engine/batch_copy_timeout_ms";
 
 inline constexpr char CONFIG_SERVER_WORLD_SIZE[] = "memory_engine/server/world_size";
 inline constexpr char CONFIG_SERVER_HOST_MEM_MAX[] = "memory_engine/server/host_mem_max";

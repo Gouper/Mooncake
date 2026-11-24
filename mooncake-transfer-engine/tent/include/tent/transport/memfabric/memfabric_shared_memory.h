@@ -45,6 +45,8 @@ class MemFabricSharedMemory {
                               const std::string& descriptor) const;
     Status beginCopy(uint64_t source, uint64_t destination, size_t size,
                      uint32_t& direction);
+    Status PinCopyBatch();
+    Status RunPinnedBatchCopy(const std::vector<MemFabricGvaCopy> &copies, uint32_t direction);
     // Each member has already been pinned by beginCopy; settles all those pins.
     Status runBatchCopy(const std::vector<MemFabricGvaCopy>&,
                         uint32_t direction);

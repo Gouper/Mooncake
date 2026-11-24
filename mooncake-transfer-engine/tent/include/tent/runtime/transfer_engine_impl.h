@@ -41,6 +41,8 @@ namespace mooncake {
 class TransferEngineImplTestPeer;
 namespace tent {
 
+class MemFabricSharedMemory;
+
 class Batch;
 class Topology;
 class Transport;
@@ -267,6 +269,8 @@ class TransferEngineImpl {
     TransferEngineImpl(std::shared_ptr<Config> config, bool configLoaded, bool loadEnvironment);
 
     Status GetMemFabricGvaBases(uint64_t &host, uint64_t &device) const;
+    // The caller must keep the GVA transport open while using the context.
+    MemFabricSharedMemory *GetMemFabricGva() const;
     Status CloseMemFabricGva();
     Status GetMemFabricGvaIdentity(std::string &identity) const;
     Status PrepareMemFabricPeer(const std::string &segment, const std::string &identity);

@@ -15,6 +15,7 @@
         "client_host": "127.0.0.1",
         "heartbeat_interval_ms": 3000,
         "join_timeout_ms": 120000,
+        "batch_copy_timeout_ms": 30000,
         "server": {
             "world_size": 1,
             "host_mem_max": 0,

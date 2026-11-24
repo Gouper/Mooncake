@@ -851,6 +851,22 @@ Status MemFabricSharedMemory::runPinnedCopy(size_t count, Copy copy,
     releaseCopy(count, !drained);
     return status;
 }
+Status MemFabricSharedMemory::PinCopyBatch()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (copy_failed_) {
+        return pending("native copy completion remains unknown");
+    }
+    ++pending_copies_;
+    return Status::OK();
+}
+
+Status MemFabricSharedMemory::RunPinnedBatchCopy(const std::vector<MemFabricGvaCopy> &copies, uint32_t direction)
+{
+    return runPinnedCopy(0, [&] { return MemFabricGvaApi::batchCopy(entity_, copies, direction); },
+                         "synchronous buffer batch copy");
+}
+
 Status MemFabricSharedMemory::runBatchCopy(
     const std::vector<MemFabricGvaCopy>& copies, uint32_t direction) {
     if (copies.empty()) return Status::OK();

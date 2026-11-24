@@ -387,6 +387,17 @@ Status TransferEngineImpl::CloseMemFabricGva()
     return transport_list_[MEMFABRIC]->uninstall();
 }
 
+MemFabricSharedMemory *TransferEngineImpl::GetMemFabricGva() const
+{
+#ifdef USE_MEMFABRIC
+    const auto *transport = static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get());
+    if (transport) {
+        return transport->GetGvaContext();
+    }
+#endif
+    return nullptr;
+}
+
 Status TransferEngineImpl::GetMemFabricGvaIdentity(std::string &identity) const
 {
 #ifdef USE_MEMFABRIC

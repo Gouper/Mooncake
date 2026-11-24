@@ -153,6 +153,7 @@ constexpr uint32_t kGvaCopySourceHost = 0x4;
 constexpr uint32_t kGvaCopySourceDevice = 0x8;
 constexpr uint32_t kGvaCopyDestinationHost = 0x0;
 constexpr uint32_t kGvaCopyDestinationDevice = 0x1;
+constexpr uint32_t kGvaCopyAuto = 12;
 
 struct MemFabricGvaConfig {
     bool enabled = false;

@@ -118,6 +118,12 @@ Status MemFabricTransport::GetGvaIdentity(std::string &identity) const
     return Status::OK();
 }
 
+MemFabricSharedMemory *MemFabricTransport::GetGvaContext() const
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    return stopping_ ? nullptr : gva_.get();
+}
+
 Status MemFabricTransport::PrepareGvaPeer(const std::string &segment, const std::string &identity)
 {
     std::lock_guard<std::mutex> lock(inflight_mu_);

@@ -87,6 +87,7 @@ class MemFabricTransport : public Transport {
     bool warmupMemory(void* address, size_t size) override;
     bool supportsGlobalAddressing() const override;
     Status GetGvaBases(uint64_t &host, uint64_t &device) const;
+    MemFabricSharedMemory *GetGvaContext() const;
     Status GetGvaIdentity(std::string &identity) const;
     Status PrepareGvaPeer(const std::string &segment, const std::string &identity);
     Status CloseGvaPeer(SegmentID id, uint32_t rank, const std::string &segment);
