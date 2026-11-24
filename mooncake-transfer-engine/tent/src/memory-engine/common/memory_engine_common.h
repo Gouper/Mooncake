@@ -15,6 +15,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "tent/common/config.h"
 #include "tent/rpc/rpc.h"
@@ -94,6 +95,18 @@ struct Layout {
     bool operator==(const Layout &) const = default;
 };
 
+struct RegisterRequest {
+    std::string id;
+    Layout layout;
+    std::string callbackAddress;
+    std::optional<uint32_t> requestedRank;
+};
+
+struct RegisterResponse {
+    uint32_t rank{};
+    uint64_t leaseMs{};
+};
+
 struct Bases {
     uint64_t host{};
     uint64_t device{};
@@ -104,6 +117,50 @@ struct GvaRegion {
     uint64_t address{};
     size_t size{};
     bool revoking = false;
+};
+
+struct RegistrationIdRequest {
+    std::string id;
+};
+
+struct ConfirmRequest {
+    std::string id;
+    uint32_t rank{};
+    Bases bases;
+};
+
+struct CancelRequest {
+    std::string id;
+    std::string callbackAddress;
+};
+
+struct JoinRequest {
+    std::string id;
+    std::string segment;
+    std::string identity;
+};
+
+struct RegionRequest {
+    std::string id;
+    GvaRegion region;
+};
+
+struct PeerRequest {
+    std::string id;
+    uint32_t rank{};
+    uint64_t generation{};
+};
+
+struct SharePeerRequest {
+    PeerRequest peer;
+    std::string segment;
+    std::string identity;
+    std::vector<GvaRegion> regions;
+};
+
+struct PeerRegionRequest {
+    PeerRequest peer;
+    GvaRegion region;
 };
 
 struct PeerCall {
@@ -119,8 +176,42 @@ Status ValidateBases(const Layout &layout, const Bases &bases);
 Status ReadLayout(const json &worldSize, const json &hostWindow, const json &deviceWindow, Layout &layout);
 Status ReadLayout(const Config &config, const char *worldSizeKey, const char *hostWindowKey,
                   const char *deviceWindowKey, Layout &layout);
-bool ReadRegion(const json &payload, GvaRegion &region);
+
+json EncodeRegisterRequest(const RegisterRequest &request);
+Status DecodeRegisterRequest(const json &payload, RegisterRequest &request);
+
+json EncodeRegisterResponse(const RegisterResponse &response, const Status &status);
+Status DecodeRegisterResponse(const json &payload, uint32_t worldSize, RegisterResponse &response);
+
+json EncodeRegistrationIdRequest(const RegistrationIdRequest &request);
+Status DecodeRegistrationIdRequest(const json &payload, RegistrationIdRequest &request);
+
+json EncodeConfirmRequest(const ConfirmRequest &request);
+Status DecodeConfirmRequest(const json &payload, ConfirmRequest &request);
+
+json EncodeCancelRequest(const CancelRequest &request);
+Status DecodeCancelRequest(const json &payload, CancelRequest &request);
+
+json EncodeJoinRequest(const JoinRequest &request);
+Status DecodeJoinRequest(const json &payload, JoinRequest &request);
+
+json EncodeRegionRequest(const RegionRequest &request);
+Status DecodeRegionRequest(const json &payload, RegionRequest &request);
+
+json EncodePeerRequest(const PeerRequest &request);
+Status DecodePeerRequest(const json &payload, PeerRequest &request);
+
+json EncodeSharePeerRequest(const SharePeerRequest &request);
+// Decode the rest of the callback after the recipient and generation have been checked.
+Status DecodeSharePeerDetails(const json &payload, SharePeerRequest &request);
+
+json EncodePeerRegionRequest(const PeerRegionRequest &request);
+Status DecodePeerRegion(const json &payload, GvaRegion &region);
+
+std::string EncodeReply(const Status &status, json &response);
+
 Status Call(CoroRpcAgent &rpc, const std::string &endpoint, MemoryRpc op, const json &request, json &response);
+Status Call(CoroRpcAgent &rpc, const std::string &endpoint, MemoryRpc op, const json &request);
 std::future<Status> CallAsync(CoroRpcAgent &rpc, MemoryRpc op, const PeerCall &peer, Clock::time_point deadline);
 bool Retryable(const Status &status);
 
@@ -135,9 +226,18 @@ Status RegisterHandler(CoroRpcAgent &rpc, MemoryRpc op, Handler handler, bool of
         } catch (const json::exception &) {
             status = Status::MalformedJson("Malformed MemoryEngine RPC request");
         }
-        response["code"] = static_cast<uint16_t>(status.code());
-        response["message"] = std::string(status.message());
-        output = response.dump();
+        output = EncodeReply(status, response);
+    }, offload);
+}
+
+template <typename Request, typename Handler>
+Status RegisterRequestHandler(CoroRpcAgent &rpc, MemoryRpc op, Status (*decode)(const json &, Request &),
+                              Handler handler, bool offload = false)
+{
+    return RegisterHandler(rpc, op, [decode, handler](const json &payload, json &) {
+        Request request;
+        CHECK_STATUS(decode(payload, request));
+        return handler(request);
     }, offload);
 }
 

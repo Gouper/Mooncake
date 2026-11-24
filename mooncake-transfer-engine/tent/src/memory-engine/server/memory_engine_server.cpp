@@ -50,12 +50,6 @@ struct Registration {
     bool leavePrepared = false;
 };
 
-struct JoinDescription {
-    std::string id;
-    std::string segment;
-    std::string identity;
-};
-
 class Mutation {
    public:
     explicit Mutation(std::atomic<uint64_t> &active, bool exclusive = true)
@@ -166,23 +160,22 @@ Status Fanout(CoroRpcAgent &rpc, MemoryRpc op, std::vector<PeerCall> peers, Cloc
 
 json ShareRequest(const Registration &target, const Registration &owner, bool mapRegions)
 {
-    auto regions = json::array();
+    SharePeerRequest request{{target.id, owner.rank, std::max(target.generation, owner.generation)},
+                             owner.segment, owner.identity, {}};
     if (mapRegions) {
+        request.regions.reserve(owner.regions.size());
         for (const auto &[address, region] : owner.regions) {
             if (!region.revoking) {
-                regions.push_back({{"address", address}, {"size", region.size}});
+                request.regions.push_back({address, region.size});
             }
         }
     }
-    return {{"id", target.id}, {"rank", owner.rank}, {"segment", owner.segment}, {"regions", std::move(regions)},
-            {"identity", owner.identity},
-            {"generation", std::max(target.generation, owner.generation)}};
+    return EncodeSharePeerRequest(request);
 }
 
 PeerCall UnshareRequest(const Registration &target, const Registration &owner)
 {
-    return {target.callback, {{"id", target.id}, {"rank", owner.rank},
-                              {"generation", std::max(target.generation, owner.generation)}}};
+    return {target.callback, EncodePeerRequest({target.id, owner.rank, std::max(target.generation, owner.generation)})};
 }
 
 bool InRankWindow(uint64_t base, uint64_t window, uint32_t rank, const GvaRegion &region)
@@ -212,18 +205,20 @@ struct MemoryEngineServer::Impl {
     Status Start(const Config &config, const Endpoint &endpoint);
     Status CheckEndpoint(const Endpoint &endpoint) const;
     Status RegisterRpcHandlers();
-    Status Register(const json &request, json &response);
-    Status Confirm(const json &request);
-    Status Heartbeat(const json &request);
-    Status Cancel(const json &request);
-    Status Join(const json &request);
-    Status BeginJoin(const JoinDescription &request, Registration &member, std::vector<Registration> &peers);
+    Status HandleRegister(const json &payload, json &reply);
+    Status HandleBeginLeave(const json &payload);
+    Status Register(const RegisterRequest &request, RegisterResponse &response);
+    Status Confirm(const ConfirmRequest &request);
+    Status Heartbeat(const RegistrationIdRequest &request);
+    Status Cancel(const CancelRequest &request);
+    Status Join(const json &payload);
+    Status BeginJoin(const JoinRequest &request, Registration &member, std::vector<Registration> &peers);
     Status Share(const Registration &member, const std::vector<Registration> &peers);
     Status RollbackJoin(const Registration &member, const std::vector<Registration> &peers);
     Status BeginLeave(const std::string &id);
     Status FinishLeave(const std::string &id);
     Status PrepareLeave(const std::string &id, std::vector<PeerCall> &calls);
-    Status UpdateRegion(const json &request, bool publish);
+    Status UpdateRegion(const json &payload, bool publish);
     Status PrepareRegion(const std::string &id, const GvaRegion &region, bool publish, std::vector<PeerCall> &calls);
     void CommitRegion(const std::string &id, const GvaRegion &region, bool publish);
     Status ClaimRank(std::optional<uint32_t> requested, uint32_t &rank);
@@ -303,24 +298,20 @@ Status MemoryEngineServer::Impl::CheckEndpoint(const Endpoint &endpoint) const
 Status MemoryEngineServer::Impl::RegisterRpcHandlers()
 {
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::Register,
-                                 [this](const json &request, json &reply) { return Register(request, reply); }));
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::Confirm,
-                                 [this](const json &request, json &) { return Confirm(request); }));
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::Heartbeat,
-                                 [this](const json &request, json &) { return Heartbeat(request); }));
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::Cancel,
-                                 [this](const json &request, json &) { return Cancel(request); }));
+                                 [this](const json &payload, json &reply) { return HandleRegister(payload, reply); }));
+    CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::Confirm, DecodeConfirmRequest,
+                                        [this](const ConfirmRequest &request) { return Confirm(request); }));
+    CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::Heartbeat, DecodeRegistrationIdRequest,
+                                        [this](const RegistrationIdRequest &request) { return Heartbeat(request); }));
+    CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::Cancel, DecodeCancelRequest,
+                                        [this](const CancelRequest &request) { return Cancel(request); }));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::Join,
                                  [this](const json &request, json &) { return Join(request); }, true));
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::BeginLeave, [this](const json &request, json &) {
-        Mutation mutation(mMutating);
-        if (!mutation.Acquired()) {
-            return Status::TooManyRequests("MemoryEngine membership operation in progress");
-        }
-        return BeginLeave(request.at("id").get<std::string>());
-    }, true));
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::FinishLeave, [this](const json &request, json &) {
-        return FinishLeave(request.at("id").get<std::string>());
+    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::BeginLeave,
+                                 [this](const json &request, json &) { return HandleBeginLeave(request); }, true));
+    CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::FinishLeave, DecodeRegistrationIdRequest,
+                                        [this](const RegistrationIdRequest &request) {
+        return FinishLeave(request.id);
     }));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::PublishRegion, [this](const json &request, json &) {
         return UpdateRegion(request, true);
@@ -328,6 +319,28 @@ Status MemoryEngineServer::Impl::RegisterRpcHandlers()
     return RegisterHandler(mRpc, MemoryRpc::RevokeRegion, [this](const json &request, json &) {
         return UpdateRegion(request, false);
     }, true);
+}
+
+Status MemoryEngineServer::Impl::HandleRegister(const json &payload, json &reply)
+{
+    RegisterRequest request;
+    CHECK_STATUS(DecodeRegisterRequest(payload, request));
+
+    RegisterResponse response;
+    const auto status = Register(request, response);
+    reply = EncodeRegisterResponse(response, status);
+    return status;
+}
+
+Status MemoryEngineServer::Impl::HandleBeginLeave(const json &payload)
+{
+    Mutation mutation(mMutating);
+    if (!mutation.Acquired()) {
+        return Status::TooManyRequests("MemoryEngine membership operation in progress");
+    }
+    RegistrationIdRequest request;
+    CHECK_STATUS(DecodeRegistrationIdRequest(payload, request));
+    return BeginLeave(request.id);
 }
 
 Status MemoryEngineServer::Impl::ClaimRank(std::optional<uint32_t> requested, uint32_t &rank)
@@ -384,27 +397,9 @@ void MemoryEngineServer::Impl::ResetUnconfirmedLayout()
     }
 }
 
-Status MemoryEngineServer::Impl::Register(const json &request, json &response)
+Status MemoryEngineServer::Impl::Register(const RegisterRequest &request, RegisterResponse &response)
 {
-    const auto id = request.at("id").get<std::string>();
-    const auto callbackAddress = request.at("callback").get<std::string>();
-    Layout layout;
-    CHECK_STATUS(ReadLayout(request.at("worldSize"), request.at("hostWindow"), request.at("deviceWindow"), layout));
-    CHECK_STATUS(ValidateLayout(layout));
-    Endpoint callback;
-    CHECK_STATUS(ParseEndpoint(callbackAddress, callback));
-    if (id.empty()) {
-        return Status::InvalidArgument("Missing MemoryEngine registration ID");
-    }
-    std::optional<uint32_t> requested;
-    if (request.contains("rank")) {
-        const auto rank = ReadUnsigned(request.at("rank"), layout.worldSize - 1);
-        if (!rank) {
-            return Status::InvalidArgument("Requested MemoryEngine rank is out of range");
-        }
-        requested = static_cast<uint32_t>(*rank);
-    }
-
+    const auto &layout = request.layout;
     std::lock_guard lock(mMutex);
     if ((mConfiguredLayout.worldSize && mConfiguredLayout.worldSize != layout.worldSize) ||
         (mConfiguredLayout.hostWindow && mConfiguredLayout.hostWindow != layout.hostWindow) ||
@@ -418,37 +413,31 @@ Status MemoryEngineServer::Impl::Register(const json &request, json &response)
     if (layout != mLayout) {
         return Status::InvalidArgument("MemoryEngine rank layout differs from registered server layout");
     }
-    response["leaseMs"] = mLease.count();
-    auto found = mRegistrations.find(id);
+    response.leaseMs = static_cast<uint64_t>(mLease.count());
+    auto found = mRegistrations.find(request.id);
     if (found != mRegistrations.end()) {
-        if (found->second.expires <= Clock::now() || found->second.callback != callbackAddress ||
-            (requested && *requested != found->second.rank)) {
+        if (found->second.expires <= Clock::now() || found->second.callback != request.callbackAddress ||
+            (request.requestedRank && *request.requestedRank != found->second.rank)) {
             return Status::InvalidEntry("MemoryEngine registration ID already in use");
         }
-        response["rank"] = found->second.rank;
+        response.rank = found->second.rank;
         return Status::OK();
     }
 
     uint32_t rank{};
-    CHECK_STATUS(ClaimRank(requested, rank));
-    mRegistrations.emplace(id, Registration{rank, id, callbackAddress, Clock::now() + mRegistrationTimeout});
-    response["rank"] = rank;
+    CHECK_STATUS(ClaimRank(request.requestedRank, rank));
+    const auto expires = Clock::now() + mRegistrationTimeout;
+    mRegistrations.emplace(request.id, Registration{rank, request.id, request.callbackAddress, expires});
+    response.rank = rank;
     return Status::OK();
 }
 
-Status MemoryEngineServer::Impl::Confirm(const json &request)
+Status MemoryEngineServer::Impl::Confirm(const ConfirmRequest &request)
 {
-    const auto id = request.at("id").get<std::string>();
-    const auto host = ReadUnsigned(request.at("hostBase"), UINT64_MAX);
-    const auto device = ReadUnsigned(request.at("deviceBase"), UINT64_MAX);
-    const auto rank = ReadUnsigned(request.at("rank"), MAX_RANKS);
-    if (!host || !device || !rank) {
-        return Status::InvalidArgument("Invalid MemoryEngine confirmation");
-    }
-    const Bases bases{*host, *device};
+    const auto &bases = request.bases;
     std::lock_guard lock(mMutex);
-    auto found = mRegistrations.find(id);
-    if (found == mRegistrations.end() || static_cast<uint64_t>(found->second.rank) != *rank ||
+    auto found = mRegistrations.find(request.id);
+    if (found == mRegistrations.end() || found->second.rank != request.rank ||
         found->second.expires <= Clock::now()) {
         return Status::InvalidEntry("MemoryEngine registration expired or unknown");
     }
@@ -468,11 +457,10 @@ Status MemoryEngineServer::Impl::Confirm(const json &request)
     return Status::OK();
 }
 
-Status MemoryEngineServer::Impl::Heartbeat(const json &request)
+Status MemoryEngineServer::Impl::Heartbeat(const RegistrationIdRequest &request)
 {
-    const auto id = request.at("id").get<std::string>();
     std::lock_guard lock(mMutex);
-    auto found = mRegistrations.find(id);
+    auto found = mRegistrations.find(request.id);
     const auto now = Clock::now();
     if (found == mRegistrations.end() || found->second.state == MemberState::Pending || found->second.expires <= now) {
         return Status::InvalidEntry("MemoryEngine registration expired or unknown");
@@ -481,13 +469,11 @@ Status MemoryEngineServer::Impl::Heartbeat(const json &request)
     return Status::OK();
 }
 
-Status MemoryEngineServer::Impl::Cancel(const json &request)
+Status MemoryEngineServer::Impl::Cancel(const CancelRequest &request)
 {
-    const auto id = request.at("id").get<std::string>();
-    const auto &callbackAddress = request.at("callback").get_ref<const std::string &>();
     std::lock_guard lock(mMutex);
-    auto found = mRegistrations.find(id);
-    if (found != mRegistrations.end() && found->second.callback == callbackAddress) {
+    auto found = mRegistrations.find(request.id);
+    if (found != mRegistrations.end() && found->second.callback == request.callbackAddress) {
         if (found->second.state != MemberState::Pending && found->second.state != MemberState::Registered) {
             return Status::InvalidEntry("Unshare joined MemoryEngine rank before canceling");
         }
@@ -578,7 +564,7 @@ Status MemoryEngineServer::Impl::FinishLeave(const std::string &id)
     return Status::OK();
 }
 
-Status MemoryEngineServer::Impl::BeginJoin(const JoinDescription &request, Registration &member,
+Status MemoryEngineServer::Impl::BeginJoin(const JoinRequest &request, Registration &member,
                                            std::vector<Registration> &peers)
 {
     std::lock_guard lock(mMutex);
@@ -649,33 +635,30 @@ Status MemoryEngineServer::Impl::RollbackJoin(const Registration &member, const 
     return Status::OK();
 }
 
-Status MemoryEngineServer::Impl::Join(const json &request)
+Status MemoryEngineServer::Impl::Join(const json &payload)
 {
     Mutation mutation(mMutating);
     if (!mutation.Acquired()) {
         return Status::TooManyRequests("MemoryEngine membership operation in progress");
     }
-    const JoinDescription description{request.at("id").get<std::string>(), request.at("segment").get<std::string>(),
-                                      request.at("identity").get<std::string>()};
-    if (description.segment.empty() || description.identity.empty()) {
-        return Status::InvalidArgument("Missing MemoryEngine TENT segment or identity");
-    }
+    JoinRequest request;
+    CHECK_STATUS(DecodeJoinRequest(payload, request));
     Registration member;
     std::vector<Registration> peers;
-    CHECK_STATUS(BeginJoin(description, member, peers));
+    CHECK_STATUS(BeginJoin(request, member, peers));
     if (member.state == MemberState::Joined) {
         return Status::OK();
     }
     if (member.state == MemberState::Joining) {
         CHECK_STATUS(RollbackJoin(member, peers));
         peers.clear();
-        CHECK_STATUS(BeginJoin(description, member, peers));
+        CHECK_STATUS(BeginJoin(request, member, peers));
     }
 
     auto status = Share(member, peers);
     if (status.ok()) {
         std::lock_guard lock(mMutex);
-        auto &current = mRegistrations.at(description.id);
+        auto &current = mRegistrations.at(request.id);
         if (current.expires > Clock::now()) {
             current.state = MemberState::Joined;
             return status;
@@ -726,9 +709,8 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
         if (peerId == id || !available) {
             continue;
         }
-        calls.push_back({peer.callback, {{"id", peerId}, {"rank", owner.rank}, {"address", region.address},
-                                         {"size", region.size}, {"generation", std::max(peer.generation,
-                                                                                        owner.generation)}}});
+        const PeerRegionRequest request{{peerId, owner.rank, std::max(peer.generation, owner.generation)}, region};
+        calls.push_back({peer.callback, EncodePeerRegionRequest(request)});
     }
     return Status::OK();
 }
@@ -744,17 +726,16 @@ void MemoryEngineServer::Impl::CommitRegion(const std::string &id, const GvaRegi
     }
 }
 
-Status MemoryEngineServer::Impl::UpdateRegion(const json &request, bool publish)
+Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, bool publish)
 {
     Mutation mutation(mMutating, false);
     if (!mutation.Acquired()) {
         return Status::TooManyRequests("MemoryEngine region operation in progress");
     }
-    GvaRegion region;
-    if (!ReadRegion(request, region)) {
-        return Status::InvalidArgument("Invalid MemoryEngine region");
-    }
-    const auto id = request.at("id").get<std::string>();
+    RegionRequest request;
+    CHECK_STATUS(DecodeRegionRequest(payload, request));
+    const auto &id = request.id;
+    const auto &region = request.region;
     OwnerMutation owner(mMutex, mUpdatingOwners, id);
     if (!owner.Acquired()) {
         return Status::TooManyRequests("MemoryEngine owner region operation in progress");
