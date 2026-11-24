@@ -199,10 +199,17 @@ export MF_PROTOCOL=device_sdma
 ```
 
 Build with `-DUSE_TENT=ON -DUSE_MEMFABRIC=ON` and MemFabric HYBM headers. Make
-`libmf_hybm_core.so` available to the client at runtime. Start
-`MemoryEngineServer::Start` before calling `MemoryEngine::Create`. Bind the
-client thread to its Ascend device before `Create`, then call `Join` before
-allocating.
+`libmf_hybm_core.so` available to the client at runtime. Call
+`MemoryEngineServer::Instance().Start()` before calling `MemoryEngine::Create`.
+`Start()` loads the server configuration from the environment, and `Start(config)`
+accepts a TENT `Config` directly. A second start on the same endpoint returns
+`OK` and keeps the current configuration. A different endpoint returns
+`InvalidEntry` while the server is running.
+
+Bind the client thread to its Ascend device before `Create`, then call `Join`
+before allocating. For a planned shutdown, let clients `Leave()` before calling
+`MemoryEngineServer::Instance().Stop()`. `Stop()` closes the listener and clears
+the in-memory cluster state. A subsequent `Start()` begins with a fresh state.
 
 For multiple hosts, choose an `MF_PROTOCOL` supported by the deployment and
 use mutually reachable addresses for `server_url`, `client_host`, and the

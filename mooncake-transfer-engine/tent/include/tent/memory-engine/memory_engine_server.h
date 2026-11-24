@@ -5,6 +5,7 @@
 #define TENT_MEMORY_ENGINE_SERVER_H
 
 #include <memory>
+#include <mutex>
 
 #include "tent/common/status.h"
 
@@ -15,15 +16,20 @@ class Config;
 
 class MemoryEngineServer {
    public:
-    // Keep the returned object alive for as long as the service should listen.
-    static Status Start(const Config &config, std::unique_ptr<MemoryEngineServer> *server);
-    static Status Start(std::unique_ptr<MemoryEngineServer> *server);
-    ~MemoryEngineServer();
+    static MemoryEngineServer &Instance();
+
+    // Starting again on the same endpoint keeps the current configuration.
+    Status Start(const Config &config);
+    Status Start();
+    // Stop listening and discard the in-memory cluster state.
+    void Stop();
 
    private:
     struct Impl;
-    explicit MemoryEngineServer(std::unique_ptr<Impl> impl);
+    MemoryEngineServer();
+    ~MemoryEngineServer();
 
+    std::mutex mLifecycleMutex;
     std::unique_ptr<Impl> mImpl;
 };
 

@@ -2500,12 +2500,12 @@ protected:
         config.set("memory_engine/server/host_mem_max", WINDOW_SIZE);
         config.set("memory_engine/server/device_mem_max", WINDOW_SIZE);
         config.set("memory_engine/server/rpc_server_threads", RPC_THREADS);
-        ASSERT_TRUE(IsOk(MemoryEngineServer::Start(config, &mServer)));
+        ASSERT_TRUE(IsOk(MemoryEngineServer::Instance().Start(config)));
     }
 
     void TearDown() override
     {
-        mServer.reset();
+        MemoryEngineServer::Instance().Stop();
         EXPECT_EQ(unsetenv("MF_PROTOCOL"), 0);
         ResetAcl();
         MemFabricGva::TearDown();
@@ -2539,15 +2539,12 @@ protected:
 
 private:
     std::string mServerUrl;
-    std::unique_ptr<MemoryEngineServer> mServer;
 };
 
 TEST_F(MemoryEngineTest, RejectsInvalidOutputsAndClientLayouts)
 {
     Config config;
-    std::unique_ptr<MemoryEngineServer> server;
-    EXPECT_TRUE(MemoryEngineServer::Start(config, &server).IsInvalidArgument());
-    EXPECT_EQ(server, nullptr);
+    EXPECT_TRUE(MemoryEngineServer::Instance().Start(config).IsInvalidArgument());
 
     std::unique_ptr<MemoryEngine> engine;
     ConfigureClient(config);

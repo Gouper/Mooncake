@@ -209,7 +209,8 @@ bool RegionOverlaps(const std::map<uint64_t, GvaRegion> &regions, const GvaRegio
 
 struct MemoryEngineServer::Impl {
     ~Impl();
-    Status Start(const Config &config);
+    Status Start(const Config &config, const Endpoint &endpoint);
+    Status CheckEndpoint(const Endpoint &endpoint) const;
     Status RegisterRpcHandlers();
     Status Register(const json &request, json &response);
     Status Confirm(const json &request);
@@ -236,6 +237,7 @@ struct MemoryEngineServer::Impl {
     uint64_t mGeneration{};
     Layout mLayout;
     Layout mConfiguredLayout;
+    Endpoint mEndpoint;
     Bases mExpectedBases;
     std::optional<Bases> mBases;
     std::unordered_map<std::string, Registration> mRegistrations;
@@ -256,10 +258,8 @@ MemoryEngineServer::Impl::~Impl()
     }
 }
 
-Status MemoryEngineServer::Impl::Start(const Config &config)
+Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &endpoint)
 {
-    Endpoint endpoint;
-    CHECK_STATUS(ParseEndpoint(config.get(config_keys::CONFIG_SERVER_URL, ""), endpoint));
     CHECK_STATUS(ReadLayout(config, config_keys::CONFIG_SERVER_WORLD_SIZE, config_keys::CONFIG_SERVER_HOST_MEM_MAX,
                             config_keys::CONFIG_SERVER_DEVICE_MEM_MAX, mConfiguredLayout));
     if (!ValidWindow(mConfiguredLayout.hostWindow) || !ValidWindow(mConfiguredLayout.deviceWindow)) {
@@ -290,6 +290,14 @@ Status MemoryEngineServer::Impl::Start(const Config &config)
     CHECK_STATUS(mRpc.StartAt(endpoint.host, endpoint.port, static_cast<size_t>(*threads)));
     mReaper = std::jthread([this](std::stop_token stop) { RunPeriodic(stop, REAP_INTERVAL, [this] { Reap(); }); });
     return Status::OK();
+}
+
+Status MemoryEngineServer::Impl::CheckEndpoint(const Endpoint &endpoint) const
+{
+    if (mEndpoint.host == endpoint.host && mEndpoint.port == endpoint.port) {
+        return Status::OK();
+    }
+    return Status::InvalidEntry("MemoryEngine server is already listening on another endpoint");
 }
 
 Status MemoryEngineServer::Impl::RegisterRpcHandlers()
@@ -767,41 +775,53 @@ Status MemoryEngineServer::Impl::UpdateRegion(const json &request, bool publish)
     return Status::OK();
 }
 
-MemoryEngineServer::MemoryEngineServer(std::unique_ptr<Impl> impl)
-    : mImpl(std::move(impl))
+MemoryEngineServer &MemoryEngineServer::Instance()
 {
+    static MemoryEngineServer instance;
+    return instance;
 }
+
+MemoryEngineServer::MemoryEngineServer() = default;
 
 MemoryEngineServer::~MemoryEngineServer() = default;
 
-Status MemoryEngineServer::Start(const Config &config, std::unique_ptr<MemoryEngineServer> *server)
+Status MemoryEngineServer::Start(const Config &config)
 {
-    if (!server || *server) {
-        return Status::InvalidArgument("MemoryEngineServer requires an empty output");
+    const auto snapshot = config.freeze();
+    Endpoint endpoint;
+    CHECK_STATUS(ParseEndpoint(snapshot->get(config_keys::CONFIG_SERVER_URL, ""), endpoint));
+
+    std::lock_guard lock(mLifecycleMutex);
+    if (mImpl) {
+        return mImpl->CheckEndpoint(endpoint);
     }
+
     auto impl = std::unique_ptr<Impl>(new (std::nothrow) Impl);
-    if (!impl) {
+    if (!impl) [[unlikely]] {
         return Status::InternalError("Could not allocate MemoryEngineServer state");
     }
-    auto result = std::unique_ptr<MemoryEngineServer>(new (std::nothrow) MemoryEngineServer(std::move(impl)));
-    if (!result) {
-        return Status::InternalError("Could not allocate MemoryEngineServer");
-    }
-    const auto snapshot = config.freeze();
-    auto status = result->mImpl->Start(*snapshot);
+    const auto status = impl->Start(*snapshot, endpoint);
     if (!status.ok()) {
         LOG(ERROR) << "Failed to start MemoryEngine server, status:" << static_cast<uint16_t>(status.code()) << ".";
         return status;
     }
-    *server = std::move(result);
+
+    impl->mEndpoint = std::move(endpoint);
+    mImpl = std::move(impl);
     return Status::OK();
 }
 
-Status MemoryEngineServer::Start(std::unique_ptr<MemoryEngineServer> *server)
+Status MemoryEngineServer::Start()
 {
     Config config;
     CHECK_STATUS(ConfigHelper().loadFromEnv(config));
-    return Start(config, server);
+    return Start(config);
+}
+
+void MemoryEngineServer::Stop()
+{
+    std::lock_guard lock(mLifecycleMutex);
+    mImpl.reset();
 }
 
 }
