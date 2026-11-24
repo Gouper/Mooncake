@@ -8,7 +8,8 @@
 #include "tent/common/utils/ip.h"
 #include "memory_engine_common.h"
 
-namespace mooncake::tent::memory_engine {
+namespace mooncake {
+namespace tent {
 namespace {
 
 constexpr uint64_t MAX_WINDOW = 1ULL << 50;
@@ -153,4 +154,5 @@ bool Retryable(const Status &status)
     return status.IsTooManyRequests() || status.IsNeedsRefreshCache();
 }
 
+}
 }

@@ -24,35 +24,9 @@
 #include "../common/memory_engine_common.h"
 #include "tent/memory-engine/memory_engine_client.h"
 
-namespace mooncake::tent {
+namespace mooncake {
+namespace tent {
 namespace {
-
-using memory_engine::Bases;
-using memory_engine::Call;
-using memory_engine::CallAsync;
-using memory_engine::Clock;
-using memory_engine::DEFAULT_REGISTRATION;
-using memory_engine::Endpoint;
-using memory_engine::GIB;
-using memory_engine::GvaRegion;
-using memory_engine::Layout;
-using memory_engine::MAX_TIMEOUT;
-using memory_engine::MemoryRpc;
-using memory_engine::Milliseconds;
-using memory_engine::ParseEndpoint;
-using memory_engine::PeerCall;
-using memory_engine::ReadLayout;
-using memory_engine::ReadRegion;
-using memory_engine::ReadUnsigned;
-using memory_engine::RegisterHandler;
-using memory_engine::RETRY_INTERVAL;
-using memory_engine::RPC_TIMEOUT;
-using memory_engine::Retryable;
-using memory_engine::RunPeriodic;
-using memory_engine::ValidateBases;
-using memory_engine::ValidateLayout;
-
-namespace config_keys = memory_engine::config_keys;
 
 constexpr auto DEFAULT_HEARTBEAT = Milliseconds(3000);
 constexpr size_t ALLOCATION_ALIGNMENT = 2UL << 20;
@@ -834,4 +808,5 @@ Status MemoryEngine::RankOfGva(const void *address, uint32_t *rank) const
     return Status::OK();
 }
 
+}
 }

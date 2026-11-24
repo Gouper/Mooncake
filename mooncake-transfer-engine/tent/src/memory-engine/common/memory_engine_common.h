@@ -19,7 +19,8 @@
 #include "tent/common/config.h"
 #include "tent/rpc/rpc.h"
 
-namespace mooncake::tent::memory_engine {
+namespace mooncake {
+namespace tent {
 
 using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
@@ -153,6 +154,7 @@ void RunPeriodic(std::stop_token stop, Milliseconds interval, Tick tick)
     }
 }
 
+}
 }
 
 #endif
