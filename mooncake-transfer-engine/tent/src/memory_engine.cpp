@@ -53,6 +53,34 @@ constexpr int REGISTRATION_ID_WORDS = 4;
 constexpr uint64_t MAX_RANKS = std::numeric_limits<uint32_t>::max();
 constexpr std::string_view RPC_SCHEME = "rpc://";
 
+constexpr char CONFIG_ENABLED[] = "memory_engine/enabled";
+constexpr char CONFIG_SERVER_URL[] = "memory_engine/server_url";
+constexpr char CONFIG_WORLD_SIZE[] = "memory_engine/world_size";
+constexpr char CONFIG_HOST_MEM_MAX[] = "memory_engine/host_mem_max";
+constexpr char CONFIG_DEVICE_MEM_MAX[] = "memory_engine/device_mem_max";
+constexpr char CONFIG_AUTO_RANKING[] = "memory_engine/auto_ranking";
+constexpr char CONFIG_LOCAL_RANK[] = "memory_engine/local_rank";
+constexpr char CONFIG_CLIENT_HOST[] = "memory_engine/client_host";
+constexpr char CONFIG_HEARTBEAT_INTERVAL_MS[] = "memory_engine/heartbeat_interval_ms";
+constexpr char CONFIG_JOIN_TIMEOUT_MS[] = "memory_engine/join_timeout_ms";
+
+constexpr char CONFIG_SERVER_WORLD_SIZE[] = "memory_engine/server/world_size";
+constexpr char CONFIG_SERVER_HOST_MEM_MAX[] = "memory_engine/server/host_mem_max";
+constexpr char CONFIG_SERVER_DEVICE_MEM_MAX[] = "memory_engine/server/device_mem_max";
+constexpr char CONFIG_SERVER_GVA_BASE_HOST[] = "memory_engine/server/gva_base_host";
+constexpr char CONFIG_SERVER_GVA_BASE_DEVICE[] = "memory_engine/server/gva_base_device";
+constexpr char CONFIG_SERVER_HEARTBEAT_TIMEOUT_MS[] = "memory_engine/server/heartbeat_timeout_ms";
+constexpr char CONFIG_SERVER_RPC_SERVER_THREADS[] = "memory_engine/server/rpc_server_threads";
+
+constexpr char TENT_CONFIG_METADATA_TYPE[] = "metadata_type";
+constexpr char TENT_CONFIG_METADATA_SERVERS[] = "metadata_servers";
+constexpr char TENT_CONFIG_MEMFABRIC_ENABLE[] = "transports/memfabric/enable";
+constexpr char TENT_CONFIG_GVA_ENABLED[] = "transports/memfabric/gva/enabled";
+constexpr char TENT_CONFIG_GVA_RANK[] = "transports/memfabric/gva/rank";
+constexpr char TENT_CONFIG_GVA_RANK_COUNT[] = "transports/memfabric/gva/rank_count";
+constexpr char TENT_CONFIG_GVA_DRAM_WINDOW[] = "transports/memfabric/gva/dram_window";
+constexpr char TENT_CONFIG_GVA_HBM_WINDOW[] = "transports/memfabric/gva/hbm_window";
+
 enum class MemoryRpc {
     Register = 100,
     Confirm,
@@ -299,29 +327,30 @@ Status ReadLayout(const json &worldSize, const json &hostWindow, const json &dev
     return Status::OK();
 }
 
-Status ReadLayout(const Config &config, const std::string &prefix, Layout &layout)
+Status ReadLayout(const Config &config, const char *worldSizeKey, const char *hostWindowKey,
+                  const char *deviceWindowKey, Layout &layout)
 {
-    return ReadLayout(config.get(prefix + "world_size", json(0)), config.get(prefix + "host_mem_max", json(0)),
-                      config.get(prefix + "device_mem_max", json(0)), layout);
+    return ReadLayout(config.get(worldSizeKey, json(0)), config.get(hostWindowKey, json(0)),
+                      config.get(deviceWindowKey, json(0)), layout);
 }
 
 Status ReadClientOptions(const Config &config, ClientOptions &options)
 {
-    if (!config.get("memory_engine/enabled", true)) {
+    if (!config.get(CONFIG_ENABLED, true)) {
         return Status::NotImplemented("MemoryEngine is disabled");
     }
-    CHECK_STATUS(ParseEndpoint(config.get("memory_engine/server_url", ""), options.server));
-    CHECK_STATUS(ReadLayout(config, "memory_engine/", options.layout));
+    CHECK_STATUS(ParseEndpoint(config.get(CONFIG_SERVER_URL, ""), options.server));
+    CHECK_STATUS(ReadLayout(config, CONFIG_WORLD_SIZE, CONFIG_HOST_MEM_MAX, CONFIG_DEVICE_MEM_MAX, options.layout));
     CHECK_STATUS(ValidateLayout(options.layout));
-    if (!config.get("memory_engine/auto_ranking", true)) {
-        const auto rank = ReadUnsigned(config.get("memory_engine/local_rank", json()), options.layout.worldSize - 1);
+    if (!config.get(CONFIG_AUTO_RANKING, true)) {
+        const auto rank = ReadUnsigned(config.get(CONFIG_LOCAL_RANK, json()), options.layout.worldSize - 1);
         if (!rank) {
             return Status::InvalidArgument("Explicit local_rank is required and must be in range");
         }
         options.requestedRank = static_cast<uint32_t>(*rank);
     }
-    options.callbackHost = config.get("memory_engine/client_host", "");
-    options.heartbeat = Milliseconds(config.get("memory_engine/heartbeat_interval_ms", DEFAULT_HEARTBEAT.count()));
+    options.callbackHost = config.get(CONFIG_CLIENT_HOST, "");
+    options.heartbeat = Milliseconds(config.get(CONFIG_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT.count()));
     if (options.heartbeat <= Milliseconds::zero() || options.heartbeat >= MAX_TIMEOUT) {
         return Status::InvalidArgument("Invalid MemoryEngine heartbeat interval");
     }
@@ -568,25 +597,26 @@ MemoryEngineServer::Impl::~Impl()
 Status MemoryEngineServer::Impl::Start(const Config &config)
 {
     Endpoint endpoint;
-    CHECK_STATUS(ParseEndpoint(config.get("memory_engine/server_url", ""), endpoint));
-    CHECK_STATUS(ReadLayout(config, "memory_engine/server/", mConfiguredLayout));
+    CHECK_STATUS(ParseEndpoint(config.get(CONFIG_SERVER_URL, ""), endpoint));
+    CHECK_STATUS(ReadLayout(config, CONFIG_SERVER_WORLD_SIZE, CONFIG_SERVER_HOST_MEM_MAX,
+                            CONFIG_SERVER_DEVICE_MEM_MAX, mConfiguredLayout));
     if (!ValidWindow(mConfiguredLayout.hostWindow) || !ValidWindow(mConfiguredLayout.deviceWindow)) {
         return Status::InvalidArgument("Invalid MemoryEngine server GVA windows");
     }
-    const auto host = ReadUnsigned(config.get("memory_engine/server/gva_base_host", json(0)), UINT64_MAX);
-    const auto device = ReadUnsigned(config.get("memory_engine/server/gva_base_device", json(0)), UINT64_MAX);
+    const auto host = ReadUnsigned(config.get(CONFIG_SERVER_GVA_BASE_HOST, json(0)), UINT64_MAX);
+    const auto device = ReadUnsigned(config.get(CONFIG_SERVER_GVA_BASE_DEVICE, json(0)), UINT64_MAX);
     if (!host || !device) {
         return Status::InvalidArgument("Invalid MemoryEngine server GVA bases");
     }
     mExpectedBases = {*host, *device};
 
-    mLease = Milliseconds(config.get("memory_engine/server/heartbeat_timeout_ms", DEFAULT_LEASE.count()));
-    mRegistrationTimeout = Milliseconds(config.get("memory_engine/join_timeout_ms", DEFAULT_REGISTRATION.count()));
+    mLease = Milliseconds(config.get(CONFIG_SERVER_HEARTBEAT_TIMEOUT_MS, DEFAULT_LEASE.count()));
+    mRegistrationTimeout = Milliseconds(config.get(CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
     if (mLease <= Milliseconds::zero() || mRegistrationTimeout <= Milliseconds::zero() ||
         mLease >= MAX_TIMEOUT || mRegistrationTimeout >= MAX_TIMEOUT) {
         return Status::InvalidArgument("Invalid MemoryEngine server timeouts");
     }
-    const auto threads = ReadUnsigned(config.get("memory_engine/server/rpc_server_threads", json(DEFAULT_RPC_THREADS)),
+    const auto threads = ReadUnsigned(config.get(CONFIG_SERVER_RPC_SERVER_THREADS, json(DEFAULT_RPC_THREADS)),
                                       std::numeric_limits<size_t>::max());
     if (!threads || !*threads) {
         return Status::InvalidArgument("Invalid MemoryEngine server RPC thread count");
@@ -1618,14 +1648,14 @@ Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
 {
     auto native = std::make_shared<Config>();
     CHECK_STATUS(native->load(config.dump()));
-    native->set("metadata_type", "p2p");
-    native->set("metadata_servers", "");
-    native->set("transports/memfabric/enable", true);
-    native->set("transports/memfabric/gva/enabled", true);
-    native->set("transports/memfabric/gva/rank", mRank);
-    native->set("transports/memfabric/gva/rank_count", mLayout.worldSize);
-    native->set("transports/memfabric/gva/dram_window", mLayout.hostWindow / GIB);
-    native->set("transports/memfabric/gva/hbm_window", mLayout.deviceWindow / GIB);
+    native->set(TENT_CONFIG_METADATA_TYPE, "p2p");
+    native->set(TENT_CONFIG_METADATA_SERVERS, "");
+    native->set(TENT_CONFIG_MEMFABRIC_ENABLE, true);
+    native->set(TENT_CONFIG_GVA_ENABLED, true);
+    native->set(TENT_CONFIG_GVA_RANK, mRank);
+    native->set(TENT_CONFIG_GVA_RANK_COUNT, mLayout.worldSize);
+    native->set(TENT_CONFIG_GVA_DRAM_WINDOW, mLayout.hostWindow / GIB);
+    native->set(TENT_CONFIG_GVA_HBM_WINDOW, mLayout.deviceWindow / GIB);
     auto tent = std::unique_ptr<TransferEngineImpl>(new (std::nothrow) TransferEngineImpl(native, true, false));
     if (!tent || !tent->available()) {
         return Status::InternalError("Could not initialize MemoryEngine TENT instance");
@@ -1687,7 +1717,7 @@ Status MemoryEngine::Impl::ConfirmRegistration()
 Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
 {
     CHECK_STATUS(ReadClientOptions(*config, mOptions));
-    mJoinTimeout = Milliseconds(config->get("memory_engine/join_timeout_ms", DEFAULT_REGISTRATION.count()));
+    mJoinTimeout = Milliseconds(config->get(CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
     if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
         return Status::InvalidArgument("Invalid MemoryEngine join timeout");
     }
