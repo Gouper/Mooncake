@@ -185,6 +185,9 @@ A topology file may also use TENT's native `{"nics":[...],"mems":[...]}` format 
 
 ## MemoryEngine configuration
 
+Include `tent/memory-engine/memory_engine_client.h` to use `MemoryEngine` and
+`tent/memory-engine/memory_engine_server.h` to start `MemoryEngineServer`.
+
 Copy `mooncake-transfer-engine/tent/config/transfer-engine.json` and edit its
 top-level `memory_engine` object. The example uses one rank on the local host
 with a 1 GiB Device GVA window. Set both variables in the client environment

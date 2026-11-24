@@ -30,7 +30,8 @@
 
 #include "memfabric_allocator.h"
 #include "tent/common/config.h"
-#include "tent/memory_engine.h"
+#include "tent/memory-engine/memory_engine_client.h"
+#include "tent/memory-engine/memory_engine_server.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/transfer_engine.h"
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
