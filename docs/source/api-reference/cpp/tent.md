@@ -183,6 +183,45 @@ export MC_CUSTOM_TOPO_JSON=/etc/mooncake/nic_priority_matrix.json
 
 A topology file may also use TENT's native `{"nics":[...],"mems":[...]}` format when loaded via `custom_json_path` / `MC_CUSTOM_TOPO_JSON`. If loading or parsing fails, TENT falls back to auto-discovery.
 
+## MemoryEngine configuration
+
+Copy `mooncake-transfer-engine/tent/config/transfer-engine.json` and edit its
+top-level `memory_engine` object. The example uses one rank on the local host
+with a 1 GiB Device GVA window. Set both variables in the client environment
+and set `MC_TENT_CONF` in the server environment.
+
+```bash
+export MC_TENT_CONF=/path/to/transfer-engine.json
+export MF_PROTOCOL=device_sdma
+```
+
+Build with `-DUSE_TENT=ON -DUSE_MEMFABRIC=ON` and MemFabric HYBM headers. Make
+`libmf_hybm_core.so` available to the client at runtime. Start
+`MemoryEngineServer::Start` before calling `MemoryEngine::Create`. Bind the
+client thread to its Ascend device before `Create`, then call `Join` before
+allocating.
+
+For multiple hosts, choose an `MF_PROTOCOL` supported by the deployment and
+use mutually reachable addresses for `server_url`, `client_host`, and the
+top-level TENT `rpc_server_hostname`. Use the same `world_size` and window sizes
+on every client.
+
+| Key under `memory_engine` | Meaning |
+| --- | --- |
+| `enabled` | Allows clients to call `MemoryEngine::Create`. Defaults to `true`. |
+| `server_url` | Server listen and client connect endpoint, in `host:port` form. |
+| `world_size` | Number of ranks. Required on clients. |
+| `host_mem_max`, `device_mem_max` | Per-rank GVA window sizes in bytes. Use whole GiB and set an unused window to zero. Enable at least one window. |
+| `auto_ranking` | Lets the server assign each rank. Defaults to `true`. |
+| `local_rank` | Required when `auto_ranking` is `false`. Use a unique rank in `[0, world_size)`. |
+| `client_host` | Client callback address. An empty value enables automatic selection. |
+| `heartbeat_interval_ms` | Client heartbeat interval. Defaults to `3000` and must be shorter than the server timeout. |
+| `join_timeout_ms` | Registration and join timeout in milliseconds. Defaults to `120000`. |
+| `server.world_size`, `server.host_mem_max`, `server.device_mem_max` | Expected layout. Each nonzero value must match the client value. |
+| `server.gva_base_host`, `server.gva_base_device` | Expected GVA base addresses. For each zero value the server accepts the first confirmed base. |
+| `server.heartbeat_timeout_ms` | Time before a rank expires without a heartbeat. Defaults to `20000`. |
+| `server.rpc_server_threads` | Server RPC worker count. Defaults to `4`. |
+
 ## Core APIs
 
 ### Core Usage Path (C++)

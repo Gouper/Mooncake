@@ -4,6 +4,27 @@
     "metadata_servers": "127.0.0.1:2379",
     "rpc_server_hostname": "127.0.0.1",
     "rpc_server_port": 0,
+    "memory_engine": {
+        "enabled": true,
+        "server_url": "127.0.0.1:29557",
+        "world_size": 1,
+        "host_mem_max": 0,
+        "device_mem_max": 1073741824,
+        "auto_ranking": true,
+        "local_rank": 0,
+        "client_host": "127.0.0.1",
+        "heartbeat_interval_ms": 3000,
+        "join_timeout_ms": 120000,
+        "server": {
+            "world_size": 1,
+            "host_mem_max": 0,
+            "device_mem_max": 1073741824,
+            "gva_base_host": 0,
+            "gva_base_device": 0,
+            "heartbeat_timeout_ms": 20000,
+            "rpc_server_threads": 4
+        }
+    },
     "topology": {
         "rdma_whitelist": ["mlx5_0", "mlx5_2"],
         "rdma_blacklist": []
