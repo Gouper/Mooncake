@@ -185,20 +185,21 @@ A topology file may also use TENT's native `{"nics":[...],"mems":[...]}` format 
 
 ## MemoryEngine configuration
 
-Include `tent/memory-engine/memory_engine_client.h` to use `MemoryEngine` and
-`tent/memory-engine/memory_engine_server.h` to start `MemoryEngineServer`.
+Link `mooncake_memory_engine`. Include `memory_engine_client.h` to use
+`MemoryEngine` and `memory_engine_server.h` to start `MemoryEngineServer`.
 
-Copy `mooncake-transfer-engine/tent/config/transfer-engine.json` and edit its
+Copy `mooncake-memory-engine/config/memory-engine.json` and edit its
 top-level `memory_engine` object. The example uses one rank on the local host
 with a 1 GiB Device GVA window. Set both variables in the client environment
 and set `MC_TENT_CONF` in the server environment.
 
 ```bash
-export MC_TENT_CONF=/path/to/transfer-engine.json
+export MC_TENT_CONF=/path/to/memory-engine.json
 export MF_PROTOCOL=device_sdma
 ```
 
-Build with `-DUSE_TENT=ON -DUSE_MEMFABRIC=ON` and MemFabric HYBM headers. Make
+Build with `-DUSE_TENT=ON -DUSE_MEMFABRIC=ON` and MemFabric HYBM headers. Keep
+`transports.memfabric.enable` set to `true` in the client's `MC_TENT_CONF`. Make
 `libmf_hybm_core.so` available to the client at runtime. Call
 `MemoryEngineServer::Instance().Start()` before calling `MemoryEngine::Create`.
 `Start()` loads the server configuration from the environment, and `Start(config)`

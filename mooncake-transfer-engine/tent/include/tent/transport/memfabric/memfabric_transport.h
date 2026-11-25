@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "memfabric_gva_access.h"
 #include "memfabric_types.h"
 #include "tent/common/concurrent/thread_pool.h"
 #include "tent/transport/memfabric/memfabric_shared_memory.h"
@@ -53,7 +54,8 @@ struct MemFabricSubBatch : public Transport::SubBatch {
     ~MemFabricSubBatch() override;
 };
 
-class MemFabricTransport : public Transport {
+class MemFabricTransport : public Transport, public MemFabricGvaAccess,
+                           public std::enable_shared_from_this<MemFabricTransport> {
     friend class MemFabricTransportTest;
 
    public:
@@ -86,13 +88,13 @@ class MemFabricTransport : public Transport {
     Status freeLocalMemory(void*, size_t) override;
     bool warmupMemory(void* address, size_t size) override;
     bool supportsGlobalAddressing() const override;
-    Status GetGvaBases(uint64_t &host, uint64_t &device) const;
-    MemFabricSharedMemory *GetGvaContext() const;
-    Status GetGvaIdentity(std::string &identity) const;
-    Status PrepareGvaPeer(const std::string &segment, const std::string &identity);
-    Status CloseGvaPeer(SegmentID id, uint32_t rank, const std::string &segment);
-    Status MapGvaRegion(SegmentID id, void *address, size_t size);
-    Status RevokeGvaRegion(SegmentID id, uint32_t rank, const std::string &segment, uint64_t address);
+    Status GetGvaBases(uint64_t &host, uint64_t &device) const override;
+    MemFabricSharedMemory *GetGvaContext() const override;
+    Status GetGvaIdentity(std::string &identity) const override;
+    Status PrepareGvaPeer(const std::string &segment, const std::string &identity) override;
+    Status CloseGvaPeer(SegmentID id, uint32_t rank, const std::string &segment) override;
+    Status MapGvaRegion(SegmentID id, void *address, size_t size) override;
+    Status RevokeGvaRegion(SegmentID id, uint32_t rank, const std::string &segment, uint64_t address) override;
     Status mapRemoteMemory(SegmentID, void*, size_t) override;
     Status unmapRemoteMemory(SegmentID, void*) override;
     const char* getName() const override { return "memfabric"; }
@@ -124,7 +126,7 @@ class MemFabricTransport : public Transport {
     std::shared_ptr<std::atomic<size_t>> gva_pending_ =
         std::make_shared<std::atomic<size_t>>(0);
     size_t max_pending_copies_ = 256;
-    Status loadConfig(const std::shared_ptr<Config>& conf);
+    Status loadConfig(const std::shared_ptr<const Config>& conf);
     Status loadGvaConfig(const Config& conf, const std::string& protocol);
     Status finishInstall();
     // Called with inflight_mu_ held; also serializes registration and teardown.

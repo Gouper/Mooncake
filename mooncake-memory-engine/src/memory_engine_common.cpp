@@ -434,20 +434,20 @@ std::string EncodeReply(const Status &status, json &response)
     return response.dump();
 }
 
-Status Call(CoroRpcAgent &rpc, const std::string &endpoint, MemoryRpc op, const json &request, json &response)
+Status Call(MemoryEngineRpc &rpc, const std::string &endpoint, MemoryRpc op, const json &request, json &response)
 {
     std::string raw;
-    CHECK_STATUS(rpc.callOwned(endpoint, static_cast<int>(op), request.dump(), raw));
+    CHECK_STATUS(rpc.CallOwned(endpoint, static_cast<int>(op), request.dump(), raw));
     return DecodeReply(raw, response);
 }
 
-Status Call(CoroRpcAgent &rpc, const std::string &endpoint, MemoryRpc op, const json &request)
+Status Call(MemoryEngineRpc &rpc, const std::string &endpoint, MemoryRpc op, const json &request)
 {
     json response;
     return Call(rpc, endpoint, op, request, response);
 }
 
-std::future<Status> CallAsync(CoroRpcAgent &rpc, MemoryRpc op, const PeerCall &peer, Clock::time_point deadline)
+std::future<Status> CallAsync(MemoryEngineRpc &rpc, MemoryRpc op, const PeerCall &peer, Clock::time_point deadline)
 {
     std::promise<Status> completion;
     auto result = completion.get_future();

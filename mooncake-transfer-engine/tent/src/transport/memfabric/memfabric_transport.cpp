@@ -81,6 +81,33 @@ TransferStatusEnum mapBatchStatus(int32_t query_ret, int32_t batch_result) {
 
 }  // namespace
 
+namespace {
+
+std::mutex gGvaTransportsMutex;
+std::unordered_map<std::string, std::weak_ptr<MemFabricTransport>> gGvaTransports;
+
+}
+
+thread_local const MemFabricConfigScope *MemFabricConfigScope::gCurrent = nullptr;
+
+MemFabricConfigScope::MemFabricConfigScope(const Config &config)
+    : mConfig(config), mSnapshot(config.freeze()), mPrevious(gCurrent)
+{
+    gCurrent = this;
+}
+
+MemFabricConfigScope::~MemFabricConfigScope()
+{
+    gCurrent = mPrevious;
+}
+
+std::shared_ptr<MemFabricGvaAccess> MemFabricGvaAccess::Find(const std::string &segment)
+{
+    std::lock_guard lock(gGvaTransportsMutex);
+    const auto found = gGvaTransports.find(segment);
+    return found == gGvaTransports.end() ? nullptr : found->second.lock();
+}
+
 std::atomic<int> MemFabricTransport::g_init_ref_{0};
 std::mutex MemFabricTransport::g_init_mutex_;
 
@@ -266,7 +293,7 @@ Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     return context->unmap(peer, reinterpret_cast<uint64_t>(addr));
 }
 
-Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
+Status MemFabricTransport::loadConfig(const std::shared_ptr<const Config>& conf) {
     transfer_timeout_ms_ = 10000;
     const char* timeout_env = std::getenv("MF_TRANSFER_TIMEOUT");
     if (timeout_env && timeout_env[0] != '\0') {
@@ -361,7 +388,9 @@ Status MemFabricTransport::install(std::string& local_segment_name,
 
     local_segment_name_ = local_segment_name;
     metadata_ = metadata;
-    CHECK_STATUS(loadConfig(conf));
+    const auto *scope = MemFabricConfigScope::gCurrent;
+    const auto nativeConfig = scope && &scope->mConfig == conf.get() ? scope->mSnapshot : conf;
+    CHECK_STATUS(loadConfig(nativeConfig));
 
     if (!metadata_) {
         return Status::InvalidArgument("metadata is null" LOC_MARK);
@@ -418,6 +447,10 @@ Status MemFabricTransport::finishInstall() {
             gva_config_, local_segment_name_);
         CHECK_STATUS(context->initialize());
         gva_ = std::move(context);
+        if (const auto self = weak_from_this(); !self.expired()) {
+            std::lock_guard lock(gGvaTransportsMutex);
+            gGvaTransports.insert_or_assign(local_segment_name_, self);
+        }
     }
     stopping_ = false;
     installed_ = true;
@@ -1273,6 +1306,12 @@ Status MemFabricTransport::uninstall() {
     if (!installed_) return Status::OK();
     if (gva_) {
         CHECK_STATUS(gva_->close());
+        std::lock_guard lock(gGvaTransportsMutex);
+        const auto found = gGvaTransports.find(local_segment_name_);
+        if (found != gGvaTransports.end() &&
+            !found->second.owner_before(weak_from_this()) && !weak_from_this().owner_before(found->second)) {
+            gGvaTransports.erase(found);
+        }
         gva_.reset();
     }
     LOG(INFO) << "uninstall: handle=" << handle_;

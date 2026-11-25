@@ -49,9 +49,6 @@
 #ifdef USE_MLU
 #include "tent/transport/mlu/mlu_transport.h"
 #endif
-#ifdef USE_MEMFABRIC
-#include "tent/transport/memfabric/memfabric_transport.h"
-#endif
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -330,34 +327,22 @@ TransferEngineImpl::TransferEngineImpl()
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
                                        bool config_loaded)
-    : TransferEngineImpl(std::move(conf), config_loaded, true)
-{
-}
-
-TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf, bool configLoaded, bool loadEnvironment)
     : conf_(conf),
       available_(false),
       port_(0),
       ipv6_(false),
-      merge_requests_(true)
-{
-    if (!configLoaded) {
-        return;
-    }
+      merge_requests_(true) {
+    if (!config_loaded) return;
     if (!conf_) {
         LOG(ERROR) << "Cannot construct Transfer Engine with a null config";
         return;
     }
-    auto status = Status::OK();
-    if (loadEnvironment) {
-        auto preserved = captureExplicitTransferEngineConfig(*conf_);
-        // Keep the caller's explicit metadata identity.
-        status = ConfigHelper().loadFromEnv(*conf_);
-        restoreExplicitTransferEngineConfig(*conf_, preserved);
-    }
-    if (status.ok()) {
-        status = construct();
-    }
+    auto preserved = captureExplicitTransferEngineConfig(*conf_);
+    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
+    // explicit metadata identity intact.
+    auto status = ConfigHelper().loadFromEnv(*conf_);
+    restoreExplicitTransferEngineConfig(*conf_, preserved);
+    if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
@@ -367,96 +352,6 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf, bool config
 }
 
 TransferEngineImpl::~TransferEngineImpl() { deconstruct(); }
-
-Status TransferEngineImpl::GetMemFabricGvaBases(uint64_t &host, uint64_t &device) const
-{
-#ifdef USE_MEMFABRIC
-    const auto *transport = static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get());
-    if (transport) {
-        return transport->GetGvaBases(host, device);
-    }
-#else
-    static_cast<void>(host);
-    static_cast<void>(device);
-#endif
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-}
-
-Status TransferEngineImpl::CloseMemFabricGva()
-{
-    return transport_list_[MEMFABRIC]->uninstall();
-}
-
-MemFabricSharedMemory *TransferEngineImpl::GetMemFabricGva() const
-{
-#ifdef USE_MEMFABRIC
-    const auto *transport = static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get());
-    if (transport) {
-        return transport->GetGvaContext();
-    }
-#endif
-    return nullptr;
-}
-
-Status TransferEngineImpl::GetMemFabricGvaIdentity(std::string &identity) const
-{
-#ifdef USE_MEMFABRIC
-    return static_cast<const MemFabricTransport *>(transport_list_[MEMFABRIC].get())->GetGvaIdentity(identity);
-#else
-    static_cast<void>(identity);
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-#endif
-}
-
-Status TransferEngineImpl::PrepareMemFabricPeer(const std::string &segment, const std::string &identity)
-{
-#ifdef USE_MEMFABRIC
-    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->PrepareGvaPeer(segment, identity);
-#else
-    static_cast<void>(segment);
-    static_cast<void>(identity);
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-#endif
-}
-
-Status TransferEngineImpl::CloseMemFabricPeer(SegmentID id, uint32_t rank, const std::string &segment)
-{
-#ifdef USE_MEMFABRIC
-    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->CloseGvaPeer(id, rank, segment);
-#else
-    static_cast<void>(id);
-    static_cast<void>(rank);
-    static_cast<void>(segment);
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-#endif
-}
-
-Status TransferEngineImpl::RevokeMemFabricRegion(SegmentID id, uint32_t rank, const std::string &segment,
-                                               uint64_t address)
-{
-#ifdef USE_MEMFABRIC
-    auto &transport = static_cast<MemFabricTransport &>(*transport_list_[MEMFABRIC]);
-    return transport.RevokeGvaRegion(id, rank, segment, address);
-#else
-    static_cast<void>(id);
-    static_cast<void>(rank);
-    static_cast<void>(segment);
-    static_cast<void>(address);
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-#endif
-}
-
-Status TransferEngineImpl::MapMemFabricRegion(SegmentID id, void *address, size_t size)
-{
-#ifdef USE_MEMFABRIC
-    return static_cast<MemFabricTransport *>(transport_list_[MEMFABRIC].get())->MapGvaRegion(id, address, size);
-#else
-    static_cast<void>(id);
-    static_cast<void>(address);
-    static_cast<void>(size);
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-#endif
-}
 
 std::string randomSegmentName() {
     std::string name = "segment_noname_";

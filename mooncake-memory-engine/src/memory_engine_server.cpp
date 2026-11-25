@@ -24,8 +24,8 @@
 #include <glog/logging.h>
 
 #include "tent/common/utils/ip.h"
-#include "../common/memory_engine_common.h"
-#include "tent/memory-engine/memory_engine_server.h"
+#include "memory_engine_common.h"
+#include "memory_engine_server.h"
 
 namespace mooncake {
 namespace tent {
@@ -129,7 +129,7 @@ class OwnerMutation {
     bool mAcquired{};
 };
 
-Status SendToPeersInParallel(CoroRpcAgent &rpc, MemoryRpc op, std::vector<PeerCallback> peers,
+Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, std::vector<PeerCallback> peers,
                              Clock::time_point deadline)
 {
     while (!peers.empty()) {
@@ -261,14 +261,14 @@ struct MemoryEngineServer::Impl {
     std::set<uint32_t> mFreeRanks;
     Milliseconds mLease{DEFAULT_LEASE};
     Milliseconds mRegistrationTimeout{DEFAULT_REGISTRATION};
-    CoroRpcAgent mRpc;
+    MemoryEngineRpc mRpc;
     std::jthread mReaper;
 };
 
 MemoryEngineServer::Impl::~Impl()
 {
     mReaper = std::jthread();
-    const auto status = mRpc.stop();
+    const auto status = mRpc.Stop();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to stop MemoryEngine server RPC, port:" << mEndpoint.port
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";

@@ -20,7 +20,7 @@
 #include <glog/logging.h>
 
 #include "tent/common/config.h"
-#include "tent/rpc/rpc.h"
+#include "memory_engine_rpc.h"
 
 namespace mooncake {
 namespace tent {
@@ -227,15 +227,15 @@ Status DecodePeerRegion(const json &payload, GvaRegion &region);
 
 std::string EncodeReply(const Status &status, json &response);
 
-Status Call(CoroRpcAgent &rpc, const std::string &endpoint, MemoryRpc op, const json &request, json &response);
-Status Call(CoroRpcAgent &rpc, const std::string &endpoint, MemoryRpc op, const json &request);
-std::future<Status> CallAsync(CoroRpcAgent &rpc, MemoryRpc op, const PeerCall &peer, Clock::time_point deadline);
+Status Call(MemoryEngineRpc &rpc, const std::string &endpoint, MemoryRpc op, const json &request, json &response);
+Status Call(MemoryEngineRpc &rpc, const std::string &endpoint, MemoryRpc op, const json &request);
+std::future<Status> CallAsync(MemoryEngineRpc &rpc, MemoryRpc op, const PeerCall &peer, Clock::time_point deadline);
 bool Retryable(const Status &status);
 
 template <typename Handler>
-Status RegisterHandler(CoroRpcAgent &rpc, MemoryRpc op, Handler handler, bool offload = false)
+Status RegisterHandler(MemoryEngineRpc &rpc, MemoryRpc op, Handler handler, bool offload = false)
 {
-    return rpc.registerFunction(static_cast<int>(op), [handler](std::string_view data, std::string &output) {
+    return rpc.RegisterFunction(static_cast<int>(op), [handler](std::string_view data, std::string &output) {
         json response = json::object();
         Status status;
         try {
@@ -249,7 +249,7 @@ Status RegisterHandler(CoroRpcAgent &rpc, MemoryRpc op, Handler handler, bool of
 }
 
 template <typename Request, typename Handler>
-Status RegisterRequestHandler(CoroRpcAgent &rpc, MemoryRpc op, Status (*decode)(const json &, Request &),
+Status RegisterRequestHandler(MemoryEngineRpc &rpc, MemoryRpc op, Status (*decode)(const json &, Request &),
                               Handler handler, bool offload = false)
 {
     return RegisterHandler(rpc, op, [decode, handler](const json &payload, json &) {

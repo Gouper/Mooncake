@@ -202,9 +202,6 @@ else()
 endif()
 
 file(GLOB TENT_ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-file(GLOB_RECURSE TENT_MEMORY_ENGINE_SOURCES CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/memory-engine/*.cpp")
-list(APPEND TENT_ENGINE_SOURCES ${TENT_MEMORY_ENGINE_SOURCES})
 
 add_library(tent STATIC ${TENT_ENGINE_SOURCES})
 target_link_libraries(tent PUBLIC tent_runtime tent_interface)
@@ -267,8 +264,3 @@ install(
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
-install(
-  FILES ../include/tent/memory-engine/memory_engine_client.h
-        ../include/tent/memory-engine/memory_engine_server.h
-  DESTINATION include/tent/memory-engine)
-install(FILES ../include/tent/common/status.h DESTINATION include/tent/common)
