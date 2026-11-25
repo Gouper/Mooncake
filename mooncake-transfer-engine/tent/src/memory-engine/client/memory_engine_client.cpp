@@ -452,7 +452,13 @@ Status MemoryEngine::Impl::ImportSharedPeer(PeerMapping &peer, SharedPeer &reque
 Status MemoryEngine::Impl::MapSharedPeerRegions(PeerMapping &peer, const SharedPeer &request)
 {
     for (const auto &region : request.regions) {
-        CHECK_STATUS(MapPeerRegion(request.rank, peer, region));
+        const auto mapRet = MapPeerRegion(request.rank, peer, region);
+        if (!mapRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to map shared MemoryEngine region, registration ID:" << mId
+                       << ", rank:" << mRank << ", peer rank:" << request.rank << ", generation:" << peer.generation
+                       << ", bytes:" << region.size << ", status:" << static_cast<uint16_t>(mapRet.code()) << ".";
+            return mapRet;
+        }
     }
     return Status::OK();
 }
@@ -589,7 +595,14 @@ Status MemoryEngine::Impl::SharePeer(const json &payload)
         return detailsRet;
     }
 
-    CHECK_STATUS(ImportSharedPeer(peer, request));
+    const auto importRet = ImportSharedPeer(peer, request);
+    if (!importRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine SharePeer import failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", peer rank:" << rank << ", generation:" << header.generation
+                   << ", status:" << static_cast<uint16_t>(importRet.code()) << ".";
+        return importRet;
+    }
+
     return MapSharedPeerRegions(peer, request);
 }
 
