@@ -4,6 +4,7 @@
 #include <chrono>
 #include <limits>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -31,6 +32,7 @@ constexpr char SEGMENT_KEY[] = "segment";
 constexpr char IDENTITY_KEY[] = "identity";
 constexpr char GENERATION_KEY[] = "generation";
 constexpr char REGIONS_KEY[] = "regions";
+constexpr char PEERS_KEY[] = "peers";
 constexpr char ADDRESS_KEY[] = "address";
 constexpr char SIZE_KEY[] = "size";
 constexpr char CODE_KEY[] = "code";
@@ -84,6 +86,32 @@ bool ReadRegion(const json &payload, GvaRegion &region)
     }
     region = {*address, static_cast<size_t>(*size)};
     return true;
+}
+
+Status DecodePeerRankAndGeneration(const json &payload, uint32_t &rank, uint64_t &generation)
+{
+    const auto decodedRank = ReadUnsigned(payload.at(RANK_KEY), MAX_RANKS);
+    const auto decodedGeneration = ReadUnsigned(payload.at(GENERATION_KEY), UINT64_MAX);
+    if (!decodedRank || !decodedGeneration || !*decodedGeneration) {
+        return Status::InvalidArgument("Invalid MemoryEngine peer callback");
+    }
+    rank = static_cast<uint32_t>(*decodedRank);
+    generation = *decodedGeneration;
+    return Status::OK();
+}
+
+json EncodeSharedPeer(const SharedPeer &peer)
+{
+    auto regions = json::array();
+    regions.get_ref<json::array_t &>().reserve(peer.regions.size());
+    for (const auto &region : peer.regions) {
+        json entry = json::object();
+        EncodeRegion(region, entry);
+        regions.push_back(std::move(entry));
+    }
+
+    return {{RANK_KEY, peer.rank}, {GENERATION_KEY, peer.generation}, {SEGMENT_KEY, peer.segment},
+            {IDENTITY_KEY, peer.identity}, {REGIONS_KEY, std::move(regions)}};
 }
 
 }
@@ -316,52 +344,73 @@ json EncodePeerRequest(const PeerRequest &request)
 
 Status DecodePeerRequest(const json &payload, PeerRequest &request)
 {
-    const auto rank = ReadUnsigned(payload.at(RANK_KEY), MAX_RANKS);
-    const auto generation = ReadUnsigned(payload.at(GENERATION_KEY), UINT64_MAX);
-    if (!rank || !generation || !*generation) {
-        return Status::InvalidArgument("Invalid MemoryEngine peer callback");
-    }
+    PeerRequest decoded;
+    CHECK_STATUS(DecodePeerRankAndGeneration(payload, decoded.rank, decoded.generation));
     const auto &id = payload.at(ID_KEY);
     if (!id.is_string()) {
         return Status::InvalidArgument("Invalid MemoryEngine peer callback");
     }
-    request = {id.get<std::string>(), static_cast<uint32_t>(*rank), *generation};
+    decoded.id = id.get<std::string>();
+    request = std::move(decoded);
     return Status::OK();
 }
 
 json EncodeSharePeerRequest(const SharePeerRequest &request)
 {
-    auto payload = EncodePeerRequest(request.peer);
-    payload[SEGMENT_KEY] = request.segment;
-    payload[IDENTITY_KEY] = request.identity;
-
-    auto regions = json::array();
-    regions.get_ref<json::array_t &>().reserve(request.regions.size());
-    for (const auto &region : request.regions) {
-        json entry = json::object();
-        EncodeRegion(region, entry);
-        regions.push_back(std::move(entry));
-    }
-    payload[REGIONS_KEY] = std::move(regions);
+    auto payload = EncodeSharedPeer(request.peer);
+    payload[ID_KEY] = request.id;
     return payload;
 }
 
-Status DecodeSharePeerDetails(const json &payload, SharePeerRequest &request)
+Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer)
 {
-    request.segment = payload.at(SEGMENT_KEY).get<std::string>();
-    request.identity = payload.at(IDENTITY_KEY).get<std::string>();
+    peer.segment = payload.at(SEGMENT_KEY).get<std::string>();
+    peer.identity = payload.at(IDENTITY_KEY).get<std::string>();
     const auto &regions = payload.at(REGIONS_KEY);
-    if (request.segment.empty() || request.identity.empty() || !regions.is_array()) {
+    if (peer.segment.empty() || peer.identity.empty() || !regions.is_array()) {
         return Status::InvalidArgument("Invalid MemoryEngine peer description");
     }
 
-    request.regions.reserve(regions.size());
+    peer.regions.reserve(regions.size());
     for (const auto &entry : regions) {
         GvaRegion region;
         if (!ReadRegion(entry, region)) {
             return Status::InvalidArgument("Invalid MemoryEngine mapped region");
         }
-        request.regions.push_back(region);
+        peer.regions.push_back(region);
+    }
+    return Status::OK();
+}
+
+json EncodeSharePeersRequest(const SharePeersRequest &request)
+{
+    auto peers = json::array();
+    peers.get_ref<json::array_t &>().reserve(request.peers.size());
+    for (const auto &peer : request.peers) {
+        peers.push_back(EncodeSharedPeer(peer));
+    }
+    return {{ID_KEY, request.id}, {PEERS_KEY, std::move(peers)}};
+}
+
+Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request)
+{
+    request.id = payload.at(ID_KEY).get<std::string>();
+    const auto &peers = payload.at(PEERS_KEY);
+    if (!peers.is_array() || peers.empty() || peers.size() >= static_cast<size_t>(worldSize)) {
+        return Status::InvalidArgument("Invalid MemoryEngine shared peer list");
+    }
+
+    request.peers.reserve(peers.size());
+    std::unordered_set<uint32_t> ranks;
+    ranks.reserve(peers.size());
+    for (const auto &entry : peers) {
+        SharedPeer peer;
+        CHECK_STATUS(DecodePeerRankAndGeneration(entry, peer.rank, peer.generation));
+        if (!ranks.insert(peer.rank).second) {
+            return Status::InvalidArgument("Duplicate MemoryEngine shared peer rank");
+        }
+        CHECK_STATUS(DecodeSharePeerDetails(entry, peer));
+        request.peers.push_back(std::move(peer));
     }
     return Status::OK();
 }

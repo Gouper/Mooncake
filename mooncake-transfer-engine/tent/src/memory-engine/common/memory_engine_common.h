@@ -82,6 +82,7 @@ enum class MemoryRpc {
     RevokeRegion,
     MapRegion,
     UnmapRegion,
+    SharePeers,
 };
 
 struct Endpoint {
@@ -153,11 +154,22 @@ struct PeerRequest {
     uint64_t generation{};
 };
 
-struct SharePeerRequest {
-    PeerRequest peer;
+struct SharedPeer {
+    uint32_t rank{};
+    uint64_t generation{};
     std::string segment;
     std::string identity;
     std::vector<GvaRegion> regions;
+};
+
+struct SharePeerRequest {
+    std::string id;
+    SharedPeer peer;
+};
+
+struct SharePeersRequest {
+    std::string id;
+    std::vector<SharedPeer> peers;
 };
 
 struct PeerRegionRequest {
@@ -205,7 +217,10 @@ Status DecodePeerRequest(const json &payload, PeerRequest &request);
 
 json EncodeSharePeerRequest(const SharePeerRequest &request);
 // Decode the rest of the callback after the recipient and generation have been checked.
-Status DecodeSharePeerDetails(const json &payload, SharePeerRequest &request);
+Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer);
+
+json EncodeSharePeersRequest(const SharePeersRequest &request);
+Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);
 
 json EncodePeerRegionRequest(const PeerRegionRequest &request);
 Status DecodePeerRegion(const json &payload, GvaRegion &region);

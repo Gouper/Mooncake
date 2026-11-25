@@ -260,10 +260,13 @@ struct MemoryEngine::Impl {
 #endif
     Status DestroyTent();
     Status SharePeer(const json &payload);
+    Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
-    Status ValidatePeerRequest(const PeerRequest &request) const;
+    Status ValidatePeerRequest(const std::string &id, uint32_t rank) const;
     Status UnmapPeer(uint32_t rank, PeerMapping &peer);
-    Status PrepareSharedPeer(PeerMapping &peer, SharePeerRequest &request);
+    Status PreparePeerGeneration(uint32_t rank, uint64_t generation, PeerMapping &peer);
+    Status ImportSharedPeer(PeerMapping &peer, SharedPeer &request);
+    Status MapSharedPeerRegions(PeerMapping &peer, const SharedPeer &request);
     Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status UpdatePeerRegion(const json &payload, bool map);
     Status PrepareNativePeers();
@@ -334,6 +337,8 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
     }
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeer,
                                  [this](const json &request, json &) { return SharePeer(request); }, true));
+    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeers,
+                                 [this](const json &request, json &) { return SharePeers(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnsharePeer,
                                  [this](const json &request, json &) { return UnsharePeer(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::MapRegion,
@@ -388,20 +393,42 @@ Status MemoryEngine::Impl::Register()
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::ValidatePeerRequest(const PeerRequest &request) const
+Status MemoryEngine::Impl::ValidatePeerRequest(const std::string &id, uint32_t rank) const
 {
-    if (request.rank >= mLayout.worldSize || request.rank == mRank || request.id != mId) [[unlikely]] {
-        LOG(ERROR) << "Invalid MemoryEngine peer callback, request ID:" << request.id
-                   << ", registration ID:" << mId << ", rank:" << mRank << ", peer rank:" << request.rank
+    if (rank >= mLayout.worldSize || rank == mRank || id != mId) [[unlikely]] {
+        LOG(ERROR) << "Invalid MemoryEngine peer callback, request ID:" << id
+                   << ", registration ID:" << mId << ", rank:" << mRank << ", peer rank:" << rank
                    << ", world size:" << mLayout.worldSize << ".";
         return Status::InvalidArgument("Invalid MemoryEngine peer callback");
     }
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::PrepareSharedPeer(PeerMapping &peer, SharePeerRequest &request)
+Status MemoryEngine::Impl::PreparePeerGeneration(uint32_t rank, uint64_t generation, PeerMapping &peer)
 {
-    const auto rank = request.peer.rank;
+    if (peer.generation > generation || (peer.generation == generation && peer.revoked)) [[unlikely]] {
+        LOG(WARNING) << "MemoryEngine SharePeer generation was replaced or revoked, registration ID:" << mId
+                     << ", rank:" << mRank << ", peer rank:" << rank << ", generation:" << generation
+                     << ", current generation:" << peer.generation << ".";
+        return Status::InvalidEntry("MemoryEngine peer generation was replaced or revoked");
+    }
+    if (peer.generation < generation) {
+        CHECK_STATUS(UnmapPeer(rank, peer));
+        peer.generation = generation;
+        peer.revoked = false;
+    }
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::ImportSharedPeer(PeerMapping &peer, SharedPeer &request)
+{
+    const auto rank = request.rank;
+    if (request.segment == mTent->getSegmentName()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine SharePeer named the local segment, registration ID:" << mId
+                   << ", rank:" << mRank << ", peer rank:" << rank << ".";
+        return Status::InvalidArgument("Invalid MemoryEngine peer description");
+    }
+
     if (peer.segment == LOCAL_SEGMENT_ID) {
         const auto openRet = mTent->openSegment(peer.segment, request.segment);
         if (!openRet.ok()) [[unlikely]] {
@@ -419,8 +446,13 @@ Status MemoryEngine::Impl::PrepareSharedPeer(PeerMapping &peer, SharePeerRequest
                    << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(prepareRet.code()) << ".";
         return prepareRet;
     }
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::MapSharedPeerRegions(PeerMapping &peer, const SharedPeer &request)
+{
     for (const auto &region : request.regions) {
-        CHECK_STATUS(MapPeerRegion(rank, peer, region));
+        CHECK_STATUS(MapPeerRegion(request.rank, peer, region));
     }
     return Status::OK();
 }
@@ -461,7 +493,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
         return decodeRet;
     }
 
-    CHECK_STATUS(ValidatePeerRequest(request.peer));
+    CHECK_STATUS(ValidatePeerRequest(request.peer.id, request.peer.rank));
     const auto rank = request.peer.rank;
     const auto found = mPeers.find(rank);
     if (!mTent || found == mPeers.end() || found->second.revoked ||
@@ -535,42 +567,61 @@ Status MemoryEngine::Impl::SharePeer(const json &payload)
         LOG(WARNING) << "MemoryEngine SharePeer cannot access TENT, registration ID:" << mId << ".";
         return Status::InvalidEntry("MemoryEngine TENT is unavailable");
     }
-    SharePeerRequest request;
-    const auto decodeRet = DecodePeerRequest(payload, request.peer);
+    PeerRequest header;
+    const auto decodeRet = DecodePeerRequest(payload, header);
     if (!decodeRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to decode MemoryEngine SharePeer request, error:" << decodeRet.message()
                    << ", registration ID:" << mId << ", rank:" << mRank << ".";
         return decodeRet;
     }
 
-    CHECK_STATUS(ValidatePeerRequest(request.peer));
-    const auto rank = request.peer.rank;
-    const auto generation = request.peer.generation;
+    const auto rank = header.rank;
+    CHECK_STATUS(ValidatePeerRequest(header.id, rank));
     auto &peer = mPeers[rank];
-    if (peer.generation > generation || (peer.generation == generation && peer.revoked)) {
-        LOG(WARNING) << "MemoryEngine SharePeer generation was replaced or revoked, registration ID:" << request.peer.id
-                     << ", rank:" << mRank << ", peer rank:" << rank << ", generation:" << generation
-                     << ", current generation:" << peer.generation << ".";
-        return Status::InvalidEntry("MemoryEngine peer generation was replaced or revoked");
-    }
-    if (peer.generation < generation) {
-        CHECK_STATUS(UnmapPeer(rank, peer));
-        peer.generation = generation;
-        peer.revoked = false;
-    }
+    CHECK_STATUS(PreparePeerGeneration(rank, header.generation, peer));
 
+    SharedPeer request;
+    request.rank = rank;
     const auto detailsRet = DecodeSharePeerDetails(payload, request);
     if (!detailsRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to decode shared MemoryEngine peer details, error:" << detailsRet.message()
                    << ", registration ID:" << mId << ", rank:" << mRank << ", peer rank:" << rank << ".";
         return detailsRet;
     }
-    if (request.segment == mTent->getSegmentName()) [[unlikely]] {
-        LOG(ERROR) << "MemoryEngine SharePeer named the local segment, registration ID:" << mId
-                   << ", rank:" << mRank << ", peer rank:" << rank << ".";
-        return Status::InvalidArgument("Invalid MemoryEngine peer description");
+
+    CHECK_STATUS(ImportSharedPeer(peer, request));
+    return MapSharedPeerRegions(peer, request);
+}
+
+Status MemoryEngine::Impl::SharePeers(const json &payload)
+{
+    SharePeersRequest request;
+    const auto decodeRet = DecodeSharePeersRequest(payload, mLayout.worldSize, request);
+
+    std::lock_guard lock(mPeerMutex);
+    if (!decodeRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to decode MemoryEngine SharePeers request, error:" << decodeRet.message()
+                   << ", request ID:" << request.id << ", registration ID:" << mId << ".";
+        return decodeRet;
     }
-    return PrepareSharedPeer(peer, request);
+    if (!mTent) [[unlikely]] {
+        LOG(WARNING) << "MemoryEngine SharePeers cannot access TENT, request ID:" << request.id << ".";
+        return Status::InvalidEntry("MemoryEngine TENT is unavailable");
+    }
+
+    for (auto &sharedPeer : request.peers) {
+        const auto rank = sharedPeer.rank;
+        CHECK_STATUS(ValidatePeerRequest(request.id, rank));
+        auto &peer = mPeers[rank];
+        CHECK_STATUS(PreparePeerGeneration(rank, sharedPeer.generation, peer));
+        CHECK_STATUS(ImportSharedPeer(peer, sharedPeer));
+    }
+
+    // Region mapping starts after all reciprocal identity imports have completed.
+    for (const auto &sharedPeer : request.peers) {
+        CHECK_STATUS(MapSharedPeerRegions(mPeers.at(sharedPeer.rank), sharedPeer));
+    }
+    return Status::OK();
 }
 
 Status MemoryEngine::Impl::UnsharePeer(const json &payload)
@@ -585,7 +636,7 @@ Status MemoryEngine::Impl::UnsharePeer(const json &payload)
         return decodeRet;
     }
 
-    CHECK_STATUS(ValidatePeerRequest(request));
+    CHECK_STATUS(ValidatePeerRequest(request.id, request.rank));
     const auto rank = request.rank;
     const auto generation = request.generation;
     auto &peer = mPeers[rank];
@@ -607,8 +658,13 @@ Status MemoryEngine::Impl::Join()
         return Status::OK();
     }
     if (!mReady) {
-        CHECK_STATUS(InitializeRegistration());
+        const auto initRet = InitializeRegistration();
+        if (!initRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to initialize registration, status:" << static_cast<uint16_t>(initRet.code()) << ".";
+            return initRet;
+        }
     }
+
     const auto deadline = Clock::now() + mJoinTimeout + RPC_TIMEOUT;
     std::string identity;
     const auto identityRet = mTent->GetMemFabricGvaIdentity(identity);
