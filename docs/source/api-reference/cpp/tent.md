@@ -225,12 +225,12 @@ on every client.
 | `auto_ranking` | Lets the server assign each rank. Defaults to `true`. |
 | `local_rank` | Required when `auto_ranking` is `false`. Use a unique rank in `[0, world_size)`. |
 | `client_host` | Client callback address. An empty value enables automatic selection. |
-| `heartbeat_interval_ms` | Client heartbeat interval. Defaults to `3000` and must be shorter than the server timeout. |
+| `heartbeat_interval_ms` | Client heartbeat interval in milliseconds. Defaults to `3000`. Must be shorter than `server.rank_lease_ms`. |
 | `join_timeout_ms` | Registration and join timeout in milliseconds. Defaults to `120000`. |
 | `batch_copy_timeout_ms` | Batch copy deadline in milliseconds. Defaults to `30000`. Set to `0` for no deadline. |
 | `server.world_size`, `server.host_mem_max`, `server.device_mem_max` | Expected layout. Each nonzero value must match the client value. |
 | `server.gva_base_host`, `server.gva_base_device` | Expected GVA base addresses. For each zero value the server accepts the first confirmed base. |
-| `server.heartbeat_timeout_ms` | Time before a rank expires without a heartbeat. Defaults to `20000`. |
+| `server.rank_lease_ms` | Rank lease duration in milliseconds. Defaults to `20000`. The server starts the lease on confirmation and renews it on each accepted heartbeat. |
 | `server.rpc_server_threads` | Server RPC worker count. Defaults to `4`. |
 
 ### MemoryEngine batch copy

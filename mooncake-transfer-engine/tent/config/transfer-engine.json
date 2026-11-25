@@ -22,7 +22,7 @@
             "device_mem_max": 1073741824,
             "gva_base_host": 0,
             "gva_base_device": 0,
-            "heartbeat_timeout_ms": 20000,
+            "rank_lease_ms": 20000,
             "rpc_server_threads": 4
         }
     },

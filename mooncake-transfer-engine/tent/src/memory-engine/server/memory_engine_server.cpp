@@ -267,7 +267,7 @@ Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &end
     }
     mExpectedBases = {*host, *device};
 
-    mLease = Milliseconds(config.get(config_keys::CONFIG_SERVER_HEARTBEAT_TIMEOUT_MS, DEFAULT_LEASE.count()));
+    mLease = Milliseconds(config.get(config_keys::CONFIG_SERVER_RANK_LEASE_MS, DEFAULT_LEASE.count()));
     mRegistrationTimeout = Milliseconds(config.get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
     if (mLease <= Milliseconds::zero() || mRegistrationTimeout <= Milliseconds::zero() ||
         mLease >= MAX_TIMEOUT || mRegistrationTimeout >= MAX_TIMEOUT) {
