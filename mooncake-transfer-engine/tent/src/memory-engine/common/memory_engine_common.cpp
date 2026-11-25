@@ -6,6 +6,8 @@
 #include <string_view>
 #include <utility>
 
+#include <glog/logging.h>
+
 #include "tent/common/utils/ip.h"
 #include "memory_engine_common.h"
 
@@ -253,7 +255,10 @@ Status DecodeConfirmRequest(const json &payload, ConfirmRequest &request)
     const auto host = ReadUnsigned(payload.at(HOST_BASE_KEY), UINT64_MAX);
     const auto device = ReadUnsigned(payload.at(DEVICE_BASE_KEY), UINT64_MAX);
     const auto rank = ReadUnsigned(payload.at(RANK_KEY), MAX_RANKS);
-    if (!host || !device || !rank) {
+    if (!host || !device || !rank) [[unlikely]] {
+        LOG(ERROR) << "Invalid MemoryEngine Confirm request, registration ID:" << id << ", rank:"
+                   << (rank ? std::to_string(*rank) : "unknown")
+                   << ", valid host base:" << host.has_value() << ", valid device base:" << device.has_value() << ".";
         return Status::InvalidArgument("Invalid MemoryEngine confirmation");
     }
     request = {std::move(id), static_cast<uint32_t>(*rank), {*host, *device}};

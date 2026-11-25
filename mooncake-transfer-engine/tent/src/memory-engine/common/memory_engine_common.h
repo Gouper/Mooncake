@@ -17,6 +17,8 @@
 #include <string_view>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "tent/common/config.h"
 #include "tent/rpc/rpc.h"
 
@@ -224,6 +226,7 @@ Status RegisterHandler(CoroRpcAgent &rpc, MemoryRpc op, Handler handler, bool of
         try {
             status = handler(json::parse(data), response);
         } catch (const json::exception &) {
+            LOG(ERROR) << "Malformed MemoryEngine RPC request, bytes:" << data.size() << ".";
             status = Status::MalformedJson("Malformed MemoryEngine RPC request");
         }
         output = EncodeReply(status, response);

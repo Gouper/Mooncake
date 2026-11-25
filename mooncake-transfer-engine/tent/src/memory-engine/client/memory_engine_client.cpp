@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -139,8 +140,13 @@ MemoryEngineCopyResult CopyResult(const Status &status, Clock::time_point deadli
     return status.ok() ? MemoryEngineCopyResult::Ok : MemoryEngineCopyResult::TransferFailed;
 }
 
+struct CopyLogContext {
+    std::string_view id;
+    uint32_t rank;
+};
+
 void ExecuteLocalCopies(const std::vector<MemoryEngineCopyEntry> &entries, const CopyPlan &plan,
-                        std::vector<int32_t> &results, Clock::time_point deadline)
+                        std::vector<int32_t> &results, Clock::time_point deadline, const CopyLogContext &context)
 {
     auto &platform = Platform::getLoader();
     for (const auto index : plan.local) {
@@ -151,8 +157,9 @@ void ExecuteLocalCopies(const std::vector<MemoryEngineCopyEntry> &entries, const
                 platform.copy(entry.dst, const_cast<void *>(entry.src), static_cast<size_t>(entry.size));
             outcome = CopyResult(status, deadline);
             if (!status.ok()) [[unlikely]] {
-                LOG(WARNING) << "MemoryEngine local copy failed, index:" << index << ", status:"
-                             << static_cast<uint16_t>(status.code()) << ".";
+                LOG(ERROR) << "MemoryEngine local copy failed, registration ID:" << context.id
+                           << ", rank:" << context.rank << ", index:" << index << ", bytes:" << entry.size
+                           << ", status:" << static_cast<uint16_t>(status.code()) << ".";
             }
         }
         results[index] = static_cast<int32_t>(outcome);
@@ -160,7 +167,7 @@ void ExecuteLocalCopies(const std::vector<MemoryEngineCopyEntry> &entries, const
 }
 
 void ExecuteRemoteCopies(MemFabricSharedMemory &gva, const CopyPlan &plan, std::vector<int32_t> &results,
-                         Clock::time_point deadline)
+                         Clock::time_point deadline, const CopyLogContext &context)
 {
     for (const auto &[key, group] : plan.remote) {
         auto outcome = MemoryEngineCopyResult::TimedOut;
@@ -168,9 +175,10 @@ void ExecuteRemoteCopies(MemFabricSharedMemory &gva, const CopyPlan &plan, std::
             const auto status = gva.RunPinnedBatchCopy(group.copies, kGvaCopyAuto);
             outcome = CopyResult(status, deadline);
             if (!status.ok()) [[unlikely]] {
-                LOG(WARNING) << "MemoryEngine remote copy failed, peer rank:" << (key / COPY_GROUP_DIRECTIONS)
-                             << ", count:" << group.copies.size() << ", status:"
-                             << static_cast<uint16_t>(status.code()) << ".";
+                LOG(ERROR) << "MemoryEngine remote copy failed, registration ID:" << context.id
+                           << ", rank:" << context.rank << ", peer rank:" << (key / COPY_GROUP_DIRECTIONS)
+                           << ", first index:" << group.indices.front() << ", count:" << group.copies.size()
+                           << ", status:" << static_cast<uint16_t>(status.code()) << ".";
             }
         }
         for (const auto index : group.indices) {
@@ -252,11 +260,11 @@ struct MemoryEngine::Impl {
 #endif
     Status DestroyTent();
     Status SharePeer(const json &payload);
-    Status UnsharePeer(const PeerRequest &request);
+    Status UnsharePeer(const json &payload);
     Status ValidatePeerRequest(const PeerRequest &request) const;
     Status UnmapPeer(uint32_t rank, PeerMapping &peer);
-    Status MapPeerRegions(PeerMapping &peer, const std::vector<GvaRegion> &regions);
-    Status MapPeerRegion(PeerMapping &peer, const GvaRegion &region);
+    Status PrepareSharedPeer(PeerMapping &peer, SharePeerRequest &request);
+    Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status UpdatePeerRegion(const json &payload, bool map);
     Status PrepareNativePeers();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, uint64_t &address);
@@ -298,18 +306,21 @@ MemoryEngine::Impl::~Impl()
     if (mReady || mLeaving) {
         const auto status = Leave();
         if (!status.ok()) {
-            LOG(WARNING) << "Failed to leave MemoryEngine cluster, rank:" << mRank << ".";
+            LOG(ERROR) << "MemoryEngine destructor could not finish leaving, registration ID:" << mId
+                       << ", rank:" << mRank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         }
     }
     mHeartbeat = std::jthread();
     const auto stopped = mRpc.stop();
     if (!stopped.ok()) {
-        LOG(WARNING) << "Failed to stop MemoryEngine client RPC, rank:" << mRank << ".";
+        LOG(ERROR) << "Failed to stop MemoryEngine client RPC, registration ID:" << mId
+                   << ", status:" << static_cast<uint16_t>(stopped.code()) << ".";
     }
     mTent.reset();
     const auto status = CancelRegistration();
     if (!status.ok()) {
-        LOG(WARNING) << "Failed to release MemoryEngine registration, rank:" << mRank << ".";
+        LOG(ERROR) << "MemoryEngine destructor could not cancel registration, registration ID:" << mId
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
     }
 }
 
@@ -323,8 +334,8 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
     }
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeer,
                                  [this](const json &request, json &) { return SharePeer(request); }, true));
-    CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::UnsharePeer, DecodePeerRequest,
-                                        [this](const PeerRequest &request) { return UnsharePeer(request); }, true));
+    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnsharePeer,
+                                 [this](const json &request, json &) { return UnsharePeer(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::MapRegion,
                                  [this](const json &request, json &) { return UpdatePeerRegion(request, true); },
                                  true));
@@ -349,11 +360,26 @@ Status MemoryEngine::Impl::Register()
     const auto payload = EncodeRegisterRequest(request);
     mRegistrationAttempted = true;
     json reply;
-    CHECK_STATUS(Call(mRpc, mServer, MemoryRpc::Register, payload, reply));
+    auto status = Call(mRpc, mServer, MemoryRpc::Register, payload, reply);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine Register RPC failed, registration ID:" << mId << ", requested rank:"
+                   << (request.requestedRank ? std::to_string(*request.requestedRank) : "auto")
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        return status;
+    }
 
     RegisterResponse response;
-    CHECK_STATUS(DecodeRegisterResponse(reply, mLayout.worldSize, response));
+    status = DecodeRegisterResponse(reply, mLayout.worldSize, response);
+    if (!status.ok()) {
+        LOG(ERROR) << "Invalid MemoryEngine Register response, registration ID:" << mId
+                   << ", world size:" << mLayout.worldSize << ", status:"
+                   << static_cast<uint16_t>(status.code()) << ", reason:" << status.message() << ".";
+        return status;
+    }
     if (static_cast<uint64_t>(mOptions.heartbeat.count()) >= response.leaseMs) {
+        LOG(ERROR) << "MemoryEngine heartbeat interval exceeds or equals rank lease, registration ID:" << mId
+                   << ", rank:" << response.rank << ", heartbeat interval ms:" << mOptions.heartbeat.count()
+                   << ", rank lease ms:" << response.leaseMs << ".";
         return Status::InvalidArgument("MemoryEngine heartbeat interval must be shorter than the server lease");
     }
 
@@ -364,30 +390,61 @@ Status MemoryEngine::Impl::Register()
 
 Status MemoryEngine::Impl::ValidatePeerRequest(const PeerRequest &request) const
 {
-    if (request.rank >= mLayout.worldSize || request.rank == mRank || request.id != mId) {
+    if (request.rank >= mLayout.worldSize || request.rank == mRank || request.id != mId) [[unlikely]] {
+        LOG(ERROR) << "Invalid MemoryEngine peer callback, request ID:" << request.id
+                   << ", registration ID:" << mId << ", rank:" << mRank << ", peer rank:" << request.rank
+                   << ", world size:" << mLayout.worldSize << ".";
         return Status::InvalidArgument("Invalid MemoryEngine peer callback");
     }
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::MapPeerRegions(PeerMapping &peer, const std::vector<GvaRegion> &regions)
+Status MemoryEngine::Impl::PrepareSharedPeer(PeerMapping &peer, SharePeerRequest &request)
 {
-    for (const auto &region : regions) {
-        CHECK_STATUS(MapPeerRegion(peer, region));
+    const auto rank = request.peer.rank;
+    if (peer.segment == LOCAL_SEGMENT_ID) {
+        const auto openRet = mTent->openSegment(peer.segment, request.segment);
+        if (!openRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to open shared MemoryEngine segment, registration ID:" << mId << ", rank:" << mRank
+                       << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(openRet.code()) << ".";
+            return openRet;
+        }
+        peer.segmentName = std::move(request.segment);
+        peer.identity = std::move(request.identity);
+    }
+
+    const auto prepareRet = mTent->PrepareMemFabricPeer(peer.segmentName, peer.identity);
+    if (!prepareRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to prepare shared MemoryEngine peer, registration ID:" << mId << ", rank:" << mRank
+                   << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(prepareRet.code()) << ".";
+        return prepareRet;
+    }
+    for (const auto &region : request.regions) {
+        CHECK_STATUS(MapPeerRegion(rank, peer, region));
     }
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::MapPeerRegion(PeerMapping &peer, const GvaRegion &region)
+Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region)
 {
     auto &mapped = peer.regions.try_emplace(region.address, RemoteRegion{region.size}).first->second;
-    if (mapped.revoked || mapped.size != region.size) {
+    if (mapped.revoked || mapped.size != region.size) [[unlikely]] {
+        LOG(WARNING) << "MemoryEngine region cannot be mapped, registration ID:" << mId << ", rank:" << mRank
+                     << ", peer rank:" << rank << ", generation:" << peer.generation << ", revoked:" << mapped.revoked
+                     << ", requested bytes:" << region.size << ", mapped bytes:" << mapped.size << ".";
         return Status::InvalidEntry("MemoryEngine region was revoked or has a conflicting size");
     }
     if (mapped.mapped) {
         return Status::OK();
     }
-    CHECK_STATUS(mTent->MapMemFabricRegion(peer.segment, reinterpret_cast<void *>(region.address), region.size));
+
+    const auto mapRet = mTent->MapMemFabricRegion(peer.segment, reinterpret_cast<void *>(region.address), region.size);
+    if (!mapRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to map MemoryEngine peer region, registration ID:" << mId << ", rank:" << mRank
+                   << ", peer rank:" << rank << ", bytes:" << region.size
+                   << ", status:" << static_cast<uint16_t>(mapRet.code()) << ".";
+        return mapRet;
+    }
     mapped.mapped = true;
     return Status::OK();
 }
@@ -396,34 +453,73 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
 {
     std::lock_guard lock(mPeerMutex);
     PeerRegionRequest request;
-    CHECK_STATUS(DecodePeerRequest(payload, request.peer));
+    const auto decodeRet = DecodePeerRequest(payload, request.peer);
+    if (!decodeRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to decode MemoryEngine peer region request, error:" << decodeRet.message()
+                   << ", registration ID:" << mId << ", local rank:"
+                   << (mTent ? std::to_string(mRank) : "unknown") << ".";
+        return decodeRet;
+    }
+
     CHECK_STATUS(ValidatePeerRequest(request.peer));
     const auto rank = request.peer.rank;
     const auto found = mPeers.find(rank);
     if (!mTent || found == mPeers.end() || found->second.revoked ||
         found->second.generation != request.peer.generation) {
-        return map ? Status::InvalidEntry("MemoryEngine peer relationship is not current") : Status::OK();
+        if (map) {
+            LOG(WARNING) << "MemoryEngine map request has no current peer, registration ID:" << request.peer.id
+                         << ", rank:" << mRank << ", peer rank:" << rank
+                         << ", generation:" << request.peer.generation << ".";
+            return Status::InvalidEntry("MemoryEngine peer relationship is not current");
+        }
+        return Status::OK();
     }
 
-    CHECK_STATUS(DecodePeerRegion(payload, request.region));
+    const auto regionRet = DecodePeerRegion(payload, request.region);
+    if (!regionRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to decode MemoryEngine peer region, error:" << regionRet.message()
+                   << ", registration ID:" << request.peer.id << ", rank:" << mRank << ", peer rank:" << rank << ".";
+        return regionRet;
+    }
+
     const auto &region = request.region;
     auto &peer = found->second;
     if (map) {
-        return MapPeerRegion(peer, region);
+        return MapPeerRegion(rank, peer, region);
     }
     auto &mapped = peer.regions.try_emplace(region.address, RemoteRegion{region.size}).first->second;
     if (mapped.size != region.size) {
+        LOG(ERROR) << "MemoryEngine UnmapRegion size mismatch, registration ID:" << request.peer.id
+                   << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size
+                   << ", mapped bytes:" << mapped.size << ".";
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     }
     mapped.revoked = true;
-    return mTent->RevokeMemFabricRegion(peer.segment, rank, peer.segmentName, region.address);
+    const auto revokeRet = mTent->RevokeMemFabricRegion(peer.segment, rank, peer.segmentName, region.address);
+    if (!revokeRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to revoke MemoryEngine peer region, registration ID:" << request.peer.id
+                   << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size
+                   << ", status:" << static_cast<uint16_t>(revokeRet.code()) << ".";
+    }
+    return revokeRet;
 }
 
 Status MemoryEngine::Impl::UnmapPeer(uint32_t rank, PeerMapping &peer)
 {
     if (peer.segment != LOCAL_SEGMENT_ID) {
-        CHECK_STATUS(mTent->CloseMemFabricPeer(peer.segment, rank, peer.segmentName));
-        CHECK_STATUS(mTent->closeSegment(peer.segment));
+        const auto unmapRet = mTent->CloseMemFabricPeer(peer.segment, rank, peer.segmentName);
+        if (!unmapRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to unmap MemoryEngine peer, registration ID:" << mId << ", rank:" << mRank
+                       << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(unmapRet.code()) << ".";
+            return unmapRet;
+        }
+
+        const auto closeRet = mTent->closeSegment(peer.segment);
+        if (!closeRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to close MemoryEngine peer segment, registration ID:" << mId << ", rank:" << mRank
+                       << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(closeRet.code()) << ".";
+            return closeRet;
+        }
         peer.segment = LOCAL_SEGMENT_ID;
     }
     peer.regions.clear();
@@ -436,15 +532,25 @@ Status MemoryEngine::Impl::SharePeer(const json &payload)
 {
     std::lock_guard lock(mPeerMutex);
     if (!mTent) {
+        LOG(WARNING) << "MemoryEngine SharePeer cannot access TENT, registration ID:" << mId << ".";
         return Status::InvalidEntry("MemoryEngine TENT is unavailable");
     }
     SharePeerRequest request;
-    CHECK_STATUS(DecodePeerRequest(payload, request.peer));
+    const auto decodeRet = DecodePeerRequest(payload, request.peer);
+    if (!decodeRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to decode MemoryEngine SharePeer request, error:" << decodeRet.message()
+                   << ", registration ID:" << mId << ", rank:" << mRank << ".";
+        return decodeRet;
+    }
+
     CHECK_STATUS(ValidatePeerRequest(request.peer));
     const auto rank = request.peer.rank;
     const auto generation = request.peer.generation;
     auto &peer = mPeers[rank];
     if (peer.generation > generation || (peer.generation == generation && peer.revoked)) {
+        LOG(WARNING) << "MemoryEngine SharePeer generation was replaced or revoked, registration ID:" << request.peer.id
+                     << ", rank:" << mRank << ", peer rank:" << rank << ", generation:" << generation
+                     << ", current generation:" << peer.generation << ".";
         return Status::InvalidEntry("MemoryEngine peer generation was replaced or revoked");
     }
     if (peer.generation < generation) {
@@ -452,22 +558,33 @@ Status MemoryEngine::Impl::SharePeer(const json &payload)
         peer.generation = generation;
         peer.revoked = false;
     }
-    CHECK_STATUS(DecodeSharePeerDetails(payload, request));
-    if (request.segment == mTent->getSegmentName()) {
+
+    const auto detailsRet = DecodeSharePeerDetails(payload, request);
+    if (!detailsRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to decode shared MemoryEngine peer details, error:" << detailsRet.message()
+                   << ", registration ID:" << mId << ", rank:" << mRank << ", peer rank:" << rank << ".";
+        return detailsRet;
+    }
+    if (request.segment == mTent->getSegmentName()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine SharePeer named the local segment, registration ID:" << mId
+                   << ", rank:" << mRank << ", peer rank:" << rank << ".";
         return Status::InvalidArgument("Invalid MemoryEngine peer description");
     }
-    if (peer.segment == LOCAL_SEGMENT_ID) {
-        CHECK_STATUS(mTent->openSegment(peer.segment, request.segment));
-        peer.segmentName = std::move(request.segment);
-        peer.identity = std::move(request.identity);
-    }
-    CHECK_STATUS(mTent->PrepareMemFabricPeer(peer.segmentName, peer.identity));
-    return MapPeerRegions(peer, request.regions);
+    return PrepareSharedPeer(peer, request);
 }
 
-Status MemoryEngine::Impl::UnsharePeer(const PeerRequest &request)
+Status MemoryEngine::Impl::UnsharePeer(const json &payload)
 {
+    PeerRequest request;
+    const auto decodeRet = DecodePeerRequest(payload, request);
+
     std::lock_guard lock(mPeerMutex);
+    if (!decodeRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to decode MemoryEngine UnsharePeer request, error:" << decodeRet.message()
+                   << ", registration ID:" << mId << ".";
+        return decodeRet;
+    }
+
     CHECK_STATUS(ValidatePeerRequest(request));
     const auto rank = request.rank;
     const auto generation = request.generation;
@@ -494,9 +611,20 @@ Status MemoryEngine::Impl::Join()
     }
     const auto deadline = Clock::now() + mJoinTimeout + RPC_TIMEOUT;
     std::string identity;
-    CHECK_STATUS(mTent->GetMemFabricGvaIdentity(identity));
+    const auto identityRet = mTent->GetMemFabricGvaIdentity(identity);
+    if (!identityRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to get MemoryEngine GVA identity for Join, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(identityRet.code()) << ".";
+        return identityRet;
+    }
+
     const PeerCall server{mServer, EncodeJoinRequest({mId, mTent->getSegmentName(), std::move(identity)})};
-    CHECK_STATUS(CallControl(mRpc, MemoryRpc::Join, server, deadline));
+    const auto joinRet = CallControl(mRpc, MemoryRpc::Join, server, deadline);
+    if (!joinRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine Join request failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(joinRet.code()) << ".";
+        return joinRet;
+    }
     mJoined = true;
     return Status::OK();
 }
@@ -506,7 +634,13 @@ Status MemoryEngine::Impl::PrepareNativePeers()
     std::lock_guard lock(mPeerMutex);
     for (const auto &[rank, peer] : mPeers) {
         if (!peer.revoked && peer.segment != LOCAL_SEGMENT_ID) {
-            CHECK_STATUS(mTent->PrepareMemFabricPeer(peer.segmentName, peer.identity));
+            const auto status = mTent->PrepareMemFabricPeer(peer.segmentName, peer.identity);
+            if (!status.ok()) [[unlikely]] {
+                LOG(ERROR) << "Failed to prepare MemoryEngine peer for allocation, registration ID:" << mId
+                           << ", rank:" << mRank << ", peer rank:" << rank
+                           << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+                return status;
+            }
         }
     }
     return Status::OK();
@@ -518,13 +652,23 @@ Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, 
     options.type = MEMFABRIC;
     options.location = type == MemoryEngineMemType::Host ? "cpu" : "npu";
     void *memory = nullptr;
-    CHECK_STATUS(mTent->allocateLocalMemory(&memory, size, options));
+    auto status = mTent->allocateLocalMemory(&memory, size, options);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine local allocation failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", location:" << options.location << ", bytes:" << size
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        return status;
+    }
+
     address = reinterpret_cast<uint64_t>(memory);
     auto &local = mLocalRegions.try_emplace(address, LocalRegion{size}).first->second;
     // Registration can have published metadata before reporting an error.
     local.registered = true;
-    auto status = mTent->registerLocalMemory({memory}, {size}, options);
+    status = mTent->registerLocalMemory({memory}, {size}, options);
     if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine local allocation registration failed, registration ID:" << mId
+                   << ", rank:" << mRank << ", location:" << options.location << ", bytes:" << size
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         if (ReleaseLocal(address, local, true).ok()) {
             mLocalRegions.erase(address);
         } else {
@@ -538,18 +682,34 @@ Status MemoryEngine::Impl::UpdateLocalRegion(uint64_t address, size_t size, bool
 {
     const auto op = publish ? MemoryRpc::PublishRegion : MemoryRpc::RevokeRegion;
     const PeerCall server{mServer, EncodeRegionRequest({mId, {address, size}})};
-    return CallControl(mRpc, op, server, Clock::now() + mJoinTimeout + RPC_TIMEOUT);
+    const auto status = CallControl(mRpc, op, server, Clock::now() + mJoinTimeout + RPC_TIMEOUT);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine region update failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", bytes:" << size << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+    }
+    return status;
 }
 
 Status MemoryEngine::Impl::ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory)
 {
     auto *memory = reinterpret_cast<void *>(address);
     if (local.registered) {
-        CHECK_STATUS(mTent->unregisterLocalMemory(memory, local.size));
+        const auto unregisterRet = mTent->unregisterLocalMemory(memory, local.size);
+        if (!unregisterRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to unregister MemoryEngine allocation, registration ID:" << mId << ", rank:" << mRank
+                       << ", bytes:" << local.size << ", status:" << static_cast<uint16_t>(unregisterRet.code()) << ".";
+            return unregisterRet;
+        }
         local.registered = false;
     }
+
     if (releaseMemory) {
-        return mTent->freeLocalMemory(memory);
+        const auto freeRet = mTent->freeLocalMemory(memory);
+        if (!freeRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to free MemoryEngine allocation, registration ID:" << mId << ", rank:" << mRank
+                       << ", bytes:" << local.size << ", status:" << static_cast<uint16_t>(freeRet.code()) << ".";
+        }
+        return freeRet;
     }
     return Status::OK();
 }
@@ -587,6 +747,9 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
     }
     const auto window = type == MemoryEngineMemType::Host ? mLayout.hostWindow : mLayout.deviceWindow;
     if (size > window) {
+        LOG(WARNING) << "MemoryEngine allocation exceeds the rank window, registration ID:" << mId
+                     << ", rank:" << mRank << ", location:" << (type == MemoryEngineMemType::Host ? "cpu" : "npu")
+                     << ", bytes:" << size << ", window bytes:" << window << ".";
         return Status::TooManyRequests("MemoryEngine allocation exceeds the rank window");
     }
     const auto aligned = ((size - 1) / ALLOCATION_ALIGNMENT + 1) * ALLOCATION_ALIGNMENT;
@@ -603,7 +766,8 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
         mFailedAllocation = allocated;
         const auto cleanup = ReconcileAllocation();
         if (!cleanup.ok()) {
-            LOG(WARNING) << "Failed to roll back MemoryEngine allocation, rank:" << mRank << ".";
+            LOG(ERROR) << "Failed to roll back MemoryEngine allocation, registration ID:" << mId << ", rank:" << mRank
+                       << ", bytes:" << aligned << ", status:" << static_cast<uint16_t>(cleanup.code()) << ".";
         }
         return status;
     }
@@ -642,7 +806,6 @@ Status MemoryEngine::Impl::DrainRetired(uint64_t requested)
             if (*it == requested) {
                 result = status;
             }
-            LOG(WARNING) << "Failed to release retired MemoryEngine allocation, rank:" << mRank << ".";
             ++it;
         }
     }
@@ -658,6 +821,8 @@ Status MemoryEngine::Impl::Free(void *address)
     const auto key = reinterpret_cast<uint64_t>(address);
     const auto found = mLocalRegions.find(key);
     if (found == mLocalRegions.end() || mFailedAllocation == key) {
+        LOG(WARNING) << "MemoryEngine Free rejected an allocation, registration ID:" << mId << ", rank:" << mRank
+                     << ", reason:" << (found == mLocalRegions.end() ? "base not owned" : "rollback pending") << ".";
         return Status::InvalidArgument("MemoryEngine requires an owned allocation base");
     }
     auto &local = found->second;
@@ -758,17 +923,21 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
             const auto status = gva->PinCopyBatch();
             if (!status.ok()) [[unlikely]] {
                 std::fill(results.begin(), results.end(), INVALID_COPY);
+                LOG(ERROR) << "MemoryEngine BatchCopy could not pin remote mappings, registration ID:" << mId
+                           << ", rank:" << mRank << ", entries:" << entries.size()
+                           << ", status:" << static_cast<uint16_t>(status.code()) << ".";
                 return status;
             }
             pin.reset(gva);
         }
     }
 
+    const CopyLogContext context{mId, mRank};
     if (!plan.local.empty()) {
-        ExecuteLocalCopies(entries, plan, results, deadline);
+        ExecuteLocalCopies(entries, plan, results, deadline, context);
     }
     if (pin) {
-        ExecuteRemoteCopies(*pin, plan, results, deadline);
+        ExecuteRemoteCopies(*pin, plan, results, deadline, context);
     }
     return Status::OK();
 }
@@ -782,11 +951,7 @@ Status MemoryEngine::Impl::DestroyTent()
     }
     for (auto &[rank, peer] : mPeers) {
         peer.revoked = true;
-        auto status = UnmapPeer(rank, peer);
-        if (!status.ok()) {
-            LOG(WARNING) << "Failed to remove MemoryEngine peer during leave, rank:" << rank << ".";
-            return status;
-        }
+        CHECK_STATUS(UnmapPeer(rank, peer));
     }
     for (auto it = mLocalRegions.begin(); it != mLocalRegions.end();) {
         CHECK_STATUS(ReleaseLocal(it->first, it->second, true));
@@ -795,7 +960,12 @@ Status MemoryEngine::Impl::DestroyTent()
     mFailedAllocation.reset();
     mRetired.clear();
     mLiveRegions = 0;
-    CHECK_STATUS(mTent->CloseMemFabricGva());
+    const auto closeRet = mTent->CloseMemFabricGva();
+    if (!closeRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to close MemoryEngine GVA layout, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(closeRet.code()) << ".";
+        return closeRet;
+    }
     mTent.reset();
     return Status::OK();
 }
@@ -810,9 +980,20 @@ Status MemoryEngine::Impl::Leave()
     mJoined = false;
     const PeerCall server{mServer, EncodeRegistrationIdRequest({mId})};
     const auto deadline = Clock::now() + mJoinTimeout;
-    CHECK_STATUS(CallControl(mRpc, MemoryRpc::BeginLeave, server, deadline));
+    const auto beginRet = CallControl(mRpc, MemoryRpc::BeginLeave, server, deadline);
+    if (!beginRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine BeginLeave request failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(beginRet.code()) << ".";
+        return beginRet;
+    }
     CHECK_STATUS(DestroyTent());
-    CHECK_STATUS(CallAsync(mRpc, MemoryRpc::FinishLeave, server, Clock::now() + RPC_TIMEOUT).get());
+
+    const auto finishRet = CallAsync(mRpc, MemoryRpc::FinishLeave, server, Clock::now() + RPC_TIMEOUT).get();
+    if (!finishRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine FinishLeave request failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(finishRet.code()) << ".";
+        return finishRet;
+    }
     mHeartbeat = std::jthread();
     mRegistrationAttempted = false;
     mReady = false;
@@ -826,7 +1007,12 @@ Status MemoryEngine::Impl::CancelRegistration()
         return Status::OK();
     }
     const auto request = EncodeCancelRequest({mId, mCallbackAddress});
-    CHECK_STATUS(Call(mRpc, mServer, MemoryRpc::Cancel, request));
+    const auto status = Call(mRpc, mServer, MemoryRpc::Cancel, request);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine Cancel RPC failed, registration ID:" << mId
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        return status;
+    }
     mRegistrationAttempted = false;
     return Status::OK();
 }
@@ -844,11 +1030,26 @@ Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
     native->set(config_keys::TENT_CONFIG_GVA_DRAM_WINDOW, mLayout.hostWindow / GIB);
     native->set(config_keys::TENT_CONFIG_GVA_HBM_WINDOW, mLayout.deviceWindow / GIB);
     auto tent = std::unique_ptr<TransferEngineImpl>(new (std::nothrow) TransferEngineImpl(native, true, false));
-    if (!tent || !tent->available()) {
+    if (!tent || !tent->available()) [[unlikely]] {
+        LOG(ERROR) << "Failed to initialize MemoryEngine TENT instance, registration ID:" << mId << ", rank:" << mRank
+                   << ", world size:" << mLayout.worldSize << ".";
         return Status::InternalError("Could not initialize MemoryEngine TENT instance");
     }
-    CHECK_STATUS(tent->GetMemFabricGvaBases(mBases.host, mBases.device));
-    CHECK_STATUS(ValidateBases(mLayout, mBases));
+
+    const auto basesRet = tent->GetMemFabricGvaBases(mBases.host, mBases.device);
+    if (!basesRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to get MemoryEngine GVA bases, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(basesRet.code()) << ".";
+        return basesRet;
+    }
+    const auto validateRet = ValidateBases(mLayout, mBases);
+    if (!validateRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "Invalid MemoryEngine GVA layout, error:" << validateRet.message()
+                   << ", registration ID:" << mId << ", rank:" << mRank << ", world size:" << mLayout.worldSize
+                   << ", host window bytes:" << mLayout.hostWindow << ", device window bytes:" << mLayout.deviceWindow
+                   << ".";
+        return validateRet;
+    }
     std::lock_guard lock(mPeerMutex);
     mTent = std::move(tent);
     return Status::OK();
@@ -857,14 +1058,21 @@ Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
 void MemoryEngine::Impl::StartHeartbeat(Milliseconds interval)
 {
     mHeartbeat = std::jthread([this, interval](std::stop_token stop) {
-        bool failed = false;
+        auto lastCode = Status::Code::kOk;
         const auto request = EncodeRegistrationIdRequest({mId});
         RunPeriodic(stop, interval, [&] {
             const auto status = Call(mRpc, mServer, MemoryRpc::Heartbeat, request);
-            if (!status.ok() && !failed) {
-                LOG(WARNING) << "MemoryEngine heartbeat failed, rank:" << mRank << ".";
+            const auto code = status.code();
+            if (!status.ok() && code != lastCode) {
+                if (status.IsInvalidEntry()) {
+                    LOG(ERROR) << "MemoryEngine server rejected the heartbeat registration, registration ID:" << mId
+                               << ", rank:" << mRank << ", status:" << static_cast<uint16_t>(code) << ".";
+                } else {
+                    LOG(WARNING) << "MemoryEngine Heartbeat RPC failed, registration ID:" << mId << ", rank:" << mRank
+                                 << ", status:" << static_cast<uint16_t>(code) << ".";
+                }
             }
-            failed = !status.ok();
+            lastCode = code;
         });
     });
 }
@@ -881,7 +1089,9 @@ Status MemoryEngine::Impl::InitializeRegistration()
             cleanup = CancelRegistration();
         }
         if (!cleanup.ok()) {
-            LOG(WARNING) << "Failed to release MemoryEngine GVA layout, rank:" << mRank << ".";
+            LOG(ERROR) << "Failed to clean up MemoryEngine registration, registration ID:" << mId
+                       << ", create status:" << static_cast<uint16_t>(status.code())
+                       << ", cleanup status:" << static_cast<uint16_t>(cleanup.code()) << ".";
             return cleanup;
         }
         return status;
@@ -896,26 +1106,45 @@ Status MemoryEngine::Impl::ConfirmRegistration()
     CHECK_STATUS(Register());
     CHECK_STATUS(CreateTransferEngine(*mConfig));
     const auto request = EncodeConfirmRequest({mId, mRank, mBases});
-    return Call(mRpc, mServer, MemoryRpc::Confirm, request);
+    const auto confirmRet = Call(mRpc, mServer, MemoryRpc::Confirm, request);
+    if (!confirmRet.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine Confirm request failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(confirmRet.code()) << ".";
+    }
+    return confirmRet;
 }
 
 Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
 {
-    CHECK_STATUS(ReadClientOptions(*config, mOptions));
+    const auto status = ReadClientOptions(*config, mOptions);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine could not read client options, status:" << static_cast<uint16_t>(status.code())
+                   << ", reason:" << status.message() << ".";
+        return status;
+    }
     mJoinTimeout = Milliseconds(config->get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
     if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
+        LOG(ERROR) << "Invalid MemoryEngine client timeout, config:" << config_keys::CONFIG_JOIN_TIMEOUT_MS
+                   << ", value ms:" << mJoinTimeout.count() << ".";
         return Status::InvalidArgument("Invalid MemoryEngine join timeout");
     }
     mBatchCopyTimeout = Milliseconds(config->get(config_keys::CONFIG_BATCH_COPY_TIMEOUT_MS,
                                                 DEFAULT_BATCH_COPY_TIMEOUT.count()));
     if (mBatchCopyTimeout < Milliseconds::zero() || mBatchCopyTimeout >= MAX_TIMEOUT) {
+        LOG(ERROR) << "Invalid MemoryEngine client timeout, config:" << config_keys::CONFIG_BATCH_COPY_TIMEOUT_MS
+                   << ", value ms:" << mBatchCopyTimeout.count() << ".";
         return Status::InvalidArgument("Invalid MemoryEngine batch copy timeout");
     }
     mConfig = std::move(config);
     mLayout = mOptions.layout;
     const auto &server = mOptions.server;
     mServer = buildIpAddrWithPort(server.host, server.port, server.ipv6);
-    CHECK_STATUS(StartCallbacks(mOptions.callbackHost));
+    const auto callbacks = StartCallbacks(mOptions.callbackHost);
+    if (!callbacks.ok()) {
+        LOG(ERROR) << "Could not start MemoryEngine callback RPC, status:"
+                   << static_cast<uint16_t>(callbacks.code()) << ".";
+        return callbacks;
+    }
     return InitializeRegistration();
 }
 
