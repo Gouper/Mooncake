@@ -13,6 +13,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -236,8 +237,7 @@ struct MemoryEngineServer::Impl {
     Bases mExpectedBases;
     std::optional<Bases> mBases;
     std::unordered_map<std::string, Registration> mRegistrations;
-    // Free rank intervals, with exclusive upper bounds.
-    std::map<uint32_t, uint32_t> mFreeRanks;
+    std::set<uint32_t> mFreeRanks;
     Milliseconds mLease{DEFAULT_LEASE};
     Milliseconds mRegistrationTimeout{DEFAULT_REGISTRATION};
     CoroRpcAgent mRpc;
@@ -349,45 +349,18 @@ Status MemoryEngineServer::Impl::ClaimRank(std::optional<uint32_t> requested, ui
     if (mFreeRanks.empty()) {
         return Status::TooManyRequests("No free MemoryEngine rank");
     }
-    auto interval = mFreeRanks.begin();
-    rank = interval->first;
-    if (requested) {
-        rank = *requested;
-        auto next = mFreeRanks.upper_bound(rank);
-        if (next == mFreeRanks.begin() || rank >= std::prev(next)->second) {
-            return Status::InvalidEntry("Requested MemoryEngine rank is already in use");
-        }
-        interval = std::prev(next);
+    const auto freeRank = requested ? mFreeRanks.find(*requested) : mFreeRanks.begin();
+    if (freeRank == mFreeRanks.end()) {
+        return Status::InvalidEntry("Requested MemoryEngine rank is already in use");
     }
-    const auto [begin, end] = *interval;
-    if (rank + 1 < end) {
-        mFreeRanks.emplace(rank + 1, end);
-    }
-    if (begin < rank) {
-        interval->second = rank;
-    } else {
-        mFreeRanks.erase(interval);
-    }
+    rank = *freeRank;
+    mFreeRanks.erase(freeRank);
     return Status::OK();
 }
 
 void MemoryEngineServer::Impl::ReleaseRank(uint32_t rank)
 {
-    auto begin = rank;
-    auto end = rank + 1;
-    auto next = mFreeRanks.upper_bound(rank);
-    if (next != mFreeRanks.begin()) {
-        auto previous = std::prev(next);
-        if (previous->second == rank) {
-            begin = previous->first;
-            mFreeRanks.erase(previous);
-        }
-    }
-    if (next != mFreeRanks.end() && end == next->first) {
-        end = next->second;
-        mFreeRanks.erase(next);
-    }
-    mFreeRanks.emplace(begin, end);
+    mFreeRanks.emplace(rank);
 }
 
 void MemoryEngineServer::Impl::ResetUnconfirmedLayout()
@@ -408,8 +381,12 @@ Status MemoryEngineServer::Impl::Register(const RegisterRequest &request, Regist
         return Status::InvalidArgument("MemoryEngine rank layout differs from configured server layout");
     }
     if (mLayout == Layout{}) {
+        std::set<uint32_t> freeRanks;
+        for (uint32_t rank = 0; rank < layout.worldSize; ++rank) {
+            freeRanks.emplace_hint(freeRanks.end(), rank);
+        }
+        mFreeRanks = std::move(freeRanks);
         mLayout = layout;
-        mFreeRanks.emplace(0, layout.worldSize);
     }
     if (layout != mLayout) {
         return Status::InvalidArgument("MemoryEngine rank layout differs from registered server layout");
