@@ -1,11 +1,15 @@
-add_library(memory_engine_objects OBJECT
-            src/memory_engine_client.cpp src/memory_engine_common.cpp
-            src/memory_engine_rpc.cpp src/memory_engine_server.cpp)
+add_library(
+  memory_engine_objects OBJECT
+  src/client/memory_engine_client.cpp
+  src/common/memory_engine_common.cpp
+  src/common/memory_engine_rpc.cpp
+  src/server/memory_engine_server.cpp)
 set_target_properties(memory_engine_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(memory_engine_objects PUBLIC cxx_std_20)
 target_include_directories(
   memory_engine_objects PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-  PRIVATE ${PROJECT_SOURCE_DIR}/mooncake-transfer-engine/tent/include)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+          ${PROJECT_SOURCE_DIR}/mooncake-transfer-engine/tent/include)
 target_link_libraries(memory_engine_objects PRIVATE tent_interface
                       glog::glog yalantinglibs::yalantinglibs)
 if(USE_MEMFABRIC)
