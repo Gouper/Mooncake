@@ -151,6 +151,17 @@ MemFabricSharedMemory *MemFabricTransport::GetGvaContext() const
     return stopping_ ? nullptr : gva_.get();
 }
 
+Status MemFabricTransport::PinGvaCopyBatch(std::shared_ptr<MemFabricSharedMemory> &context)
+{
+    std::lock_guard lock(inflight_mu_);
+    if (!gva_ || stopping_) [[unlikely]] {
+        return Status::NotImplemented("MemFabric GVA is unavailable");
+    }
+    CHECK_STATUS(gva_->PinCopyBatch());
+    context = gva_;
+    return Status::OK();
+}
+
 Status MemFabricTransport::PrepareGvaPeer(const std::string &segment, const std::string &identity)
 {
     std::lock_guard<std::mutex> lock(inflight_mu_);

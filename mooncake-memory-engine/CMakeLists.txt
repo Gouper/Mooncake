@@ -12,9 +12,6 @@ target_include_directories(
           ${PROJECT_SOURCE_DIR}/mooncake-transfer-engine/tent/include)
 target_link_libraries(memory_engine_objects PRIVATE tent_interface
                       glog::glog yalantinglibs::yalantinglibs)
-if(USE_MEMFABRIC)
-  target_compile_definitions(memory_engine_objects PRIVATE USE_MEMFABRIC)
-endif()
 
 add_library(mooncake_memory_engine SHARED)
 target_link_libraries(mooncake_memory_engine PRIVATE memory_engine_objects

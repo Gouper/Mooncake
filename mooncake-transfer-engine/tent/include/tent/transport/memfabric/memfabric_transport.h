@@ -57,6 +57,7 @@ struct MemFabricSubBatch : public Transport::SubBatch {
 class MemFabricTransport : public Transport, public MemFabricGvaAccess,
                            public std::enable_shared_from_this<MemFabricTransport> {
     friend class MemFabricTransportTest;
+    friend class TransferEngine;
 
    public:
     MemFabricTransport();
@@ -101,6 +102,7 @@ class MemFabricTransport : public Transport, public MemFabricGvaAccess,
     bool supportNotification() const override { return false; }
 
    private:
+    Status PinGvaCopyBatch(std::shared_ptr<MemFabricSharedMemory> &context);
     Status MapGva(SegmentID id, void *address, size_t size, bool bundle);
     struct GvaCopy {
         uint64_t source, destination;

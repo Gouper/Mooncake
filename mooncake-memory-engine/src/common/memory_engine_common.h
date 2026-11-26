@@ -59,15 +59,6 @@ inline constexpr char CONFIG_SERVER_GVA_BASE_DEVICE[] = "memory_engine/server/gv
 inline constexpr char CONFIG_SERVER_RANK_LEASE_MS[] = "memory_engine/server/rank_lease_ms";
 inline constexpr char CONFIG_SERVER_RPC_SERVER_THREADS[] = "memory_engine/server/rpc_server_threads";
 
-inline constexpr char TENT_CONFIG_METADATA_TYPE[] = "metadata_type";
-inline constexpr char TENT_CONFIG_METADATA_SERVERS[] = "metadata_servers";
-inline constexpr char TENT_CONFIG_MEMFABRIC_ENABLE[] = "transports/memfabric/enable";
-inline constexpr char TENT_CONFIG_GVA_ENABLED[] = "transports/memfabric/gva/enabled";
-inline constexpr char TENT_CONFIG_GVA_RANK[] = "transports/memfabric/gva/rank";
-inline constexpr char TENT_CONFIG_GVA_RANK_COUNT[] = "transports/memfabric/gva/rank_count";
-inline constexpr char TENT_CONFIG_GVA_DRAM_WINDOW[] = "transports/memfabric/gva/dram_window";
-inline constexpr char TENT_CONFIG_GVA_HBM_WINDOW[] = "transports/memfabric/gva/hbm_window";
-
 }
 
 enum class MemoryRpc {

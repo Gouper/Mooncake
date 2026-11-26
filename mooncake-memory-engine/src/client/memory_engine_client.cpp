@@ -25,11 +25,6 @@
 
 #include "tent/common/utils/ip.h"
 #include "tent/transfer_engine.h"
-#include "tent/transport/memfabric/memfabric_gva_access.h"
-#ifdef USE_MEMFABRIC
-#include "tent/runtime/platform.h"
-#include "tent/transport/memfabric/memfabric_shared_memory.h"
-#endif
 #include "memory_engine_common.h"
 #include "memory_engine_client.h"
 
@@ -73,7 +68,6 @@ struct ClientOptions {
     Milliseconds heartbeat{DEFAULT_HEARTBEAT};
 };
 
-#ifdef USE_MEMFABRIC
 constexpr uint32_t LOCAL_VA_RANK = UINT32_MAX;
 constexpr int32_t INVALID_COPY = static_cast<int32_t>(MemoryEngineCopyResult::InvalidArgument);
 constexpr uint64_t COPY_GROUP_DIRECTIONS = 2;
@@ -84,7 +78,7 @@ struct CopyEndpoint {
 };
 
 struct CopyGroup {
-    std::vector<MemFabricGvaCopy> copies;
+    std::vector<TransferEngine::GvaCopy> copies;
     std::vector<size_t> indices;
 };
 
@@ -149,13 +143,11 @@ struct CopyLogContext {
 void ExecuteLocalCopies(const std::vector<MemoryEngineCopyEntry> &entries, const CopyPlan &plan,
                         std::vector<int32_t> &results, Clock::time_point deadline, const CopyLogContext &context)
 {
-    auto &platform = Platform::getLoader();
     for (const auto index : plan.local) {
         auto outcome = MemoryEngineCopyResult::TimedOut;
         if (!CopyExpired(deadline)) {
             const auto &entry = entries[index];
-            const auto status = entry.src == entry.dst ? Status::OK() :
-                platform.copy(entry.dst, const_cast<void *>(entry.src), static_cast<size_t>(entry.size));
+            const auto status = TransferEngine::CopyLocalMemory(entry.dst, entry.src, static_cast<size_t>(entry.size));
             outcome = CopyResult(status, deadline);
             if (!status.ok()) [[unlikely]] {
                 LOG(ERROR) << "MemoryEngine local copy failed, registration ID:" << context.id
@@ -167,13 +159,13 @@ void ExecuteLocalCopies(const std::vector<MemoryEngineCopyEntry> &entries, const
     }
 }
 
-void ExecuteRemoteCopies(MemFabricSharedMemory &gva, const CopyPlan &plan, std::vector<int32_t> &results,
+void ExecuteRemoteCopies(const TransferEngine::GvaCopyBatch &batch, const CopyPlan &plan, std::vector<int32_t> &results,
                          Clock::time_point deadline, const CopyLogContext &context)
 {
     for (const auto &[key, group] : plan.remote) {
         auto outcome = MemoryEngineCopyResult::TimedOut;
         if (!CopyExpired(deadline)) {
-            const auto status = gva.RunPinnedBatchCopy(group.copies, kGvaCopyAuto);
+            const auto status = batch.Copy(group.copies);
             outcome = CopyResult(status, deadline);
             if (!status.ok()) [[unlikely]] {
                 LOG(ERROR) << "MemoryEngine remote copy failed, registration ID:" << context.id
@@ -187,7 +179,6 @@ void ExecuteRemoteCopies(MemFabricSharedMemory &gva, const CopyPlan &plan, std::
         }
     }
 }
-#endif
 
 Status ReadClientOptions(const Config &config, ClientOptions &options)
 {
@@ -252,13 +243,11 @@ struct MemoryEngine::Impl {
     Status Leave();
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
     Status Free(void *address);
-#ifdef USE_MEMFABRIC
     Status BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> &results);
     CopyEndpoint ResolveCopyEndpoint(uint64_t address, uint64_t size) const;
     bool IsPublishedCopyRange(uint32_t rank, uint64_t address, uint64_t size) const;
     void PlanCopy(const MemoryEngineCopyEntry &entry, size_t index, CopyPlan &plan, int32_t &result,
                   std::unique_lock<std::mutex> &peerLock) const;
-#endif
     Status DestroyTent();
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
@@ -301,7 +290,6 @@ struct MemoryEngine::Impl {
     std::optional<uint64_t> mFailedAllocation;
     size_t mLiveRegions{};
     MemoryEngineRpc mRpc;
-    std::shared_ptr<MemFabricGvaAccess> mFabric;
     std::unique_ptr<TransferEngine> mTent;
     std::jthread mHeartbeat;
 };
@@ -442,7 +430,7 @@ Status MemoryEngine::Impl::ImportSharedPeer(PeerMapping &peer, SharedPeer &reque
         peer.identity = std::move(request.identity);
     }
 
-    const auto prepareRet = mFabric->PrepareGvaPeer(peer.segmentName, peer.identity);
+    const auto prepareRet = mTent->PrepareGvaPeer(peer.segmentName, peer.identity);
     if (!prepareRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to prepare shared MemoryEngine peer, registration ID:" << mId << ", rank:" << mRank
                    << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(prepareRet.code()) << ".";
@@ -478,7 +466,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
         return Status::OK();
     }
 
-    const auto mapRet = mFabric->MapGvaRegion(peer.segment, reinterpret_cast<void *>(region.address), region.size);
+    const auto mapRet = mTent->MapGvaRegion(peer.segment, reinterpret_cast<void *>(region.address), region.size);
     if (!mapRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to map MemoryEngine peer region, registration ID:" << mId << ", rank:" << mRank
                    << ", peer rank:" << rank << ", bytes:" << region.size
@@ -535,7 +523,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     }
     mapped.revoked = true;
-    const auto revokeRet = mFabric->RevokeGvaRegion(peer.segment, rank, peer.segmentName, region.address);
+    const auto revokeRet = mTent->RevokeGvaRegion(peer.segment, rank, peer.segmentName, region.address);
     if (!revokeRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to revoke MemoryEngine peer region, registration ID:" << request.peer.id
                    << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size
@@ -547,7 +535,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
 Status MemoryEngine::Impl::UnmapPeer(uint32_t rank, PeerMapping &peer)
 {
     if (peer.segment != LOCAL_SEGMENT_ID) {
-        const auto unmapRet = mFabric->CloseGvaPeer(peer.segment, rank, peer.segmentName);
+        const auto unmapRet = mTent->CloseGvaPeer(peer.segment, rank, peer.segmentName);
         if (!unmapRet.ok()) [[unlikely]] {
             LOG(ERROR) << "Failed to unmap MemoryEngine peer, registration ID:" << mId << ", rank:" << mRank
                        << ", peer rank:" << rank << ", status:" << static_cast<uint16_t>(unmapRet.code()) << ".";
@@ -682,7 +670,7 @@ Status MemoryEngine::Impl::Join()
 
     const auto deadline = Clock::now() + mJoinTimeout + RPC_TIMEOUT;
     std::string identity;
-    const auto identityRet = mFabric->GetGvaIdentity(identity);
+    const auto identityRet = mTent->GetGvaIdentity(identity);
     if (!identityRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to get MemoryEngine GVA identity for Join, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(identityRet.code()) << ".";
@@ -705,7 +693,7 @@ Status MemoryEngine::Impl::PrepareNativePeers()
     std::lock_guard lock(mPeerMutex);
     for (const auto &[rank, peer] : mPeers) {
         if (!peer.revoked && peer.segment != LOCAL_SEGMENT_ID) {
-            const auto status = mFabric->PrepareGvaPeer(peer.segmentName, peer.identity);
+            const auto status = mTent->PrepareGvaPeer(peer.segmentName, peer.identity);
             if (!status.ok()) [[unlikely]] {
                 LOG(ERROR) << "Failed to prepare MemoryEngine peer for allocation, registration ID:" << mId
                            << ", rank:" << mRank << ", peer rank:" << rank
@@ -720,10 +708,9 @@ Status MemoryEngine::Impl::PrepareNativePeers()
 Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, uint64_t &address)
 {
     MemoryOptions options;
-    options.type = MEMFABRIC;
     options.location = type == MemoryEngineMemType::Host ? "cpu" : "npu";
     void *memory = nullptr;
-    auto status = mTent->allocateLocalMemory(&memory, size, options);
+    auto status = mTent->AllocateGvaMemory(&memory, size, options);
     if (!status.ok()) {
         LOG(ERROR) << "MemoryEngine local allocation failed, registration ID:" << mId << ", rank:" << mRank
                    << ", location:" << options.location << ", bytes:" << size
@@ -903,7 +890,6 @@ Status MemoryEngine::Impl::Free(void *address)
     return DrainRetired(key);
 }
 
-#ifdef USE_MEMFABRIC
 CopyEndpoint MemoryEngine::Impl::ResolveCopyEndpoint(uint64_t address, uint64_t size) const
 {
     const auto host = ClassifyWindow(address, size, mBases.host, mLayout.hostWindow, mLayout.worldSize);
@@ -981,8 +967,7 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
     results.assign(entries.size(), INVALID_COPY);
 
     CopyPlan plan;
-    const auto release = [](MemFabricSharedMemory *gva) { gva->releaseCopy(1); };
-    std::unique_ptr<MemFabricSharedMemory, decltype(release)> pin(nullptr, release);
+    TransferEngine::GvaCopyBatch remoteBatch;
     {
         std::unique_lock peerLock(mPeerMutex, std::defer_lock);
         for (size_t index = 0; index < entries.size(); ++index) {
@@ -990,8 +975,7 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
         }
         if (!plan.remote.empty()) {
             // Pin before releasing the peer lock so revoke cannot invalidate a planned range.
-            auto *gva = mFabric->GetGvaContext();
-            const auto status = gva->PinCopyBatch();
+            const auto status = mTent->PinGvaCopyBatch(remoteBatch);
             if (!status.ok()) [[unlikely]] {
                 std::fill(results.begin(), results.end(), INVALID_COPY);
                 LOG(ERROR) << "MemoryEngine BatchCopy could not pin remote mappings, registration ID:" << mId
@@ -999,7 +983,6 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
                            << ", status:" << static_cast<uint16_t>(status.code()) << ".";
                 return status;
             }
-            pin.reset(gva);
         }
     }
 
@@ -1007,12 +990,11 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
     if (!plan.local.empty()) {
         ExecuteLocalCopies(entries, plan, results, deadline, context);
     }
-    if (pin) {
-        ExecuteRemoteCopies(*pin, plan, results, deadline, context);
+    if (!plan.remote.empty()) {
+        ExecuteRemoteCopies(remoteBatch, plan, results, deadline, context);
     }
     return Status::OK();
 }
-#endif
 
 Status MemoryEngine::Impl::DestroyTent()
 {
@@ -1031,13 +1013,12 @@ Status MemoryEngine::Impl::DestroyTent()
     mFailedAllocation.reset();
     mRetired.clear();
     mLiveRegions = 0;
-    const auto closeRet = mFabric->uninstall();
+    const auto closeRet = mTent->CloseGva();
     if (!closeRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to close MemoryEngine GVA layout, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(closeRet.code()) << ".";
         return closeRet;
     }
-    mFabric.reset();
     mTent.reset();
     return Status::OK();
 }
@@ -1091,33 +1072,17 @@ Status MemoryEngine::Impl::CancelRegistration()
 
 Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
 {
-#ifdef USE_MEMFABRIC
-    auto native = std::make_shared<Config>();
-    CHECK_STATUS(native->load(config.dump()));
-    native->set(config_keys::TENT_CONFIG_METADATA_TYPE, "p2p");
-    native->set(config_keys::TENT_CONFIG_METADATA_SERVERS, "");
-    native->set(config_keys::TENT_CONFIG_MEMFABRIC_ENABLE, true);
-    native->set(config_keys::TENT_CONFIG_GVA_ENABLED, true);
-    native->set(config_keys::TENT_CONFIG_GVA_RANK, mRank);
-    native->set(config_keys::TENT_CONFIG_GVA_RANK_COUNT, mLayout.worldSize);
-    native->set(config_keys::TENT_CONFIG_GVA_DRAM_WINDOW, mLayout.hostWindow / GIB);
-    native->set(config_keys::TENT_CONFIG_GVA_HBM_WINDOW, mLayout.deviceWindow / GIB);
-    MemFabricConfigScope configScope(*native);
-    auto tent = std::unique_ptr<TransferEngine>(new (std::nothrow) TransferEngine(native));
-    if (!tent || !tent->available()) [[unlikely]] {
+    const TransferEngine::GvaLayout layout{mRank, mLayout.worldSize, mLayout.hostWindow, mLayout.deviceWindow};
+    std::unique_ptr<TransferEngine> tent;
+    const auto createRet = TransferEngine::CreateWithGva(config, layout, tent);
+    if (!createRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to initialize MemoryEngine TENT instance, registration ID:" << mId << ", rank:" << mRank
-                   << ", world size:" << mLayout.worldSize << ".";
-        return Status::InternalError("Could not initialize MemoryEngine TENT instance");
-    }
-
-    auto fabric = MemFabricGvaAccess::Find(tent->getSegmentName());
-    if (!fabric) [[unlikely]] {
-        LOG(ERROR) << "MemFabric GVA is unavailable for MemoryEngine, registration ID:" << mId << ", rank:" << mRank
+                   << ", world size:" << mLayout.worldSize << ", status:" << static_cast<uint16_t>(createRet.code())
                    << ".";
-        return Status::NotImplemented("MemFabric GVA transport is unavailable");
+        return createRet;
     }
 
-    const auto basesRet = fabric->GetGvaBases(mBases.host, mBases.device);
+    const auto basesRet = tent->GetGvaBases(mBases.host, mBases.device);
     if (!basesRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to get MemoryEngine GVA bases, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(basesRet.code()) << ".";
@@ -1132,13 +1097,8 @@ Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
         return validateRet;
     }
     std::lock_guard lock(mPeerMutex);
-    mFabric = std::move(fabric);
     mTent = std::move(tent);
     return Status::OK();
-#else
-    static_cast<void>(config);
-    return Status::NotImplemented("MemFabric GVA transport is unavailable");
-#endif
 }
 
 void MemoryEngine::Impl::StartHeartbeat(Milliseconds interval)
@@ -1300,11 +1260,7 @@ Status MemoryEngine::BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries
     if (results == nullptr || entries.empty() || entries.size() > UINT32_MAX) [[unlikely]] {
         return Status::InvalidArgument("Invalid MemoryEngine copy batch");
     }
-#ifdef USE_MEMFABRIC
     return mImpl->BatchCopy(entries, *results);
-#else
-    return Status::NotImplemented("MemoryEngine batch copy requires MemFabric GVA");
-#endif
 }
 
 Status MemoryEngine::GvaBase(MemoryEngineMemType type, uint32_t rank, void **address) const

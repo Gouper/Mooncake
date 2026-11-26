@@ -403,7 +403,59 @@ class TransferEngine {
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
+   public:
+    struct GvaLayout {
+        uint32_t rank{};
+        uint32_t rankCount{};
+        uint64_t hostWindow{};
+        uint64_t deviceWindow{};
+    };
+
+    struct GvaCopy {
+        uint64_t source{};
+        uint64_t destination{};
+        size_t size{};
+    };
+
+    // Pins the current GVA mappings for the lifetime of this batch.
+    // Keep the engine alive until the batch is destroyed.
+    class GvaCopyBatch {
+       public:
+        GvaCopyBatch() = default;
+        ~GvaCopyBatch();
+        GvaCopyBatch(const GvaCopyBatch &) = delete;
+        GvaCopyBatch &operator=(const GvaCopyBatch &) = delete;
+
+        // Each copy uses at least one mapped GVA. Keep all buffers valid until
+        // the underlying transfer has finished, including after a copy error.
+        Status Copy(const std::vector<GvaCopy> &copies) const;
+
+       private:
+        friend class TransferEngine;
+        std::shared_ptr<void> mContext;
+    };
+
+    // The calling thread must be bound to its device. Window sizes are in bytes.
+    static Status CreateWithGva(const Config &config, const GvaLayout &layout,
+                                std::unique_ptr<TransferEngine> &engine);
+    Status GetGvaBases(uint64_t &host, uint64_t &device) const;
+    Status GetGvaIdentity(std::string &identity) const;
+    Status PrepareGvaPeer(const std::string &segment, const std::string &identity);
+    // The segment handle, name and rank must identify the same peer.
+    Status CloseGvaPeer(SegmentID peer, uint32_t rank, const std::string &segment);
+    Status MapGvaRegion(SegmentID peer, void *address, size_t size);
+    Status RevokeGvaRegion(SegmentID peer, uint32_t rank, const std::string &segment, uint64_t address);
+    // Sets the transport and other registration options for the allocated region.
+    Status AllocateGvaMemory(void **address, size_t size, MemoryOptions &options);
+    Status PinGvaCopyBatch(GvaCopyBatch &batch) const;
+    static Status CopyLocalMemory(void *destination, const void *source, size_t size);
+    // Unregister and free local allocations, close peers and quiesce other API users first.
+    Status CloseGva();
+
    private:
+    template <typename Operation>
+    Status WithGvaTransport(Operation operation) const;
+
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
