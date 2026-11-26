@@ -262,7 +262,7 @@ struct MemoryEngine::Impl {
     Status PrepareNativePeers();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
     Status RegisterLocalRegion(void *memory, MemoryOptions &options, GvaRegion &region);
-    Status UpdateLocalRegion(GvaRegion region, bool publish);
+    Status SendRegionUpdateToServer(GvaRegion region, bool publish);
     Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
     Status ReconcileAllocation();
     Status RetireLocal(uint64_t address, LocalRegion &local);
@@ -743,7 +743,7 @@ Status MemoryEngine::Impl::RegisterLocalRegion(void *memory, MemoryOptions &opti
     return mTent->GetGvaRegionDescriptor(memory, region.size, region.descriptor);
 }
 
-Status MemoryEngine::Impl::UpdateLocalRegion(GvaRegion region, bool publish)
+Status MemoryEngine::Impl::SendRegionUpdateToServer(GvaRegion region, bool publish)
 {
     const auto op = publish ? MemoryRpc::PublishRegion : MemoryRpc::RevokeRegion;
     const RegionRequest request{mId, std::move(region)};
@@ -788,7 +788,7 @@ Status MemoryEngine::Impl::ReconcileAllocation()
     auto &local = mLocalRegions.at(*mFailedAllocation);
     const bool exported = local.state == RegionState::Revoking;
     if (exported) {
-        CHECK_STATUS(UpdateLocalRegion({*mFailedAllocation, local.size}, false));
+        CHECK_STATUS(SendRegionUpdateToServer({*mFailedAllocation, local.size}, false));
     }
     const bool release = !exported || !mLiveRegions;
     CHECK_STATUS(ReleaseLocal(*mFailedAllocation, local, release));
@@ -826,7 +826,7 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
     GvaRegion region;
     CHECK_STATUS(AllocateLocal(aligned, type, region));
     const auto allocated = region.address;
-    const auto status = UpdateLocalRegion(std::move(region), true);
+    const auto status = SendRegionUpdateToServer(std::move(region), true);
     auto &local = mLocalRegions.at(allocated);
     if (!status.ok()) {
         local.state = RegionState::Revoking;
@@ -847,7 +847,7 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
 Status MemoryEngine::Impl::RetireLocal(uint64_t address, LocalRegion &local)
 {
     local.state = RegionState::Revoking;
-    CHECK_STATUS(UpdateLocalRegion({address, local.size}, false));
+    CHECK_STATUS(SendRegionUpdateToServer({address, local.size}, false));
     CHECK_STATUS(ReleaseLocal(address, local, false));
     local.state = RegionState::Retired;
     mRetired.insert(address);
