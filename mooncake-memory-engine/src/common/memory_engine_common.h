@@ -113,6 +113,7 @@ struct GvaRegion {
     uint64_t address{};
     size_t size{};
     bool revoking = false;
+    std::string descriptor{};
 };
 
 struct RegistrationIdRequest {
@@ -204,7 +205,7 @@ json EncodeJoinRequest(const JoinRequest &request);
 Status DecodeJoinRequest(const json &payload, JoinRequest &request);
 
 json EncodeRegionRequest(const RegionRequest &request);
-Status DecodeRegionRequest(const json &payload, RegionRequest &request);
+Status DecodeRegionRequest(const json &payload, bool publish, RegionRequest &request);
 
 json EncodePeerRequest(const PeerRequest &request);
 Status DecodePeerRequest(const json &payload, PeerRequest &request);
@@ -216,8 +217,9 @@ Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer);
 json EncodeSharePeersRequest(const SharePeersRequest &request);
 Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);
 
-json EncodePeerRegionRequest(const PeerRegionRequest &request);
-Status DecodePeerRegion(const json &payload, GvaRegion &region);
+json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region);
+Status DecodePeerRegion(const json &payload, bool map, GvaRegion &region);
+void ClearRegionDescriptor(json &payload);
 
 std::string EncodeReply(const Status &status, json &response);
 

@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -129,28 +130,28 @@ class OwnerMutation {
     bool mAcquired{};
 };
 
-Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, std::vector<PeerCallback> peers,
+Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, const std::vector<PeerCallback> &peers,
                              Clock::time_point deadline)
 {
-    while (!peers.empty()) {
+    std::vector<size_t> pending(peers.size());
+    std::iota(pending.begin(), pending.end(), size_t{0});
+    while (!pending.empty()) {
         const auto rpcDeadline = std::min(deadline, Clock::now() + RPC_TIMEOUT);
         std::vector<std::future<Status>> calls;
-        calls.reserve(peers.size());
-        for (const auto &peer : peers) {
-            calls.emplace_back(CallAsync(rpc, op, peer.call, rpcDeadline));
+        calls.reserve(pending.size());
+        for (const auto peerIndex : pending) {
+            calls.emplace_back(CallAsync(rpc, op, peers[peerIndex].call, rpcDeadline));
         }
 
         Status failure;
-        size_t pending = 0;
+        size_t retryCount = 0;
         for (size_t index = 0; index < calls.size(); ++index) {
+            const auto peerIndex = pending[index];
             auto status = calls[index].get();
             if (Retryable(status)) {
-                if (pending != index) {
-                    peers[pending] = std::move(peers[index]);
-                }
-                ++pending;
+                pending[retryCount++] = peerIndex;
             } else if (!status.ok() && failure.ok()) {
-                const auto &peer = peers[index];
+                const auto &peer = peers[peerIndex];
                 LOG(ERROR) << "MemoryEngine peer callback failed, target rank:" << peer.targetRank
                            << ", owner rank:" << peer.ownerRank
                            << ", status:" << static_cast<uint16_t>(status.code()) << ".";
@@ -161,16 +162,16 @@ Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, std::vector<Pee
         if (!failure.ok()) {
             return failure;
         }
-        peers.resize(pending);
-        if (pending && Clock::now() >= deadline) {
+        pending.resize(retryCount);
+        if (retryCount && Clock::now() >= deadline) {
             const auto status = Status::TimedOut("MemoryEngine callbacks did not settle");
-            LOG(ERROR) << "MemoryEngine peer callbacks did not settle, pending count:" << pending
-                       << ", first pending rank:" << peers.front().targetRank
-                       << ", owner rank:" << peers.front().ownerRank
+            const auto &peer = peers[pending.front()];
+            LOG(ERROR) << "MemoryEngine peer callbacks did not settle, pending count:" << retryCount
+                       << ", first pending rank:" << peer.targetRank << ", owner rank:" << peer.ownerRank
                        << ", status:" << static_cast<uint16_t>(status.code()) << ".";
             return status;
         }
-        if (pending) {
+        if (retryCount) {
             std::this_thread::sleep_for(RETRY_INTERVAL);
         }
     }
@@ -182,9 +183,10 @@ SharedPeer BuildSharedPeer(const Registration &target, const Registration &owner
     SharedPeer peer{owner.rank, std::max(target.generation, owner.generation), owner.segment, owner.identity, {}};
     if (includeRegions) {
         peer.regions.reserve(owner.regions.size());
-        for (const auto &[address, region] : owner.regions) {
+        for (const auto &entry : owner.regions) {
+            const auto &region = entry.second;
             if (!region.revoking) {
-                peer.regions.push_back({address, region.size});
+                peer.regions.push_back(region);
             }
         }
     }
@@ -242,7 +244,7 @@ struct MemoryEngineServer::Impl {
     Status UpdateRegion(const json &payload, bool publish);
     Status PrepareRegion(const std::string &id, const GvaRegion &region, bool publish,
                          std::vector<PeerCallback> &calls);
-    void CommitRegion(const std::string &id, const GvaRegion &region, bool publish);
+    void CommitRegion(const std::string &id, GvaRegion &&region, bool publish);
     Status ClaimRank(std::optional<uint32_t> requested, uint32_t &rank);
     void ReleaseRank(uint32_t rank);
     void ResetUnconfirmedLayout();
@@ -594,7 +596,7 @@ Status MemoryEngineServer::Impl::BeginLeave(const std::string &id)
     std::vector<PeerCallback> calls;
     CHECK_STATUS(PrepareLeave(id, calls));
     const auto deadline = Clock::now() + RPC_TIMEOUT;
-    CHECK_STATUS(SendToPeersInParallel(mRpc, MemoryRpc::UnsharePeer, std::move(calls), deadline));
+    CHECK_STATUS(SendToPeersInParallel(mRpc, MemoryRpc::UnsharePeer, calls, deadline));
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(id);
     if (found != mRegistrations.end()) {
@@ -674,7 +676,7 @@ Status MemoryEngineServer::Impl::SharePeersForJoin(const Registration &member, c
         calls.push_back({{peer.callback, std::move(request)}, peer.rank, member.rank});
     }
 
-    const auto status = SendToPeersInParallel(mRpc, MemoryRpc::SharePeer, std::move(calls), deadline);
+    const auto status = SendToPeersInParallel(mRpc, MemoryRpc::SharePeer, calls, deadline);
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to notify MemoryEngine peers of Join, registration ID:" << member.id
                    << ", rank:" << member.rank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
@@ -725,7 +727,7 @@ Status MemoryEngineServer::Impl::RollbackJoin(const Registration &member, const 
         calls.push_back(UnshareRequest(member, peer));
     }
     const auto deadline = Clock::now() + RPC_TIMEOUT;
-    auto status = SendToPeersInParallel(mRpc, MemoryRpc::UnsharePeer, std::move(calls), deadline);
+    auto status = SendToPeersInParallel(mRpc, MemoryRpc::UnsharePeer, calls, deadline);
     if (!status.ok()) {
         LOG(ERROR) << "Failed to roll back MemoryEngine join, registration ID:" << member.id
                    << ", rank:" << member.rank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
@@ -809,11 +811,12 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
                      << ", rank:" << owner.rank << ", bytes:" << region.size << ".";
         return Status::InvalidEntry("MemoryEngine region was already revoked");
     }
-    if (existing != owner.regions.end() && existing->second.size != region.size) {
-        LOG(ERROR) << "Region size conflicts with existing allocation, registration ID:" << id
+    if (existing != owner.regions.end() &&
+        (existing->second.size != region.size || (publish && existing->second.descriptor != region.descriptor))) {
+        LOG(ERROR) << "Region metadata conflicts with existing allocation, registration ID:" << id
                    << ", rank:" << owner.rank << ", bytes:" << region.size
                    << ", registered bytes:" << existing->second.size << ".";
-        return Status::InvalidArgument("Conflicting MemoryEngine region size");
+        return Status::InvalidArgument("Conflicting MemoryEngine region metadata");
     }
     if (publish && existing != owner.regions.end()) {
         return Status::OK();
@@ -835,18 +838,18 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
         if (peerId == id || !available) {
             continue;
         }
-        const PeerRegionRequest request{{peerId, owner.rank, std::max(peer.generation, owner.generation)}, region};
-        calls.push_back({{peer.callback, EncodePeerRegionRequest(request)}, peer.rank, owner.rank});
+        const PeerRequest request{peerId, owner.rank, std::max(peer.generation, owner.generation)};
+        calls.push_back({{peer.callback, EncodePeerRegionRequest(request, region)}, peer.rank, owner.rank});
     }
     return Status::OK();
 }
 
-void MemoryEngineServer::Impl::CommitRegion(const std::string &id, const GvaRegion &region, bool publish)
+void MemoryEngineServer::Impl::CommitRegion(const std::string &id, GvaRegion &&region, bool publish)
 {
     std::lock_guard lock(mMutex);
     auto &regions = mRegistrations.at(id).regions;
     if (publish) {
-        regions.try_emplace(region.address, region);
+        regions.try_emplace(region.address, std::move(region));
     } else {
         regions.erase(region.address);
     }
@@ -859,7 +862,7 @@ Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, bool publish)
         return Status::TooManyRequests("MemoryEngine region operation in progress");
     }
     RegionRequest request;
-    const auto decodeRet = DecodeRegionRequest(payload, request);
+    const auto decodeRet = DecodeRegionRequest(payload, publish, request);
     if (!decodeRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to decode MemoryEngine region update request, error:" << decodeRet.message() << ".";
         return decodeRet;
@@ -877,15 +880,18 @@ Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, bool publish)
     auto status = SendToPeersInParallel(mRpc, op, peers, Clock::now() + RPC_TIMEOUT);
     if (!status.ok()) {
         if (publish) {
+            for (auto &peer : peers) {
+                ClearRegionDescriptor(peer.call.request);
+            }
             const auto deadline = Clock::now() + RPC_TIMEOUT;
-            const auto cleanup = SendToPeersInParallel(mRpc, MemoryRpc::UnmapRegion, std::move(peers), deadline);
+            const auto cleanup = SendToPeersInParallel(mRpc, MemoryRpc::UnmapRegion, peers, deadline);
             if (!cleanup.ok()) {
                 return cleanup;
             }
         }
         return status;
     }
-    CommitRegion(id, region, publish);
+    CommitRegion(id, std::move(request.region), publish);
     return Status::OK();
 }
 

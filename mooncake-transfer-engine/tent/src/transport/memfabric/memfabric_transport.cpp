@@ -234,6 +234,52 @@ Status MemFabricTransport::MapGvaRegion(SegmentID id, void *addr, size_t size)
     return MapGva(id, addr, size, false);
 }
 
+Status MemFabricTransport::GetGvaRegionDescriptor(const void *address, size_t size, std::string &descriptor) const
+{
+    std::shared_ptr<ControlService> metadata;
+    {
+        std::lock_guard lock(inflight_mu_);
+        if (!gva_ || stopping_) [[unlikely]] {
+            return Status::NotImplemented("MemFabric GVA is unavailable");
+        }
+        metadata = metadata_;
+    }
+
+    const auto base = reinterpret_cast<uint64_t>(address);
+    const auto segment = metadata->segmentManager().getLocal();
+    const auto *buffer = segment->findBuffer(base, size);
+    if (!buffer || buffer->addr != base || buffer->length != size) [[unlikely]] {
+        return Status::InvalidEntry("MemFabric requires a complete registered GVA region");
+    }
+    const auto *published = findGvaDescriptor(*buffer);
+    if (!published) [[unlikely]] {
+        return Status::InvalidEntry("Missing registered MemFabric GVA descriptor");
+    }
+
+    descriptor = *published;
+    return Status::OK();
+}
+
+Status MemFabricTransport::ImportGvaRegion(SegmentID id, const std::string &segment, void *address, size_t size,
+                                           const std::string &descriptor)
+{
+    if (descriptor.empty() || descriptor.front() != '{') [[unlikely]] {
+        return Status::InvalidArgument("Expected one MemFabric GVA slice descriptor");
+    }
+
+    const auto base = reinterpret_cast<uint64_t>(address);
+    std::shared_ptr<MemFabricSharedMemory> context;
+    {
+        std::lock_guard lock(inflight_mu_);
+        if (!gva_ || stopping_) [[unlikely]] {
+            return Status::NotImplemented("MemFabric GVA is unavailable");
+        }
+        context = gva_;
+        gva_remote_.insert_or_assign({id, base}, segment);
+    }
+    return context->prepare(segment, descriptor, base, size);
+}
+
 Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool includeBundle)
 {
     std::shared_ptr<MemFabricSharedMemory> context;

@@ -260,8 +260,9 @@ struct MemoryEngine::Impl {
     Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status UpdatePeerRegion(const json &payload, bool map);
     Status PrepareNativePeers();
-    Status AllocateLocal(size_t size, MemoryEngineMemType type, uint64_t &address);
-    Status UpdateLocalRegion(uint64_t address, size_t size, bool publish);
+    Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
+    Status RegisterLocalRegion(void *memory, MemoryOptions &options, GvaRegion &region);
+    Status UpdateLocalRegion(GvaRegion region, bool publish);
     Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
     Status ReconcileAllocation();
     Status RetireLocal(uint64_t address, LocalRegion &local);
@@ -466,7 +467,8 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
         return Status::OK();
     }
 
-    const auto mapRet = mTent->MapGvaRegion(peer.segment, reinterpret_cast<void *>(region.address), region.size);
+    const auto mapRet = mTent->ImportGvaRegion(peer.segment, peer.segmentName,
+                                             reinterpret_cast<void *>(region.address), region.size, region.descriptor);
     if (!mapRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to map MemoryEngine peer region, registration ID:" << mId << ", rank:" << mRank
                    << ", peer rank:" << rank << ", bytes:" << region.size
@@ -503,7 +505,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
         return Status::OK();
     }
 
-    const auto regionRet = DecodePeerRegion(payload, request.region);
+    const auto regionRet = DecodePeerRegion(payload, map, request.region);
     if (!regionRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to decode MemoryEngine peer region, error:" << regionRet.message()
                    << ", registration ID:" << request.peer.id << ", rank:" << mRank << ", peer rank:" << rank << ".";
@@ -590,10 +592,8 @@ Status MemoryEngine::Impl::SharePeer(const json &payload)
         LOG(ERROR) << "MemoryEngine SharePeer import failed, registration ID:" << mId << ", rank:" << mRank
                    << ", peer rank:" << rank << ", generation:" << header.generation
                    << ", status:" << static_cast<uint16_t>(importRet.code()) << ".";
-        return importRet;
     }
-
-    return MapSharedPeerRegions(peer, request);
+    return importRet;
 }
 
 Status MemoryEngine::Impl::SharePeers(const json &payload)
@@ -705,7 +705,7 @@ Status MemoryEngine::Impl::PrepareNativePeers()
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, uint64_t &address)
+Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region)
 {
     MemoryOptions options;
     options.location = type == MemoryEngineMemType::Host ? "cpu" : "npu";
@@ -718,32 +718,40 @@ Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, 
         return status;
     }
 
-    address = reinterpret_cast<uint64_t>(memory);
-    auto &local = mLocalRegions.try_emplace(address, LocalRegion{size}).first->second;
+    region.address = reinterpret_cast<uint64_t>(memory);
+    region.size = size;
+    auto &local = mLocalRegions.try_emplace(region.address, LocalRegion{size}).first->second;
     // Registration can have published metadata before reporting an error.
     local.registered = true;
-    status = mTent->registerLocalMemory({memory}, {size}, options);
-    if (!status.ok()) {
-        LOG(ERROR) << "MemoryEngine local allocation registration failed, registration ID:" << mId
-                   << ", rank:" << mRank << ", location:" << options.location << ", bytes:" << size
+    status = RegisterLocalRegion(memory, options, region);
+    if (!status.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to register or export MemoryEngine region, registration ID:" << mId
+                   << ", rank:" << mRank << ", bytes:" << size
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";
-        if (ReleaseLocal(address, local, true).ok()) {
-            mLocalRegions.erase(address);
+        if (ReleaseLocal(region.address, local, true).ok()) {
+            mLocalRegions.erase(region.address);
         } else {
-            mFailedAllocation = address;
+            mFailedAllocation = region.address;
         }
     }
     return status;
 }
 
-Status MemoryEngine::Impl::UpdateLocalRegion(uint64_t address, size_t size, bool publish)
+Status MemoryEngine::Impl::RegisterLocalRegion(void *memory, MemoryOptions &options, GvaRegion &region)
+{
+    CHECK_STATUS(mTent->registerLocalMemory({memory}, {region.size}, options));
+    return mTent->GetGvaRegionDescriptor(memory, region.size, region.descriptor);
+}
+
+Status MemoryEngine::Impl::UpdateLocalRegion(GvaRegion region, bool publish)
 {
     const auto op = publish ? MemoryRpc::PublishRegion : MemoryRpc::RevokeRegion;
-    const PeerCall server{mServer, EncodeRegionRequest({mId, {address, size}})};
+    const RegionRequest request{mId, std::move(region)};
+    const PeerCall server{mServer, EncodeRegionRequest(request)};
     const auto status = CallControl(mRpc, op, server, Clock::now() + mJoinTimeout + RPC_TIMEOUT);
     if (!status.ok()) {
         LOG(ERROR) << "MemoryEngine region update failed, registration ID:" << mId << ", rank:" << mRank
-                   << ", bytes:" << size << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+                   << ", bytes:" << request.region.size << ", status:" << static_cast<uint16_t>(status.code()) << ".";
     }
     return status;
 }
@@ -780,7 +788,7 @@ Status MemoryEngine::Impl::ReconcileAllocation()
     auto &local = mLocalRegions.at(*mFailedAllocation);
     const bool exported = local.state == RegionState::Revoking;
     if (exported) {
-        CHECK_STATUS(UpdateLocalRegion(*mFailedAllocation, local.size, false));
+        CHECK_STATUS(UpdateLocalRegion({*mFailedAllocation, local.size}, false));
     }
     const bool release = !exported || !mLiveRegions;
     CHECK_STATUS(ReleaseLocal(*mFailedAllocation, local, release));
@@ -815,9 +823,10 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
     CHECK_STATUS(DrainRetired(0));
     CHECK_STATUS(PrepareNativePeers());
 
-    uint64_t allocated{};
-    CHECK_STATUS(AllocateLocal(aligned, type, allocated));
-    auto status = UpdateLocalRegion(allocated, aligned, true);
+    GvaRegion region;
+    CHECK_STATUS(AllocateLocal(aligned, type, region));
+    const auto allocated = region.address;
+    const auto status = UpdateLocalRegion(std::move(region), true);
     auto &local = mLocalRegions.at(allocated);
     if (!status.ok()) {
         local.state = RegionState::Revoking;
@@ -838,7 +847,7 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
 Status MemoryEngine::Impl::RetireLocal(uint64_t address, LocalRegion &local)
 {
     local.state = RegionState::Revoking;
-    CHECK_STATUS(UpdateLocalRegion(address, local.size, false));
+    CHECK_STATUS(UpdateLocalRegion({address, local.size}, false));
     CHECK_STATUS(ReleaseLocal(address, local, false));
     local.state = RegionState::Retired;
     mRetired.insert(address);

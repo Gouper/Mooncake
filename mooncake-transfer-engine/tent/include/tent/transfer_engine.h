@@ -444,6 +444,11 @@ class TransferEngine {
     // The segment handle, name and rank must identify the same peer.
     Status CloseGvaPeer(SegmentID peer, uint32_t rank, const std::string &segment);
     Status MapGvaRegion(SegmentID peer, void *address, size_t size);
+    // Export the descriptor of one complete, registered local GVA region.
+    Status GetGvaRegionDescriptor(const void *address, size_t size, std::string &descriptor) const;
+    // Import a descriptor supplied by the caller. The handle must name the given segment.
+    Status ImportGvaRegion(SegmentID peer, const std::string &segment, void *address, size_t size,
+                           const std::string &descriptor);
     Status RevokeGvaRegion(SegmentID peer, uint32_t rank, const std::string &segment, uint64_t address);
     // Sets the transport and other registration options for the allocated region.
     Status AllocateGvaMemory(void **address, size_t size, MemoryOptions &options);

@@ -138,6 +138,27 @@ Status TransferEngine::MapGvaRegion(SegmentID peer, void *address, size_t size)
     return WithGvaTransport([&](auto &transport) { return transport.MapGvaRegion(peer, address, size); });
 }
 
+Status TransferEngine::GetGvaRegionDescriptor(const void *address, size_t size, std::string &descriptor) const
+{
+    if (!address || !size) [[unlikely]] {
+        return Status::InvalidArgument("Invalid local GVA region");
+    }
+    return WithGvaTransport([&](auto &transport) {
+        return transport.GetGvaRegionDescriptor(address, size, descriptor);
+    });
+}
+
+Status TransferEngine::ImportGvaRegion(SegmentID peer, const std::string &segment, void *address, size_t size,
+                                       const std::string &descriptor)
+{
+    if (peer == LOCAL_SEGMENT_ID || segment.empty() || !address || !size) [[unlikely]] {
+        return Status::InvalidArgument("Invalid remote GVA region");
+    }
+    return WithGvaTransport([&](auto &transport) {
+        return transport.ImportGvaRegion(peer, segment, address, size, descriptor);
+    });
+}
+
 Status TransferEngine::RevokeGvaRegion(SegmentID peer, uint32_t rank, const std::string &segment, uint64_t address)
 {
     if (peer == LOCAL_SEGMENT_ID || segment.empty() || !address) [[unlikely]] {

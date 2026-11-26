@@ -102,6 +102,9 @@ class MemFabricTransport : public Transport, public MemFabricGvaAccess,
     bool supportNotification() const override { return false; }
 
    private:
+    Status GetGvaRegionDescriptor(const void *address, size_t size, std::string &descriptor) const;
+    Status ImportGvaRegion(SegmentID id, const std::string &segment, void *address, size_t size,
+                           const std::string &descriptor);
     Status PinGvaCopyBatch(std::shared_ptr<MemFabricSharedMemory> &context);
     Status MapGva(SegmentID id, void *address, size_t size, bool bundle);
     struct GvaCopy {

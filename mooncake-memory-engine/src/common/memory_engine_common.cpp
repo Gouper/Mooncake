@@ -39,6 +39,8 @@ constexpr char REGIONS_KEY[] = "regions";
 constexpr char PEERS_KEY[] = "peers";
 constexpr char ADDRESS_KEY[] = "address";
 constexpr char SIZE_KEY[] = "size";
+constexpr char DESCRIPTOR_KEY[] = "descriptor";
+constexpr size_t MAX_GVA_DESCRIPTOR_SIZE = 16U << 20;
 constexpr char CODE_KEY[] = "code";
 constexpr char MESSAGE_KEY[] = "message";
 
@@ -79,6 +81,9 @@ void EncodeRegion(const GvaRegion &region, json &payload)
 {
     payload[ADDRESS_KEY] = region.address;
     payload[SIZE_KEY] = region.size;
+    if (!region.descriptor.empty()) {
+        payload[DESCRIPTOR_KEY] = region.descriptor;
+    }
 }
 
 bool ReadRegion(const json &payload, GvaRegion &region)
@@ -89,6 +94,20 @@ bool ReadRegion(const json &payload, GvaRegion &region)
         return false;
     }
     region = {*address, static_cast<size_t>(*size)};
+    return true;
+}
+
+bool ReadPublishedRegion(const json &payload, GvaRegion &region)
+{
+    if (!ReadRegion(payload, region)) [[unlikely]] {
+        return false;
+    }
+    const auto field = payload.find(DESCRIPTOR_KEY);
+    const auto *descriptor = field == payload.end() ? nullptr : field->get_ptr<const std::string *>();
+    if (!descriptor || descriptor->empty() || descriptor->size() > MAX_GVA_DESCRIPTOR_SIZE) [[unlikely]] {
+        return false;
+    }
+    region.descriptor = *descriptor;
     return true;
 }
 
@@ -361,13 +380,14 @@ json EncodeRegionRequest(const RegionRequest &request)
     return payload;
 }
 
-Status DecodeRegionRequest(const json &payload, RegionRequest &request)
+Status DecodeRegionRequest(const json &payload, bool publish, RegionRequest &request)
 {
     GvaRegion region;
-    if (!ReadRegion(payload, region)) {
+    const bool valid = publish ? ReadPublishedRegion(payload, region) : ReadRegion(payload, region);
+    if (!valid) [[unlikely]] {
         return Status::InvalidArgument("Invalid MemoryEngine region");
     }
-    request = {payload.at(ID_KEY).get<std::string>(), region};
+    request = {payload.at(ID_KEY).get<std::string>(), std::move(region)};
     return Status::OK();
 }
 
@@ -408,10 +428,10 @@ Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer)
     peer.regions.reserve(regions.size());
     for (const auto &entry : regions) {
         GvaRegion region;
-        if (!ReadRegion(entry, region)) {
+        if (!ReadPublishedRegion(entry, region)) [[unlikely]] {
             return Status::InvalidArgument("Invalid MemoryEngine mapped region");
         }
-        peer.regions.push_back(region);
+        peer.regions.push_back(std::move(region));
     }
     return Status::OK();
 }
@@ -449,16 +469,22 @@ Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePee
     return Status::OK();
 }
 
-json EncodePeerRegionRequest(const PeerRegionRequest &request)
+json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region)
 {
-    auto payload = EncodePeerRequest(request.peer);
-    EncodeRegion(request.region, payload);
+    auto payload = EncodePeerRequest(peer);
+    EncodeRegion(region, payload);
     return payload;
 }
 
-Status DecodePeerRegion(const json &payload, GvaRegion &region)
+Status DecodePeerRegion(const json &payload, bool map, GvaRegion &region)
 {
-    return ReadRegion(payload, region) ? Status::OK() : Status::InvalidArgument("Invalid MemoryEngine peer region");
+    const bool valid = map ? ReadPublishedRegion(payload, region) : ReadRegion(payload, region);
+    return valid ? Status::OK() : Status::InvalidArgument("Invalid MemoryEngine peer region");
+}
+
+void ClearRegionDescriptor(json &payload)
+{
+    static_cast<void>(payload.erase(DESCRIPTOR_KEY));
 }
 
 std::string EncodeReply(const Status &status, json &response)

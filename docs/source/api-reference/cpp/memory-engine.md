@@ -9,6 +9,7 @@ Build with `-DUSE_TENT=ON -DUSE_MEMFABRIC=ON` and the MemFabric HYBM headers.
 Link `mooncake_memory_engine` and make `libmf_hybm_core.so` available to the
 client at runtime. Include `memory_engine_client.h` for `MemoryEngine` and
 `memory_engine_server.h` for `MemoryEngineServer`.
+Run the server and clients with matching MemoryEngine versions.
 
 Copy `mooncake-memory-engine/config/memory-engine.json` and edit its top-level
 `memory_engine` object. The example uses one rank on the local host with a
@@ -48,8 +49,9 @@ install the HYBM AICPU kernel in each client's CANN environment with
    followed by `Join()`. Use `Create(config, &engine)` to pass the configuration
    directly.
 3. Call `Allocate()` to get a GVA, and pass that address to `Free()` to release
-   it. Stop direct access to the region on all participating ranks before
-   calling `Free()`.
+   it. A successful allocation has been published to all joined clients.
+   Clients that join later receive the regions that are still published. Stop
+   direct access to the region on all participating ranks before calling `Free()`.
 4. For a planned shutdown, stop direct GVA access and let clients `Leave()`
    before calling `MemoryEngineServer::Instance().Stop()`. `Stop()` closes the
    listener and clears the in-memory cluster state. A subsequent `Start()`
