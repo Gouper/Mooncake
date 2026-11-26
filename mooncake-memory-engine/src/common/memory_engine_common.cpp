@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 
@@ -126,6 +130,36 @@ std::optional<uint64_t> ReadUnsigned(const json &value, uint64_t max)
         return std::nullopt;
     }
     return number;
+}
+
+Status LoadMemoryEngineConfig(Config &config)
+{
+    const char *path = std::getenv(config_keys::CONFIG_FILE_ENV);
+    std::error_code fileError;
+    if (!path || !std::filesystem::is_regular_file(std::filesystem::path(path), fileError)) [[unlikely]] {
+        LOG(ERROR) << "Missing or invalid MemoryEngine configuration file, environment variable:"
+                   << config_keys::CONFIG_FILE_ENV << ", error:" << fileError.value() << ".";
+        return Status::InvalidArgument(std::string("Set ") + config_keys::CONFIG_FILE_ENV +
+                                       " to the path of a MemoryEngine JSON file");
+    }
+
+    Config fileConfig;
+    const auto status = fileConfig.loadFile(std::string(path));
+    if (!status.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to load MemoryEngine configuration, environment variable:" << config_keys::CONFIG_FILE_ENV
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        return status;
+    }
+
+    const auto options = fileConfig.get(config_keys::CONFIG_SECTION, json());
+    if (!options.is_object()) [[unlikely]] {
+        LOG(ERROR) << "Missing or invalid MemoryEngine configuration section, environment variable:"
+                   << config_keys::CONFIG_FILE_ENV << ", section:" << config_keys::CONFIG_SECTION << ".";
+        return Status::InvalidArgument("MemoryEngine configuration requires a top-level memory_engine object");
+    }
+
+    config.set(config_keys::CONFIG_SECTION, options);
+    return Status::OK();
 }
 
 Status ParseEndpoint(std::string url, Endpoint &endpoint)

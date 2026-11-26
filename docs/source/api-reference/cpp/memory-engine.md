@@ -12,19 +12,26 @@ client at runtime. Include `memory_engine_client.h` for `MemoryEngine` and
 
 Copy `mooncake-memory-engine/config/memory-engine.json` and edit its top-level
 `memory_engine` object. The example uses one rank on the local host with a
-1 GiB device GVA window. Set `MC_TENT_CONF` in both the server and client
-environments, and set `MF_PROTOCOL` on each client. In each client's config,
-set `transports.memfabric.enable` to `true`.
+1 GiB device GVA window. To use `Start()` and `Create(&engine)`, point
+`MC_MEMORY_ENGINE_CONF` to this JSON file in both the server and client
+environments. These overloads read the top-level `memory_engine` object.
 
 ```bash
-export MC_TENT_CONF=/path/to/memory-engine.json
+export MC_MEMORY_ENGINE_CONF=/path/to/memory-engine.json
+```
+
+Set `MF_PROTOCOL` on each client. To supply a custom TENT configuration on
+a client, set `MC_TENT_CONF` to a separate TENT JSON file and set
+`transports.memfabric.enable` to `true` in that file.
+
+```bash
 export MF_PROTOCOL=device_sdma
 ```
 
 For multiple hosts, choose an `MF_PROTOCOL` supported by the deployment and
-use mutually reachable addresses for `server_url`, `client_host`, and the
-top-level TENT `rpc_server_hostname`. Use the same `world_size`, `host_mem_max`,
-and `device_mem_max` on every client.
+use mutually reachable addresses for `server_url` and `client_host` in the
+MemoryEngine file and `rpc_server_hostname` in the TENT file. Use the same
+`world_size`, `host_mem_max`, and `device_mem_max` on every client.
 
 For Ascend A2 with `MF_PROTOCOL=device_rdma` and `MF_HYBM_RDMA_USE_HCOMM=1`,
 install the HYBM AICPU kernel in each client's CANN environment with
@@ -33,12 +40,13 @@ install the HYBM AICPU kernel in each client's CANN environment with
 ## Server and client lifecycle
 
 1. Start the server with `MemoryEngineServer::Instance().Start()`. `Start()`
-   loads the server configuration from the environment. `Start(config)` accepts
-   a TENT `Config`. Starting again on the same endpoint returns `OK` and keeps
+   loads the file specified by `MC_MEMORY_ENGINE_CONF`. `Start(config)` accepts
+   a `Config` directly. Starting again on the same endpoint returns `OK` and keeps
    the current configuration. Starting on a different endpoint while the server
    is running returns `InvalidEntry`.
 2. Bind the calling thread to its Ascend device, then call `MemoryEngine::Create`
-   followed by `Join()`.
+   followed by `Join()`. Use `Create(config, &engine)` to pass the configuration
+   directly.
 3. Call `Allocate()` to get a GVA, and pass that address to `Free()` to release
    it. Stop direct access to the region on all participating ranks before
    calling `Free()`.

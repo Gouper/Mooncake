@@ -1,10 +1,4 @@
 {
-    "rpc_server_hostname": "127.0.0.1",
-    "transports": {
-        "memfabric": {
-            "enable": true
-        }
-    },
     "memory_engine": {
         "enabled": true,
         "server_url": "127.0.0.1:29557",

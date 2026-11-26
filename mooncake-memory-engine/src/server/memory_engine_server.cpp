@@ -934,7 +934,7 @@ Status MemoryEngineServer::Start(const Config &config)
 Status MemoryEngineServer::Start()
 {
     Config config;
-    CHECK_STATUS(ConfigHelper().loadFromEnv(config));
+    CHECK_STATUS(LoadMemoryEngineConfig(config));
     return Start(config);
 }
 

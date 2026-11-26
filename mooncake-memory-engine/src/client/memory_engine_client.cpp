@@ -1265,7 +1265,7 @@ Status MemoryEngine::Create(const Config &config, std::unique_ptr<MemoryEngine> 
 Status MemoryEngine::Create(std::unique_ptr<MemoryEngine> *engine)
 {
     Config config;
-    CHECK_STATUS(ConfigHelper().loadFromEnv(config));
+    CHECK_STATUS(LoadMemoryEngineConfig(config));
     return Create(config, engine);
 }
 

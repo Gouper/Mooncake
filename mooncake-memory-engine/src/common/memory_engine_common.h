@@ -37,6 +37,8 @@ inline constexpr uint64_t MAX_RANKS = std::numeric_limits<uint32_t>::max();
 
 namespace config_keys {
 
+inline constexpr char CONFIG_FILE_ENV[] = "MC_MEMORY_ENGINE_CONF";
+inline constexpr char CONFIG_SECTION[] = "memory_engine";
 inline constexpr char CONFIG_ENABLED[] = "memory_engine/enabled";
 inline constexpr char CONFIG_SERVER_URL[] = "memory_engine/server_url";
 inline constexpr char CONFIG_WORLD_SIZE[] = "memory_engine/world_size";
@@ -183,6 +185,7 @@ struct PeerCall {
 };
 
 std::optional<uint64_t> ReadUnsigned(const json &value, uint64_t max);
+Status LoadMemoryEngineConfig(Config &config);
 Status ParseEndpoint(std::string url, Endpoint &endpoint);
 bool ValidWindow(uint64_t window);
 Status ValidateLayout(const Layout &layout);
