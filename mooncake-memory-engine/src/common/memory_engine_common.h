@@ -54,8 +54,6 @@ inline constexpr char CONFIG_BATCH_COPY_TIMEOUT_MS[] = "memory_engine/batch_copy
 inline constexpr char CONFIG_SERVER_WORLD_SIZE[] = "memory_engine/server/world_size";
 inline constexpr char CONFIG_SERVER_HOST_MEM_MAX[] = "memory_engine/server/host_mem_max";
 inline constexpr char CONFIG_SERVER_DEVICE_MEM_MAX[] = "memory_engine/server/device_mem_max";
-inline constexpr char CONFIG_SERVER_GVA_BASE_HOST[] = "memory_engine/server/gva_base_host";
-inline constexpr char CONFIG_SERVER_GVA_BASE_DEVICE[] = "memory_engine/server/gva_base_device";
 inline constexpr char CONFIG_SERVER_RANK_LEASE_MS[] = "memory_engine/server/rank_lease_ms";
 inline constexpr char CONFIG_SERVER_RPC_SERVER_THREADS[] = "memory_engine/server/rpc_server_threads";
 

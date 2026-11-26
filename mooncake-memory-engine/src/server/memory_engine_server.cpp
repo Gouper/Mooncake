@@ -257,7 +257,6 @@ struct MemoryEngineServer::Impl {
     Layout mLayout;
     Layout mConfiguredLayout;
     Endpoint mEndpoint;
-    Bases mExpectedBases;
     std::optional<Bases> mBases;
     std::unordered_map<std::string, Registration> mRegistrations;
     std::set<uint32_t> mFreeRanks;
@@ -286,13 +285,6 @@ Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &end
                    << ", device window bytes:" << mConfiguredLayout.deviceWindow << ".";
         return Status::InvalidArgument("Invalid MemoryEngine server GVA windows");
     }
-    const auto host = ReadUnsigned(config.get(config_keys::CONFIG_SERVER_GVA_BASE_HOST, json(0)), UINT64_MAX);
-    const auto device = ReadUnsigned(config.get(config_keys::CONFIG_SERVER_GVA_BASE_DEVICE, json(0)), UINT64_MAX);
-    if (!host || !device) {
-        return Status::InvalidArgument("Invalid MemoryEngine server GVA bases");
-    }
-    mExpectedBases = {*host, *device};
-
     mLease = Milliseconds(config.get(config_keys::CONFIG_SERVER_RANK_LEASE_MS, DEFAULT_LEASE.count()));
     mRegistrationTimeout = Milliseconds(config.get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
     if (mLease <= Milliseconds::zero() || mRegistrationTimeout <= Milliseconds::zero() ||
@@ -483,18 +475,14 @@ Status MemoryEngineServer::Impl::Confirm(const ConfirmRequest &request)
                    << ", rank:" << request.rank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         return status;
     }
-    if ((mExpectedBases.host && bases.host != mExpectedBases.host) ||
-        (mExpectedBases.device && bases.device != mExpectedBases.device)) {
-        LOG(ERROR) << "MemoryEngine Confirm GVA bases differ from server configuration, registration ID:"
-                   << request.id << ", rank:" << request.rank << ".";
-        return Status::InvalidArgument("MemFabric GVA bases differ from configured server bases");
-    }
-    if (mBases && bases != *mBases) {
+
+    if (!mBases) {
+        mBases = bases;
+    } else if (bases != *mBases) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine Confirm GVA bases differ from cluster, registration ID:" << request.id
                    << ", rank:" << request.rank << ".";
         return Status::InvalidArgument("MemFabric GVA bases differ from the cluster bases");
     }
-    mBases = bases;
     if (found->second.state == MemberState::Pending) {
         found->second.state = MemberState::Registered;
     }

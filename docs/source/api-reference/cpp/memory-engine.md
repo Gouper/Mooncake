@@ -47,7 +47,9 @@ install the HYBM AICPU kernel in each client's CANN environment with
    is running returns `InvalidEntry`.
 2. Bind the calling thread to its Ascend device, then call `MemoryEngine::Create`
    followed by `Join()`. Use `Create(config, &engine)` to pass the configuration
-   directly.
+   directly. During `Create`, the server records the Host and Device GVA bases
+   from the first successful client confirmation and keeps them until `Stop()`.
+   Later clients must report the same bases or `Create` fails.
 3. Call `Allocate()` to get a GVA, and pass that address to `Free()` to release
    it. A successful allocation has been published to all joined clients.
    Clients that join later receive the regions that are still published. Stop
@@ -72,7 +74,6 @@ install the HYBM AICPU kernel in each client's CANN environment with
 | `join_timeout_ms` | Registration and join timeout in milliseconds. Defaults to `120000`. |
 | `batch_copy_timeout_ms` | Batch copy deadline in milliseconds. Defaults to `30000`. Set to `0` for no deadline. |
 | `server.world_size`, `server.host_mem_max`, `server.device_mem_max` | Expected layout. Each nonzero value must match the client value. |
-| `server.gva_base_host`, `server.gva_base_device` | Expected GVA base addresses. For each zero value the server accepts the first confirmed base. |
 | `server.rank_lease_ms` | Rank lease duration in milliseconds. Defaults to `20000`. The server starts the lease on confirmation and renews it on each accepted heartbeat. |
 | `server.rpc_server_threads` | Server RPC worker count. Defaults to `4`. |
 
