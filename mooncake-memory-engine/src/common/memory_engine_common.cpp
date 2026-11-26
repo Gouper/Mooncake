@@ -380,9 +380,10 @@ json EncodeRegionRequest(const RegionRequest &request)
     return payload;
 }
 
-Status DecodeRegionRequest(const json &payload, bool publish, RegionRequest &request)
+Status DecodeRegionRequest(const json &payload, RegionUpdateAction action, RegionRequest &request)
 {
     GvaRegion region;
+    const bool publish = action == RegionUpdateAction::Publish;
     const bool valid = publish ? ReadPublishedRegion(payload, region) : ReadRegion(payload, region);
     if (!valid) [[unlikely]] {
         return Status::InvalidArgument("Invalid MemoryEngine region");

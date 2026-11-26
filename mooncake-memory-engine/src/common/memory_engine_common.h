@@ -135,6 +135,11 @@ struct JoinRequest {
     std::string identity;
 };
 
+enum class RegionUpdateAction {
+    Publish,
+    Revoke,
+};
+
 struct RegionRequest {
     std::string id;
     GvaRegion region;
@@ -203,7 +208,7 @@ json EncodeJoinRequest(const JoinRequest &request);
 Status DecodeJoinRequest(const json &payload, JoinRequest &request);
 
 json EncodeRegionRequest(const RegionRequest &request);
-Status DecodeRegionRequest(const json &payload, bool publish, RegionRequest &request);
+Status DecodeRegionRequest(const json &payload, RegionUpdateAction action, RegionRequest &request);
 
 json EncodePeerRequest(const PeerRequest &request);
 Status DecodePeerRequest(const json &payload, PeerRequest &request);

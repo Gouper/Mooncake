@@ -241,10 +241,10 @@ struct MemoryEngineServer::Impl {
     Status BeginLeave(const std::string &id);
     Status FinishLeave(const std::string &id);
     Status PrepareLeave(const std::string &id, std::vector<PeerCallback> &calls);
-    Status UpdateRegion(const json &payload, bool publish);
-    Status PrepareRegion(const std::string &id, const GvaRegion &region, bool publish,
+    Status UpdateRegion(const json &payload, RegionUpdateAction action);
+    Status PrepareRegion(const std::string &id, const GvaRegion &region, RegionUpdateAction action,
                          std::vector<PeerCallback> &calls);
-    void CommitRegion(const std::string &id, GvaRegion &&region, bool publish);
+    void CommitRegion(const std::string &id, GvaRegion &&region, RegionUpdateAction action);
     Status ClaimRank(std::optional<uint32_t> requested, uint32_t &rank);
     void ReleaseRank(uint32_t rank);
     void ResetUnconfirmedLayout();
@@ -335,10 +335,10 @@ Status MemoryEngineServer::Impl::RegisterRpcHandlers()
         return FinishLeave(request.id);
     }));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::PublishRegion, [this](const json &request, json &) {
-        return UpdateRegion(request, true);
+        return UpdateRegion(request, RegionUpdateAction::Publish);
     }, true));
     return RegisterHandler(mRpc, MemoryRpc::RevokeRegion, [this](const json &request, json &) {
-        return UpdateRegion(request, false);
+        return UpdateRegion(request, RegionUpdateAction::Revoke);
     }, true);
 }
 
@@ -773,8 +773,8 @@ Status MemoryEngineServer::Impl::Join(const json &payload)
     return cleanup.ok() ? status : cleanup;
 }
 
-Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaRegion &region, bool publish,
-                                               std::vector<PeerCallback> &calls)
+Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaRegion &region,
+                                               RegionUpdateAction action, std::vector<PeerCallback> &calls)
 {
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(id);
@@ -793,6 +793,7 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
         return Status::InvalidArgument("MemoryEngine region lies outside the owner rank window");
     }
 
+    const bool publish = action == RegionUpdateAction::Publish;
     const auto existing = owner.regions.find(region.address);
     if (publish && owner.revokedRegions.contains(region.address)) {
         LOG(WARNING) << "Region was already revoked, registration ID:" << id
@@ -832,25 +833,25 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
     return Status::OK();
 }
 
-void MemoryEngineServer::Impl::CommitRegion(const std::string &id, GvaRegion &&region, bool publish)
+void MemoryEngineServer::Impl::CommitRegion(const std::string &id, GvaRegion &&region, RegionUpdateAction action)
 {
     std::lock_guard lock(mMutex);
     auto &regions = mRegistrations.at(id).regions;
-    if (publish) {
+    if (action == RegionUpdateAction::Publish) {
         regions.try_emplace(region.address, std::move(region));
     } else {
         regions.erase(region.address);
     }
 }
 
-Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, bool publish)
+Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, RegionUpdateAction action)
 {
     Mutation mutation(mMutating, false);
     if (!mutation.Acquired()) {
         return Status::TooManyRequests("MemoryEngine region operation in progress");
     }
     RegionRequest request;
-    const auto decodeRet = DecodeRegionRequest(payload, publish, request);
+    const auto decodeRet = DecodeRegionRequest(payload, action, request);
     if (!decodeRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to decode MemoryEngine region update request, error:" << decodeRet.message() << ".";
         return decodeRet;
@@ -863,7 +864,8 @@ Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, bool publish)
         return Status::TooManyRequests("MemoryEngine owner region operation in progress");
     }
     std::vector<PeerCallback> peers;
-    CHECK_STATUS(PrepareRegion(id, region, publish, peers));
+    CHECK_STATUS(PrepareRegion(id, region, action, peers));
+    const bool publish = action == RegionUpdateAction::Publish;
     const auto op = publish ? MemoryRpc::MapRegion : MemoryRpc::UnmapRegion;
     auto status = SendToPeersInParallel(mRpc, op, peers, Clock::now() + RPC_TIMEOUT);
     if (!status.ok()) {
@@ -879,7 +881,7 @@ Status MemoryEngineServer::Impl::UpdateRegion(const json &payload, bool publish)
         }
         return status;
     }
-    CommitRegion(id, std::move(request.region), publish);
+    CommitRegion(id, std::move(request.region), action);
     return Status::OK();
 }
 
