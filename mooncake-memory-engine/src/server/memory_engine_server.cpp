@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,7 @@ constexpr size_t DEFAULT_RPC_THREADS = 4;
 constexpr int HEARTBEAT_LOG_EVERY = 100;
 
 enum class MemberState { Pending, Registered, Joining, Joined, Leaving };
+constexpr std::array MEMBER_STATE_NAMES{"Pending", "Registered", "Joining", "Joined", "Leaving"};
 
 struct Registration {
     uint32_t rank{};
@@ -779,10 +781,14 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(id);
     const auto now = Clock::now();
-    if (found == mRegistrations.end() || found->second.state != MemberState::Joined || found->second.expires <= now) {
-        LOG(WARNING) << "MemoryEngine region owner is not joined or expired, registration ID:" << id << ", rank:"
-                     << (found != mRegistrations.end() ? std::to_string(found->second.rank) : "unknown")
-                     << ", bytes:" << region.size << ".";
+    const bool registered = found != mRegistrations.end();
+    const bool expired = registered && found->second.expires <= now;
+    if (!registered || found->second.state != MemberState::Joined || expired) [[unlikely]] {
+        const auto state = registered ? MEMBER_STATE_NAMES[static_cast<size_t>(found->second.state)] : "unknown";
+        const auto leaseExpired = registered ? (expired ? "true" : "false") : "unknown";
+        LOG(WARNING) << "MemoryEngine region owner rejected, registration ID:" << id
+                     << ", rank:" << (registered ? std::to_string(found->second.rank) : "unknown")
+                     << ", state:" << state << ", lease expired:" << leaseExpired << ", bytes:" << region.size << ".";
         return Status::InvalidEntry("MemoryEngine owner is not joined");
     }
     auto &owner = found->second;
