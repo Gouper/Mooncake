@@ -81,6 +81,33 @@ TransferStatusEnum mapBatchStatus(int32_t query_ret, int32_t batch_result) {
 
 }  // namespace
 
+namespace {
+
+std::mutex gGvaTransportsMutex;
+std::unordered_map<std::string, std::weak_ptr<MemFabricTransport>> gGvaTransports;
+
+}
+
+thread_local const MemFabricConfigScope *MemFabricConfigScope::gCurrent = nullptr;
+
+MemFabricConfigScope::MemFabricConfigScope(const Config &config)
+    : mConfig(config), mSnapshot(config.freeze()), mPrevious(gCurrent)
+{
+    gCurrent = this;
+}
+
+MemFabricConfigScope::~MemFabricConfigScope()
+{
+    gCurrent = mPrevious;
+}
+
+std::shared_ptr<MemFabricGvaAccess> MemFabricGvaAccess::Find(const std::string &segment)
+{
+    std::lock_guard lock(gGvaTransportsMutex);
+    const auto found = gGvaTransports.find(segment);
+    return found == gGvaTransports.end() ? nullptr : found->second.lock();
+}
+
 std::atomic<int> MemFabricTransport::g_init_ref_{0};
 std::mutex MemFabricTransport::g_init_mutex_;
 
@@ -98,6 +125,69 @@ bool MemFabricTransport::supportsGlobalAddressing() const {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     return static_cast<bool>(gva_);
 }
+Status MemFabricTransport::GetGvaBases(uint64_t &host, uint64_t &device) const
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (!gva_ || stopping_) {
+        return Status::NotImplemented("MemFabric GVA is unavailable");
+    }
+    gva_->GetBases(host, device);
+    return Status::OK();
+}
+
+Status MemFabricTransport::GetGvaIdentity(std::string &identity) const
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (!gva_ || stopping_) {
+        return Status::NotImplemented("MemFabric GVA is unavailable");
+    }
+    identity = gva_->GetIdentity();
+    return Status::OK();
+}
+
+MemFabricSharedMemory *MemFabricTransport::GetGvaContext() const
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    return stopping_ ? nullptr : gva_.get();
+}
+
+Status MemFabricTransport::PinGvaCopyBatch(std::shared_ptr<MemFabricSharedMemory> &context)
+{
+    std::lock_guard lock(inflight_mu_);
+    if (!gva_ || stopping_) [[unlikely]] {
+        return Status::NotImplemented("MemFabric GVA is unavailable");
+    }
+    CHECK_STATUS(gva_->PinCopyBatch());
+    context = gva_;
+    return Status::OK();
+}
+
+Status MemFabricTransport::PrepareGvaPeer(const std::string &segment, const std::string &identity)
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    return gva_->PrepareRank(segment, identity);
+}
+
+Status MemFabricTransport::CloseGvaPeer(SegmentID id, uint32_t rank, const std::string &segment)
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    CHECK_STATUS(gva_->CloseRank(rank, segment));
+    auto it = gva_remote_.lower_bound({id, 0});
+    while (it != gva_remote_.end() && it->first.first == id) {
+        it = gva_remote_.erase(it);
+    }
+    return Status::OK();
+}
+
+Status MemFabricTransport::RevokeGvaRegion(SegmentID id, uint32_t rank, const std::string &segment,
+                                           uint64_t address)
+{
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    CHECK_STATUS(gva_->Revoke(rank, segment, address));
+    gva_remote_.erase({id, address});
+    return Status::OK();
+}
+
 bool MemFabricTransport::warmupMemory(void*, size_t) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
     // GVA NPU mappings must not be prefaulted as CPU pages.
@@ -136,6 +226,62 @@ Status MemFabricTransport::freeLocalMemory(void* addr, size_t size) {
 }
 Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
                                            size_t size) {
+    return MapGva(id, addr, size, true);
+}
+
+Status MemFabricTransport::MapGvaRegion(SegmentID id, void *addr, size_t size)
+{
+    return MapGva(id, addr, size, false);
+}
+
+Status MemFabricTransport::GetGvaRegionDescriptor(const void *address, size_t size, std::string &descriptor) const
+{
+    std::shared_ptr<ControlService> metadata;
+    {
+        std::lock_guard lock(inflight_mu_);
+        if (!gva_ || stopping_) [[unlikely]] {
+            return Status::NotImplemented("MemFabric GVA is unavailable");
+        }
+        metadata = metadata_;
+    }
+
+    const auto base = reinterpret_cast<uint64_t>(address);
+    const auto segment = metadata->segmentManager().getLocal();
+    const auto *buffer = segment->findBuffer(base, size);
+    if (!buffer || buffer->addr != base || buffer->length != size) [[unlikely]] {
+        return Status::InvalidEntry("MemFabric requires a complete registered GVA region");
+    }
+    const auto *published = findGvaDescriptor(*buffer);
+    if (!published) [[unlikely]] {
+        return Status::InvalidEntry("Missing registered MemFabric GVA descriptor");
+    }
+
+    descriptor = *published;
+    return Status::OK();
+}
+
+Status MemFabricTransport::ImportGvaRegion(SegmentID id, const std::string &segment, void *address, size_t size,
+                                           const std::string &descriptor)
+{
+    if (descriptor.empty() || descriptor.front() != '{') [[unlikely]] {
+        return Status::InvalidArgument("Expected one MemFabric GVA slice descriptor");
+    }
+
+    const auto base = reinterpret_cast<uint64_t>(address);
+    std::shared_ptr<MemFabricSharedMemory> context;
+    {
+        std::lock_guard lock(inflight_mu_);
+        if (!gva_ || stopping_) [[unlikely]] {
+            return Status::NotImplemented("MemFabric GVA is unavailable");
+        }
+        context = gva_;
+        gva_remote_.insert_or_assign({id, base}, segment);
+    }
+    return context->prepare(segment, descriptor, base, size);
+}
+
+Status MemFabricTransport::MapGva(SegmentID id, void *addr, size_t size, bool includeBundle)
+{
     std::shared_ptr<MemFabricSharedMemory> context;
     std::shared_ptr<ControlService> metadata;
     {
@@ -147,8 +293,14 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
         metadata = metadata_;
     }
     SegmentDescRef segment;
-    CHECK_STATUS(metadata->segmentManager().getRemoteCached(segment, id));
-    auto* buffer = segment->findBuffer(reinterpret_cast<uint64_t>(addr), size);
+    CHECK_STATUS(metadata->segmentManager().withCachedSegment(id, segment, [&](SegmentDesc *current) {
+        auto *buffer = current->findBuffer(reinterpret_cast<uint64_t>(addr), size);
+        if (!buffer) {
+            return Status::NeedsRefreshCache("MemFabric GVA region has not been published");
+        }
+        return Status::OK();
+    }));
+    auto *buffer = segment->findBuffer(reinterpret_cast<uint64_t>(addr), size);
     if (!buffer || buffer->addr != reinterpret_cast<uint64_t>(addr)) {
         return Status::InvalidArgument("GVA map requires published slice base");
     }
@@ -156,9 +308,14 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
         return Status::InvalidArgument("Missing MemFabric GVA descriptor");
     }
     nlohmann::json bundle = nlohmann::json::array();
-    for (const auto& candidate : segment->getMemory().buffers) {
-        const auto* attribute = findGvaDescriptor(candidate);
-        if (!attribute) continue;
+    for (const auto &candidate : segment->getMemory().buffers) {
+        if (!includeBundle && &candidate != buffer) {
+            continue;
+        }
+        const auto *attribute = findGvaDescriptor(candidate);
+        if (!attribute) {
+            continue;
+        }
         try {
             auto descriptor = nlohmann::json::parse(*attribute);
             if (descriptor.at("address").get<uint64_t>() != candidate.addr ||
@@ -167,7 +324,7 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
                     "GVA descriptor disagrees with published buffer");
             }
             bundle.push_back(std::move(descriptor));
-        } catch (const nlohmann::json::exception&) {
+        } catch (const nlohmann::json::exception &) {
             return Status::InvalidArgument("Malformed MemFabric GVA metadata");
         }
     }
@@ -175,9 +332,9 @@ Status MemFabricTransport::mapRemoteMemory(SegmentID id, void* addr,
         std::lock_guard<std::mutex> lock(inflight_mu_);
         gva_remote_[{id, reinterpret_cast<uint64_t>(addr)}] = segment->name;
     }
-    return context->prepare(segment->name, bundle.dump(),
-                            reinterpret_cast<uint64_t>(addr), size);
+    return context->prepare(segment->name, bundle.dump(), reinterpret_cast<uint64_t>(addr), size);
 }
+
 Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     std::shared_ptr<MemFabricSharedMemory> context;
     std::string peer;
@@ -193,7 +350,7 @@ Status MemFabricTransport::unmapRemoteMemory(SegmentID id, void* addr) {
     return context->unmap(peer, reinterpret_cast<uint64_t>(addr));
 }
 
-Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
+Status MemFabricTransport::loadConfig(const std::shared_ptr<const Config>& conf) {
     transfer_timeout_ms_ = 10000;
     const char* timeout_env = std::getenv("MF_TRANSFER_TIMEOUT");
     if (timeout_env && timeout_env[0] != '\0') {
@@ -288,7 +445,9 @@ Status MemFabricTransport::install(std::string& local_segment_name,
 
     local_segment_name_ = local_segment_name;
     metadata_ = metadata;
-    CHECK_STATUS(loadConfig(conf));
+    const auto *scope = MemFabricConfigScope::gCurrent;
+    const auto nativeConfig = scope && &scope->mConfig == conf.get() ? scope->mSnapshot : conf;
+    CHECK_STATUS(loadConfig(nativeConfig));
 
     if (!metadata_) {
         return Status::InvalidArgument("metadata is null" LOC_MARK);
@@ -345,6 +504,10 @@ Status MemFabricTransport::finishInstall() {
             gva_config_, local_segment_name_);
         CHECK_STATUS(context->initialize());
         gva_ = std::move(context);
+        if (const auto self = weak_from_this(); !self.expired()) {
+            std::lock_guard lock(gGvaTransportsMutex);
+            gGvaTransports.insert_or_assign(local_segment_name_, self);
+        }
     }
     stopping_ = false;
     installed_ = true;
@@ -1200,6 +1363,12 @@ Status MemFabricTransport::uninstall() {
     if (!installed_) return Status::OK();
     if (gva_) {
         CHECK_STATUS(gva_->close());
+        std::lock_guard lock(gGvaTransportsMutex);
+        const auto found = gGvaTransports.find(local_segment_name_);
+        if (found != gGvaTransports.end() &&
+            !found->second.owner_before(weak_from_this()) && !weak_from_this().owner_before(found->second)) {
+            gGvaTransports.erase(found);
+        }
         gva_.reset();
     }
     LOG(INFO) << "uninstall: handle=" << handle_;

@@ -21,6 +21,11 @@ class MemFabricSharedMemory {
     ~MemFabricSharedMemory();
     // Initialize the entity and reserve windows before allocation or mapping.
     Status initialize();
+    void GetBases(uint64_t &host, uint64_t &device) const;
+    std::string GetIdentity() const;
+    Status PrepareRank(const std::string &segment, const std::string &identity);
+    Status CloseRank(uint32_t rank, const std::string &segment);
+    Status Revoke(uint32_t rank, const std::string &segment, uint64_t address);
     // allocate, map, and prepare use the ACL device bound by the caller.
     Status allocate(void**, size_t, uint32_t memory_type, MemoryOptions&);
     Status free(void*, size_t);
@@ -40,6 +45,8 @@ class MemFabricSharedMemory {
                               const std::string& descriptor) const;
     Status beginCopy(uint64_t source, uint64_t destination, size_t size,
                      uint32_t& direction);
+    Status PinCopyBatch();
+    Status RunPinnedBatchCopy(const std::vector<MemFabricGvaCopy> &copies, uint32_t direction);
     // Each member has already been pinned by beginCopy; settles all those pins.
     Status runBatchCopy(const std::vector<MemFabricGvaCopy>&,
                         uint32_t direction);
@@ -68,7 +75,9 @@ class MemFabricSharedMemory {
         std::string segment_name, generation;
         Json entity_blob;
         std::map<uint64_t, RemoteSlice> slices;
+        size_t activeSlices = 0;
         bool cleaned = false;
+        bool entityImported = false;
     };
     Status mapOrPrepare(const std::string&, const std::string&, uint64_t,
                         size_t, bool);
@@ -81,13 +90,16 @@ class MemFabricSharedMemory {
     Status bindDevice();
     Status validateDescriptor(const Json&,
                               const std::string& peer_segment_name) const;
+    Status ValidateIdentity(const Json &identity, const std::string &segment) const;
+    Status ImportIdentity(uint32_t rank, const Json &identity);
     Status validateRetainedPeers(uint32_t, const Json&, const std::string&,
                                  const Json&) const;
-    Status importBundle(uint32_t, const Json&, const std::string&, const Json&);
+    Status importBundle(uint32_t, const Json&, const Json&);
     RemoteSlice& recordSlice(ImportedRank&, const Json&);
     Status importPeer(ImportedRank&, const Json&);
     Status verifyPeerMapping(uint32_t, const RemoteSlice&);
     Status cleanupPeer(uint32_t, ImportedRank&);
+    void Deactivate(ImportedRank &peer, RemoteSlice &slice);
     uint32_t memoryTypeForRange(uint64_t, size_t) const;
     Json makeIdentity() const;
     mutable std::mutex mutex_;

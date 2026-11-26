@@ -1,0 +1,22 @@
+{
+    "memory_engine": {
+        "enabled": true,
+        "server_url": "127.0.0.1:29557",
+        "world_size": 1,
+        "host_mem_max": 0,
+        "device_mem_max": 1073741824,
+        "auto_ranking": true,
+        "local_rank": 0,
+        "client_host": "127.0.0.1",
+        "heartbeat_interval_ms": 3000,
+        "join_timeout_ms": 120000,
+        "batch_copy_timeout_ms": 30000,
+        "server": {
+            "world_size": 1,
+            "host_mem_max": 0,
+            "device_mem_max": 1073741824,
+            "rank_lease_ms": 20000,
+            "rpc_server_threads": 4
+        }
+    }
+}

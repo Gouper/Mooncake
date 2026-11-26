@@ -4,6 +4,7 @@
 |--------|-------------|
 | [Transfer Engine C++ API](transfer-engine) | `TransferEngine` class — memory registration, batch transfer, segment management, RDMA transport |
 | [TENT C++ API](tent) | `mooncake::tent::TransferEngine` — next-gen transfer engine with automatic transport selection and fault tolerance |
+| [MemoryEngine C++ API](memory-engine) | `MemoryEngine` and `MemoryEngineServer` — rank management, GVA allocation, and batch copy |
 | [Mooncake Store Client C++ API](mooncake-store) | `Client` class — `Put`/`Get`/`Remove`/`Replicate` operations |
 
 :::{toctree}
@@ -12,5 +13,6 @@
 
 transfer-engine
 tent
+memory-engine
 mooncake-store
 :::

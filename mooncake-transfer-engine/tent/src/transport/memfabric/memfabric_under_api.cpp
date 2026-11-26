@@ -172,6 +172,8 @@ void MemFabricUnderApi::ResetSymbols() {
 // HYBM GVA API. Keep its symbols and lifecycle independent of trans.
 namespace {
 
+static_assert(kGvaCopyAuto == HYBM_DATA_COPY_DIRECTION_AUTO);
+
 // clang-format off
 #define HYBM_GVA_SYMBOLS(name)     \
     name(hybm_init)                \
