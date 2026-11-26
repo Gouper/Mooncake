@@ -477,8 +477,9 @@ json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region)
     return payload;
 }
 
-Status DecodePeerRegion(const json &payload, bool map, GvaRegion &region)
+Status DecodePeerRegion(const json &payload, PeerRegionAction action, GvaRegion &region)
 {
+    const bool map = action == PeerRegionAction::Map;
     const bool valid = map ? ReadPublishedRegion(payload, region) : ReadRegion(payload, region);
     return valid ? Status::OK() : Status::InvalidArgument("Invalid MemoryEngine peer region");
 }

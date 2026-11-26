@@ -258,7 +258,7 @@ struct MemoryEngine::Impl {
     Status ImportSharedPeer(PeerMapping &peer, SharedPeer &request);
     Status MapSharedPeerRegions(PeerMapping &peer, const SharedPeer &request);
     Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
-    Status UpdatePeerRegion(const json &payload, bool map);
+    Status UpdatePeerRegion(const json &payload, PeerRegionAction action);
     Status PrepareNativePeers();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
     Status RegisterLocalRegion(void *memory, MemoryOptions &options, GvaRegion &region);
@@ -332,11 +332,11 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
                                  [this](const json &request, json &) { return SharePeers(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnsharePeer,
                                  [this](const json &request, json &) { return UnsharePeer(request); }, true));
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::MapRegion,
-                                 [this](const json &request, json &) { return UpdatePeerRegion(request, true); },
-                                 true));
+    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::MapRegion, [this](const json &request, json &) {
+        return UpdatePeerRegion(request, PeerRegionAction::Map);
+    }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnmapRegion, [this](const json &request, json &) {
-        return UpdatePeerRegion(request, false);
+        return UpdatePeerRegion(request, PeerRegionAction::Unmap);
     }, true));
     uint16_t port{};
     CHECK_STATUS(mRpc.Start(port, ipv6));
@@ -479,7 +479,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
+Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, PeerRegionAction action)
 {
     std::lock_guard lock(mPeerMutex);
     PeerRegionRequest request;
@@ -494,6 +494,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
     CHECK_STATUS(ValidatePeerRequest(request.peer.id, request.peer.rank));
     const auto rank = request.peer.rank;
     const auto found = mPeers.find(rank);
+    const bool map = action == PeerRegionAction::Map;
     if (!mTent || found == mPeers.end() || found->second.revoked ||
         found->second.generation != request.peer.generation) {
         if (map) {
@@ -505,7 +506,7 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, bool map)
         return Status::OK();
     }
 
-    const auto regionRet = DecodePeerRegion(payload, map, request.region);
+    const auto regionRet = DecodePeerRegion(payload, action, request.region);
     if (!regionRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to decode MemoryEngine peer region, error:" << regionRet.message()
                    << ", registration ID:" << request.peer.id << ", rank:" << mRank << ", peer rank:" << rank << ".";
